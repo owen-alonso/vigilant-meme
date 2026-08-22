@@ -26,6 +26,9 @@ def select_device(prefer_cuda: bool = True) -> torch.device:
 
 
 def set_seed(seed: int) -> None:
+    import random
+
+    random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)

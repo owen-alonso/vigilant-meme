@@ -53,3 +53,18 @@ def test_lm_zero_init_matches_baseline():
         logits_b = base(ids)
         logits_d = dyn(ids)
     assert torch.allclose(logits_b, logits_d, rtol=1e-4, atol=1e-4)
+
+
+def test_same_seed_constructs_matching_baseline_weights():
+    """Controller init must not steal RNG from later Mamba layers."""
+    torch.manual_seed(11)
+    base = MambaLM(tiny_config(dynamic_weights=False, n_layer=3))
+    torch.manual_seed(11)
+    dyn = MambaLM(dynamic_config(n_layer=3))
+    base_sd = base.state_dict()
+    dyn_sd = dyn.state_dict()
+    shared = [k for k in base_sd if k in dyn_sd]
+    assert shared
+    for key in shared:
+        assert torch.equal(base_sd[key], dyn_sd[key]), key
+

@@ -62,9 +62,17 @@ class MambaBlock(nn.Module):
         self._init_dt_proj(config)
 
         if self.dynamic_weights:
-            # Controller reads the SSM input [B, L, d_inner] (post conv + SiLU).
+            # Isolate controller init from the global RNG so a shared seed still
+            # produces identical baseline Mamba weights (needed for fair ablations).
+            rng_state = torch.get_rng_state()
+            cuda_states = (
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            )
             self.controller = DynamicWeightController(config, d_in=self.d_inner)
             self.modulator = DynamicParameterModulator(config)
+            torch.set_rng_state(rng_state)
+            if cuda_states is not None:
+                torch.cuda.set_rng_state_all(cuda_states)
         else:
             self.controller = None
             self.modulator = None

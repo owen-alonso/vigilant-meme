@@ -28,6 +28,7 @@ class MambaLM(nn.Module):
         self.norm_f = RMSNorm(config.d_model, eps=config.rms_eps)
         self.lm_head = nn.Linear(config.d_model, self.padded_vocab, bias=False)
         self.lm_head.weight = self.embedding.weight
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         if input_ids.dim() != 2:
