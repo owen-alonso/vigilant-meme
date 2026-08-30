@@ -62,16 +62,51 @@ OHLCV_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 # --------------------------------------------------------------------------
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def resolve_path(path: str | Path) -> Path:
+    """Resolve a relative path against the CWD, then against the repo root.
+
+    Defaults like ``data_dir="data"`` should mean the repo's ``data/`` whether
+    the entry point was launched from the repo root, from ``forecast/``, or
+    from an IDE with its own working directory.
+    """
+    candidate = Path(path)
+    if candidate.is_absolute() or candidate.exists():
+        return candidate
+    from_root = REPO_ROOT / candidate
+    return from_root if from_root.exists() else candidate
+
+
 def discover_symbol_files(data_dir: str | Path) -> list[Path]:
-    paths = sorted(Path(data_dir).glob("*.parquet"))
+    resolved = resolve_path(data_dir)
+    paths = sorted(resolved.glob("*.parquet"))
     if not paths:
-        raise FileNotFoundError(f"no .parquet files found in {data_dir}")
+        raise FileNotFoundError(
+            f"no .parquet files found in {resolved.resolve()} "
+            f"(looked for data_dir={str(data_dir)!r} relative to "
+            f"{Path.cwd()} and {REPO_ROOT})"
+        )
     return paths
 
 
 def symbol_from_path(path: str | Path) -> str:
     """``data/SPAB_clean_1min.parquet`` -> ``SPAB``."""
     return Path(path).stem.split("_")[0].upper()
+
+
+def _session_naive_datetime(series: pd.Series) -> pd.Series:
+    """US-equity session hours are 09:30–15:59 Eastern.
+
+    Tz-aware stamps are converted to America/New_York then stripped. Naive
+    timestamps are left as-is (vendor files in this repo are already session-local).
+    """
+    ts = pd.to_datetime(series)
+    tz = getattr(ts.dtype, "tz", None)
+    if tz is not None:
+        ts = ts.dt.tz_convert("America/New_York").dt.tz_localize(None)
+    return ts
 
 
 def load_bars(path: str | Path) -> pd.DataFrame:
@@ -84,9 +119,17 @@ def load_bars(path: str | Path) -> pd.DataFrame:
     missing = [c.lower() for c in OHLCV_COLUMNS if c.lower() not in df.columns]
     if missing:
         raise ValueError(f"{path}: missing columns {missing}")
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.loc[:, ["datetime", "open", "high", "low", "close", "volume"]]
+    df["datetime"] = _session_naive_datetime(df["datetime"])
+    keep = ["datetime", "open", "high", "low", "close", "volume"]
+    if "source" in df.columns:
+        keep.append("source")
+    df = df.loc[:, keep]
     df = df.dropna(subset=["datetime", "close"])
+    nonpos = df["close"] <= 0
+    if nonpos.any():
+        raise ValueError(
+            f"{path}: {int(nonpos.sum())} rows with close <= 0 (log-price is undefined)"
+        )
     df = df.sort_values("datetime").drop_duplicates("datetime", keep="last")
     return df.reset_index(drop=True)
 
@@ -120,10 +163,12 @@ def build_session_grid(df: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     grid = df.set_index(["session", "mos"]).reindex(full)
 
     grid["traded"] = grid["close"].notna().astype(np.float64)
-    # Prices carry forward across slots and across sessions (overnight).
-    grid["close"] = grid["close"].ffill()
+    # Intraday holes ffill within the session only. A dropped week must not
+    # become a one-minute return at the next open.
+    grid["close"] = grid.groupby(level="session")["close"].ffill()
     for col in ("open", "high", "low"):
-        grid[col] = grid[col].fillna(grid["close"])
+        filled = grid.groupby(level="session")[col].ffill()
+        grid[col] = filled.fillna(grid["close"])
     grid["volume"] = grid["volume"].fillna(0.0).astype(np.float64)
 
     grid = grid.reset_index()
@@ -132,9 +177,20 @@ def build_session_grid(df: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     )
     # A leading session can still start with no price to carry forward.
     grid = grid.dropna(subset=["close"]).reset_index(drop=True)
-    return grid.loc[
-        :, ["datetime", "session", "mos", "open", "high", "low", "close", "volume", "traded"]
+    cols = [
+        "datetime",
+        "session",
+        "mos",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "traded",
     ]
+    if "source" in grid.columns:
+        cols.append("source")
+    return grid.loc[:, cols]
 
 
 # --------------------------------------------------------------------------
@@ -156,7 +212,12 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     close = out["close"].astype(np.float64)
     log_close = np.log(close)
 
-    r1 = log_close.diff()
+    session_dates = pd.to_datetime(out["session"])
+    gap_days = session_dates.diff().dt.days.fillna(0)
+    large_join = gap_days > cfg.max_session_gap_days
+    join_id = large_join.cumsum()
+
+    r1 = log_close.diff().mask(large_join, np.nan)
     # EWM realized vol, shifted so bar t's own return is excluded.
     ewm_var = r1.pow(2).ewm(halflife=cfg.vol_halflife, min_periods=cfg.vol_halflife).mean()
     sigma = np.sqrt(ewm_var).shift(1).clip(lower=cfg.vol_floor)
@@ -165,7 +226,9 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     out["scale"] = sigma * math.sqrt(cfg.horizon)
 
     for k in (1, 5, 15, 60, 390):
-        out[f"ret_{k}"] = log_close.diff(k) / (sigma * math.sqrt(k))
+        crossed = join_id != join_id.shift(k)
+        raw = log_close.diff(k).mask(crossed, np.nan)
+        out[f"ret_{k}"] = raw / (sigma * math.sqrt(k))
 
     out["range_hl"] = ((out["high"] - out["low"]) / close) / sigma
     out["body_co"] = ((close - out["open"]) / close) / sigma
@@ -198,13 +261,15 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     forward = log_close.shift(-cfg.horizon) - log_close
     out["target_raw"] = forward
     out["target"] = forward / out["scale"]
+    horizon_traded = out["traded"].shift(-cfg.horizon)
+    out["horizon_traded"] = horizon_traded.fillna(0.0)
 
     # A bar is trainable only if it is a real print, the horizon lands inside
     # the same session, and every feature has enough history behind it.
     same_session = (out["mos"] + cfg.horizon) < BARS_PER_SESSION
     finite = out[list(FEATURE_NAMES)].to_numpy(dtype=np.float64)
     features_ok = np.isfinite(finite).all(axis=1)
-    out["valid"] = (
+    valid = (
         (out["traded"] > 0)
         & same_session
         & out["target"].notna()
@@ -212,6 +277,9 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
         & features_ok
         & (position >= cfg.warmup_bars)
     )
+    if cfg.require_horizon_traded:
+        valid = valid & (horizon_traded > 0)
+    out["valid"] = valid
 
     for name in FEATURE_NAMES:
         out[name] = out[name].replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -318,6 +386,16 @@ class SequenceDataset(Dataset):
         )
 
 
+def _source_mix(frame: pd.DataFrame) -> dict[str, float]:
+    if "source" not in frame.columns:
+        return {}
+    traded = frame.loc[frame["traded"] > 0, "source"].dropna()
+    if traded.empty:
+        return {}
+    counts = traded.astype(str).value_counts(normalize=True)
+    return {str(k): float(v) for k, v in counts.items()}
+
+
 def _split_bounds(n_sessions: int, cfg: DataConfig) -> tuple[int, int]:
     n_test = int(round(n_sessions * cfg.test_fraction))
     n_val = int(round(n_sessions * cfg.val_fraction))
@@ -362,6 +440,9 @@ def build_datasets(
         train_syms.append(panel_to_arrays(panel[is_train], symbol))
         val_syms.append(panel_to_arrays(panel[is_val], symbol))
         test_syms.append(panel_to_arrays(panel[is_test], symbol))
+        train_mix = _source_mix(panel[is_train])
+        val_mix = _source_mix(panel[is_val])
+        test_mix = _source_mix(panel[is_test])
         meta.append(
             {
                 "symbol": symbol,
@@ -374,6 +455,9 @@ def build_datasets(
                 "last": str(panel["datetime"].iloc[-1]),
                 "train_end": str(pd.Timestamp(train_end).date()),
                 "val_end": str(pd.Timestamp(val_end).date()),
+                "train_source_mix": train_mix,
+                "val_source_mix": val_mix,
+                "test_source_mix": test_mix,
             }
         )
         if log_fn:
@@ -384,6 +468,16 @@ def build_datasets(
                 f"{m['valid_bars']} labelled | train<{m['train_end']} "
                 f"val<{m['val_end']} test>= {m['val_end']}"
             )
+            if train_mix and test_mix:
+                train_top = max(train_mix, key=train_mix.get)
+                test_top = max(test_mix, key=test_mix.get)
+                if train_top != test_top:
+                    log_fn(
+                        f"WARNING {symbol}: train vendor is mostly {train_top} "
+                        f"({train_mix[train_top]:.0%}) but test is mostly {test_top} "
+                        f"({test_mix[test_top]:.0%}). Test IC is not the same "
+                        "data-generating process as train."
+                    )
 
     mean, std = feature_stats(train_syms)
 

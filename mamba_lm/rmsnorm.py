@@ -15,7 +15,8 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(d_model))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, L, d_model] (or any tensor whose last dim is d_model)
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        x_normed = x * torch.rsqrt(variance + self.eps)
-        return x_normed * self.weight
+        # Variance in fp32 so fp16 autocast cannot overflow x^2.
+        x32 = x.float()
+        variance = x32.pow(2).mean(dim=-1, keepdim=True)
+        x_normed = x32 * torch.rsqrt(variance + self.eps)
+        return (x_normed * self.weight.float()).to(dtype=x.dtype)

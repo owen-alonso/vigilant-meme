@@ -15,8 +15,13 @@ from torch.utils.data import DataLoader
 from mamba_lm.checkpoint import save_checkpoint
 from mamba_lm.config import MambaConfig, TrainConfig
 from mamba_lm.data import build_datasets
-from mamba_lm.model import MambaLM
-from mamba_lm.reporting import format_parameter_report, parameter_report
+from mamba_lm.model import MambaLM, format_dynamic_diagnostics
+from mamba_lm.reporting import (
+    clip_grad_norm_unique,
+    format_parameter_report,
+    parameter_report,
+    unique_parameters,
+)
 
 
 def select_device(prefer_cuda: bool = True) -> torch.device:
@@ -28,24 +33,32 @@ def select_device(prefer_cuda: bool = True) -> torch.device:
 def set_seed(seed: int) -> None:
     import random
 
+    import numpy as np
+
     random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 
-def autocast_context(device: torch.device, precision: str):
+def autocast_context(device: torch.device, precision: str, log_fn: Any | None = None):
+    """AMP context. CPU fp16 is not reliable; fall back to bf16 or fp32 and say so."""
     if precision == "fp32":
         return torch.autocast(device_type=device.type, enabled=False)
+    if precision == "fp16" and device.type == "cpu":
+        bf16_ok = bool(getattr(torch.cpu, "is_bf16_supported", lambda: False)())
+        if bf16_ok:
+            if log_fn:
+                log_fn("precision=fp16 is not available on CPU; using bf16 autocast")
+            return torch.autocast(
+                device_type="cpu", dtype=torch.bfloat16, enabled=True
+            )
+        if log_fn:
+            log_fn("precision=fp16 is not available on CPU; using fp32")
+        return torch.autocast(device_type="cpu", enabled=False)
     dtype = torch.float16 if precision == "fp16" else torch.bfloat16
-    enabled = True
-    if device.type == "cpu" and precision == "fp16":
-        # CPU fp16 autocast is not reliably implemented; fall back to bf16 if possible.
-        if torch.cpu.is_bf16_supported() if hasattr(torch.cpu, "is_bf16_supported") else True:
-            dtype = torch.bfloat16
-        else:
-            enabled = False
-    return torch.autocast(device_type=device.type, dtype=dtype, enabled=enabled)
+    return torch.autocast(device_type=device.type, dtype=dtype, enabled=True)
 
 
 def build_optimizer(model: MambaLM, train_cfg: TrainConfig) -> torch.optim.AdamW:
@@ -78,10 +91,29 @@ def _lr_at(step: int, train_cfg: TrainConfig) -> float:
     return train_cfg.lr
 
 
+def _require_nonempty_loader(loader: DataLoader, name: str) -> None:
+    if len(loader) == 0:
+        raise RuntimeError(
+            f"{name} DataLoader is empty (dataset size={len(loader.dataset)}, "
+            f"batch_size={loader.batch_size}, drop_last={loader.drop_last}). "
+            "Shrink batch_size or collect more data."
+        )
+
+
 def _cycle(loader: DataLoader) -> Iterator:
+    _require_nonempty_loader(loader, "train")
     while True:
         for batch in loader:
             yield batch
+
+
+def _grads_finite(model: torch.nn.Module) -> bool:
+    for param in unique_parameters(model):
+        if param.grad is None:
+            continue
+        if not torch.isfinite(param.grad).all():
+            return False
+    return True
 
 
 @torch.no_grad()
@@ -103,15 +135,21 @@ def evaluate(
         y = y.to(device)
         with autocast_context(device, precision):
             logits = model(x)
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                y.reshape(-1),
-            )
+        loss = F.cross_entropy(
+            logits.float().reshape(-1, logits.size(-1)),
+            y.reshape(-1),
+        )
         total_loss += float(loss.item()) * y.numel()
         total_tokens += y.numel()
         n_batches += 1
     model.train()
-    mean_loss = total_loss / max(1, total_tokens)
+    if total_tokens == 0 or n_batches == 0:
+        return {
+            "val_loss": float("nan"),
+            "val_ppl": float("nan"),
+            "val_batches": 0.0,
+        }
+    mean_loss = total_loss / total_tokens
     return {
         "val_loss": mean_loss,
         "val_ppl": math.exp(min(mean_loss, 20.0)),
@@ -141,6 +179,8 @@ def train(
     if log_fn:
         log_fn(format_parameter_report(report))
         log_fn(f"device={device} precision={train_cfg.precision} vocab={tokenizer.vocab_size}")
+        # Log the fp16-on-CPU fallback once, if it applies.
+        autocast_context(device, train_cfg.precision, log_fn=log_fn)
 
     train_loader = DataLoader(
         train_ds,
@@ -156,6 +196,7 @@ def train(
         drop_last=False,
         num_workers=train_cfg.num_workers,
     )
+    _require_nonempty_loader(train_loader, "train")
     optimizer = build_optimizer(model, train_cfg)
     use_scaler = train_cfg.precision == "fp16" and device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=use_scaler)
@@ -163,11 +204,26 @@ def train(
     checkpoint_dir = Path(train_cfg.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    extra = {"tokenizer": tokenizer.to_dict(), "train_config": train_cfg.to_dict()}
+
+    def _save(path: Path, step: int) -> None:
+        save_checkpoint(
+            path,
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler if use_scaler else None,
+            step=step,
+            extra=extra,
+        )
+
     train_losses: list[float] = []
     val_losses: list[float] = []
     grad_norms: list[float] = []
     diagnostics: list[dict[str, Any]] = []
     tokens_seen = 0
+    skipped_inf = 0
+    best_val = float("inf")
+    best_step = -1
     t0 = time.perf_counter()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -186,17 +242,27 @@ def train(
         optimizer.zero_grad(set_to_none=True)
         with autocast_context(device, train_cfg.precision):
             logits = model(x)
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                y.reshape(-1),
-            )
+        loss = F.cross_entropy(
+            logits.float().reshape(-1, logits.size(-1)),
+            y.reshape(-1),
+        )
 
         if not torch.isfinite(loss):
             raise RuntimeError(f"non-finite loss at step {step}: {loss}")
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip))
+        if not _grads_finite(model):
+            skipped_inf += 1
+            if log_fn:
+                log_fn(
+                    f"step {step:5d}: non-finite gradients, skipping optimizer step "
+                    f"(skipped={skipped_inf})"
+                )
+            scaler.update()
+            continue
+
+        grad_norm = clip_grad_norm_unique(model, train_cfg.grad_clip)
         scaler.step(optimizer)
         scaler.update()
 
@@ -218,9 +284,9 @@ def train(
                     f"lr={lr:.2e}  "
                     f"tok/s={tps:.0f}"
                 )
-                if diag:
-                    means = ", ".join(f"L{d['layer']}={d['dynamic_A_mean']:.4f}" for d in diag)
-                    msg += f"  A_scale_mean[{means}]"
+                extra_diag = format_dynamic_diagnostics(diag)
+                if extra_diag:
+                    msg += f"  {extra_diag}"
                 log_fn(msg)
 
         if (step + 1) % train_cfg.eval_interval == 0 or step + 1 == train_cfg.max_steps:
@@ -229,15 +295,17 @@ def train(
             )
             val_losses.append(val["val_loss"])
             if log_fn:
-                log_fn(f"eval step {step}  val_loss={val['val_loss']:.4f}  ppl={val['val_ppl']:.2f}")
-            save_checkpoint(
-                checkpoint_dir / "last.pt",
-                model=model,
-                optimizer=optimizer,
-                scaler=scaler if use_scaler else None,
-                step=step,
-                extra={"tokenizer": tokenizer.to_dict(), "train_config": train_cfg.to_dict()},
-            )
+                log_fn(
+                    f"eval step {step}  val_loss={val['val_loss']:.4f}  "
+                    f"ppl={val['val_ppl']:.2f}"
+                )
+            _save(checkpoint_dir / "last.pt", step)
+            if math.isfinite(val["val_loss"]) and val["val_loss"] < best_val:
+                best_val = val["val_loss"]
+                best_step = step
+                _save(checkpoint_dir / "best.pt", step)
+                if log_fn:
+                    log_fn(f"  new best val_loss={best_val:.4f} -> {checkpoint_dir / 'best.pt'}")
 
     elapsed = max(time.perf_counter() - t0, 1e-8)
     peak_mem = (
@@ -259,5 +327,8 @@ def train(
         "device": str(device),
         "final_train_loss": train_losses[-1] if train_losses else None,
         "final_val_loss": val_losses[-1] if val_losses else None,
+        "best_val_loss": best_val if math.isfinite(best_val) else None,
+        "best_step": best_step,
+        "skipped_inf_steps": skipped_inf,
         "mean_grad_norm": sum(grad_norms) / max(1, len(grad_norms)),
     }

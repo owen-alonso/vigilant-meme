@@ -134,9 +134,11 @@ class MambaBlock(nn.Module):
         if self.controller is not None and self.modulator is not None:
             params = self.controller(x)
             A, scale = self.modulator.modulate_A(A_base, params)
-            # A: [B, L, D, N], scale: [B, L, N]
-            self.last_delta_A = params.delta_A
-            self.last_A_scale = scale
+            # Detach so diagnostics do not keep the autograd graph alive.
+            self.last_delta_A = (
+                params.delta_A.detach() if params.delta_A is not None else None
+            )
+            self.last_A_scale = scale.detach()
         else:
             A = A_base  # [D, N]
             self.last_delta_A = None

@@ -73,8 +73,8 @@ def build_datasets(
     val_fraction: float = 0.1,
 ) -> tuple[CharTokenizer, CharLMDataset, CharLMDataset]:
     text = load_corpus(data_dir)
-    tokenizer = CharTokenizer.from_text(text)
     train_text, val_text = train_val_split(text, val_fraction)
+    tokenizer = CharTokenizer.from_text(train_text)
     train_ids = tokenizer.encode(train_text)
     val_ids = tokenizer.encode(val_text)
     return tokenizer, CharLMDataset(train_ids, seq_len), CharLMDataset(val_ids, seq_len)

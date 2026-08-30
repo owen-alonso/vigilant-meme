@@ -52,8 +52,11 @@ def run_training_comparison(
         for name, result in results.items():
             log_fn(f"\n{name}:")
             log_fn(format_parameter_report(result["parameter_report"]))
+            best = result.get("best_val_loss")
+            best_s = f"{best:.4f}" if isinstance(best, float) else "n/a"
             log_fn(
                 f"final train loss={result['final_train_loss']:.4f}  "
+                f"best val loss={best_s}  "
                 f"final val loss={result['final_val_loss']:.4f}  "
                 f"tok/s={result['tokens_per_sec']:.0f}  "
                 f"mean grad_norm={result['mean_grad_norm']:.3f}  "

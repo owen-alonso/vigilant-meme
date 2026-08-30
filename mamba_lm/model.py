@@ -54,6 +54,20 @@ class MambaLM(nn.Module):
         return reports
 
 
+def format_dynamic_diagnostics(reports: list[dict[str, Any]]) -> str:
+    """Compact log fragment: mean±std[min,max] per layer."""
+    if not reports:
+        return ""
+    parts = [
+        (
+            f"L{d['layer']}={d['dynamic_A_mean']:.4f}±{d['dynamic_A_std']:.4f}"
+            f"[{d['dynamic_A_min']:.3f},{d['dynamic_A_max']:.3f}]"
+        )
+        for d in reports
+    ]
+    return "A_scale[" + ", ".join(parts) + "]"
+
+
 def _scale_stats(scale: torch.Tensor) -> dict[str, float]:
     s = scale.detach().float()
     return {

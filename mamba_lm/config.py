@@ -63,10 +63,13 @@ class MambaConfig:
             raise ValueError(f"expand must be positive, got {self.expand}")
         if self.dynamic_strength < 0:
             raise ValueError("dynamic_strength must be non-negative")
+        # Reject reserved flags even when Dynamic A is off, so they cannot
+        # sit silently unused on a baseline config.
+        self._reject_unimplemented_flags()
         if self.dynamic_weights:
             self._validate_dynamic_v1()
 
-    def _validate_dynamic_v1(self) -> None:
+    def _reject_unimplemented_flags(self) -> None:
         if self.dynamic_parameterization != "elementwise":
             raise NotImplementedError(
                 "V1 only implements dynamic_parameterization='elementwise'; "
@@ -85,6 +88,9 @@ class MambaConfig:
             raise NotImplementedError(
                 "V1 only implements Dynamic A. Disable: " + ", ".join(unimplemented)
             )
+
+    def _validate_dynamic_v1(self) -> None:
+        self._reject_unimplemented_flags()
         if not self.dynamic_A:
             raise ValueError(
                 "dynamic_weights=True requires dynamic_A=True in V1 "

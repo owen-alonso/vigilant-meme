@@ -43,3 +43,5 @@ def test_delta_A_not_constant_after_perturb():
     block(x)
     assert block.last_delta_A is not None
     assert block.last_delta_A.abs().sum() > 0
+    assert not block.last_A_scale.requires_grad
+    assert not block.last_delta_A.requires_grad

@@ -173,8 +173,17 @@ y_t = \frac{\log C_{t+60} - \log C_t}{\sigma_t \sqrt{60}}
 \(t-1\). Predicting a volatility-normalized return keeps the objective
 stationary across calm and stressed regimes; `generate.py` multiplies by
 \(\sigma_t\sqrt{60}\) to report basis points. A bar is labelled only when it is
-a real print and \(t+60\) falls inside the same session, so no target spans an
-overnight gap.
+a real print, \(t+60\) falls inside the same session, **and** the horizon bar
+itself is a real print (not a forward-filled hole).
+
+Intraday missing minutes are forward-filled **within the session**. Prices do
+not carry across dropped days; returns that would cross a gap of more than
+four calendar days are treated as missing. Tz-aware timestamps are converted
+to US/Eastern before the 09:30–15:59 filter.
+
+Default training uses Huber on the mean only. Pass `--loss gaussian
+--heteroscedastic` if you want a trained residual-uncertainty head;
+`generate.py` will otherwise omit the uncertainty column.
 
 Features are scale-free (vol-normalized returns, ranges, standardized volume,
 staleness, time-of-day), so the model carries no per-symbol parameters and the
@@ -189,4 +198,4 @@ measured against the honest baseline of predicting zero.
 
 ## Tests
 
-Shape, baseline equivalence, gradients, token/batch dependence, fp32 + AMP stability, checkpoint round-trip, and parameter reporting. CUDA is used automatically when present; this environment’s unit tests run on CPU.
+Shape, baseline equivalence, gradients, token/batch dependence, fp32 + AMP stability, checkpoint round-trip, parameter reporting, scan backward, and forecast causality/masks. CUDA is used automatically when present.

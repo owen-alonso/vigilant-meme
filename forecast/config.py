@@ -50,6 +50,12 @@ class DataConfig:
     clip: float = 8.0  # feature clamp, in standardized units
     val_fraction: float = 0.15
     test_fraction: float = 0.15
+    # A label is only valid if the horizon bar itself is a real print, not a
+    # forward-filled hole. Otherwise "next hour return" can be a stale zero.
+    require_horizon_traded: bool = True
+    # Session joins wider than this (calendar days) are not treated as a
+    # one-minute return; diffs that cross the gap become NaN.
+    max_session_gap_days: int = 4
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -71,7 +77,9 @@ class ForecastModelConfig:
     expand: int = 2
     d_conv: int = 4
     dropout: float = 0.1
-    heteroscedastic: bool = True  # also predict a per-bar log sigma
+    # Extra log-sigma head. Only trained when ForecastTrainConfig.loss is
+    # "gaussian"; keep False unless you opt into that loss.
+    heteroscedastic: bool = False
 
     dynamic_weights: bool = False
     dynamic_A: bool = True
@@ -127,3 +135,14 @@ class ForecastTrainConfig:
     def from_dict(cls, data: dict[str, Any]) -> ForecastTrainConfig:
         allowed = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in data.items() if k in allowed})
+
+
+def validate_loss_head(model_cfg: ForecastModelConfig, train_cfg: ForecastTrainConfig) -> None:
+    """Huber/MSE must not ship an untrained uncertainty head; gaussian needs one."""
+    if train_cfg.loss == "gaussian" and not model_cfg.heteroscedastic:
+        raise ValueError("loss='gaussian' requires ForecastModelConfig.heteroscedastic=True")
+    if train_cfg.loss != "gaussian" and model_cfg.heteroscedastic:
+        raise ValueError(
+            "heteroscedastic=True is only trained under loss='gaussian'; "
+            "set heteroscedastic=False or switch the loss"
+        )

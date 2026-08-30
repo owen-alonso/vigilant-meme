@@ -41,3 +41,5 @@ def test_unimplemented_flags_raise():
             dynamic_weights=True,
             dynamic_parameterization="low_rank",
         )
+    with pytest.raises(NotImplementedError):
+        MambaConfig(d_model=32, n_layer=1, dynamic_weights=False, dynamic_B=True)

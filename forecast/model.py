@@ -71,7 +71,8 @@ class ReturnForecaster(nn.Module):
         mean = out[..., 0]
         if self.config.heteroscedastic:
             # Bounded so the NLL cannot escape by predicting infinite variance.
-            log_sigma = out[..., 1].clamp(-6.0, 3.0)
+            # Unit-vol targets make [-3, 1] a usable residual-std range.
+            log_sigma = out[..., 1].clamp(-3.0, 1.0)
         else:
             log_sigma = torch.zeros_like(mean)
         return mean, log_sigma
@@ -79,9 +80,13 @@ class ReturnForecaster(nn.Module):
     @torch.no_grad()
     def predict(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Prediction at the final bar of each sequence: ``([B], [B])``."""
+        was_training = self.training
         self.eval()
-        mean, log_sigma = self(features)
-        return mean[:, -1], log_sigma[:, -1]
+        try:
+            mean, log_sigma = self(features)
+            return mean[:, -1], log_sigma[:, -1]
+        finally:
+            self.train(was_training)
 
     def collect_dynamic_diagnostics(self) -> list[dict[str, Any]]:
         """Per-layer Dynamic A scale stats from the most recent forward pass."""

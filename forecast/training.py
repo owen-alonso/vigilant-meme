@@ -38,9 +38,18 @@ from forecast.config import (
     DataConfig,
     ForecastModelConfig,
     ForecastTrainConfig,
+    validate_loss_head,
 )
-from forecast.data import FEATURE_NAMES, build_datasets
+from forecast.data import FEATURE_NAMES, REPO_ROOT, build_datasets
 from forecast.model import ReturnForecaster
+from mamba_lm.model import format_dynamic_diagnostics
+from mamba_lm.reporting import clip_grad_norm_unique
+from mamba_lm.train import (
+    _grads_finite,
+    _require_nonempty_loader,
+    autocast_context,
+    select_device,
+)
 
 
 # --------------------------------------------------------------------------
@@ -57,7 +66,9 @@ def masked_loss(
 ) -> torch.Tensor:
     """Loss over labelled bars only. Returns a zero-grad-safe scalar."""
     weights = mask.to(mean.dtype)
-    denom = weights.sum().clamp(min=1.0)
+    denom = weights.sum()
+    if float(denom) <= 0:
+        return mean.new_tensor(float("nan"))
 
     if cfg.loss == "mse":
         per_bar = (mean - target).pow(2)
@@ -125,12 +136,6 @@ def compute_metrics(
 # --------------------------------------------------------------------------
 
 
-def select_device(prefer_cuda: bool = True) -> torch.device:
-    if prefer_cuda and torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-
 def set_seed(seed: int) -> None:
     import random
 
@@ -139,15 +144,6 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def autocast_context(device: torch.device, precision: str):
-    if precision == "fp32":
-        return torch.autocast(device_type=device.type, enabled=False)
-    dtype = torch.float16 if precision == "fp16" else torch.bfloat16
-    if device.type == "cpu" and precision == "fp16":
-        dtype = torch.bfloat16
-    return torch.autocast(device_type=device.type, dtype=dtype, enabled=True)
 
 
 def build_optimizer(
@@ -187,6 +183,7 @@ def lr_at(step: int, total_steps: int, cfg: ForecastTrainConfig) -> float:
 
 
 def _cycle(loader: DataLoader) -> Iterator:
+    _require_nonempty_loader(loader, "train")
     while True:
         for batch in loader:
             yield batch
@@ -204,7 +201,8 @@ def evaluate(
     preds: list[np.ndarray] = []
     targets: list[np.ndarray] = []
     scales: list[np.ndarray] = []
-    total_loss, n_batches = 0.0, 0
+    weighted_loss = 0.0
+    total_weight = 0.0
 
     for i, (x, y, mask, scale) in enumerate(loader):
         if max_batches is not None and i >= max_batches:
@@ -214,8 +212,10 @@ def evaluate(
             mean, log_sigma = model(x)
         mean = mean.float()
         loss = masked_loss(mean, log_sigma.float(), y, mask, train_cfg)
-        total_loss += float(loss)
-        n_batches += 1
+        weight = float(mask.to(mean.dtype).sum())
+        if weight > 0 and math.isfinite(float(loss)):
+            weighted_loss += float(loss) * weight
+            total_weight += weight
         sel = mask.bool()
         preds.append(mean[sel].cpu().numpy())
         targets.append(y[sel].cpu().numpy())
@@ -227,7 +227,7 @@ def evaluate(
         np.concatenate(targets) if targets else np.empty(0),
         np.concatenate(scales) if scales else np.empty(0),
     )
-    metrics["loss"] = total_loss / max(1, n_batches)
+    metrics["loss"] = weighted_loss / total_weight if total_weight > 0 else float("nan")
     return metrics
 
 
@@ -254,6 +254,7 @@ def train(
 ) -> dict[str, Any]:
     device = device or select_device()
     set_seed(train_cfg.seed)
+    validate_loss_head(model_cfg, train_cfg)
 
     bundle = build_datasets(data_cfg, log_fn=log_fn)
     datasets = bundle["datasets"]
@@ -265,8 +266,10 @@ def train(
         log_fn(
             f"device={device} params={n_params:,} features={model_cfg.n_features} "
             f"seq_len={data_cfg.seq_len} horizon={data_cfg.horizon} "
-            f"dynamic_weights={model_cfg.dynamic_weights}"
+            f"dynamic_weights={model_cfg.dynamic_weights} "
+            f"loss={train_cfg.loss} heteroscedastic={model_cfg.heteroscedastic}"
         )
+        autocast_context(device, train_cfg.precision, log_fn=log_fn)
 
     train_loader = DataLoader(
         datasets["train"],
@@ -289,13 +292,25 @@ def train(
     )
 
     steps_per_epoch = len(train_loader)
-    total_steps = train_cfg.max_steps or steps_per_epoch * train_cfg.epochs
+    _require_nonempty_loader(train_loader, "train")
+    if train_cfg.max_steps is None:
+        total_steps = steps_per_epoch * train_cfg.epochs
+    else:
+        total_steps = train_cfg.max_steps
+    if total_steps < 1:
+        raise RuntimeError("total_steps is 0; check epochs, max_steps, and dataset size")
     optimizer = build_optimizer(model, train_cfg)
     use_scaler = train_cfg.precision == "fp16" and device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=use_scaler)
 
+    # Anchor outputs to the repo root so runs launched from forecast/ or an IDE
+    # do not scatter checkpoint trees around the working directory.
     ckpt_dir = Path(train_cfg.checkpoint_dir)
+    if not ckpt_dir.is_absolute():
+        ckpt_dir = REPO_ROOT / ckpt_dir
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if log_fn:
+        log_fn(f"checkpoints -> {ckpt_dir}")
 
     def save(path: Path, step: int, metrics: dict[str, float]) -> None:
         torch.save(
@@ -343,9 +358,12 @@ def train(
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        grad_norm = float(
-            torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
-        )
+        if not _grads_finite(model):
+            if log_fn:
+                log_fn(f"step {step + 1}: non-finite gradients, skipping optimizer step")
+            scaler.update()
+            continue
+        grad_norm = clip_grad_norm_unique(model, train_cfg.grad_clip)
         scaler.step(optimizer)
         scaler.update()
         running.append(float(loss.detach()))
@@ -353,12 +371,17 @@ def train(
         if (step + 1) % train_cfg.log_interval == 0 or step == 0:
             elapsed = max(time.perf_counter() - t0, 1e-8)
             if log_fn:
-                log_fn(
+                msg = (
                     f"step {step + 1:6d}/{total_steps}  "
                     f"loss={np.mean(running[-train_cfg.log_interval:]):.5f}  "
                     f"grad={grad_norm:.3f}  lr={lr:.2e}  "
                     f"{(step + 1) / elapsed:.2f} it/s"
                 )
+                diag = model.collect_dynamic_diagnostics()
+                extra_diag = format_dynamic_diagnostics(diag)
+                if extra_diag:
+                    msg += f"  {extra_diag}"
+                log_fn(msg)
 
         if (step + 1) % train_cfg.eval_interval == 0 or step + 1 == total_steps:
             val = evaluate(model, val_loader, device, train_cfg)
@@ -423,6 +446,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--min-session-bars", type=int, default=d.min_session_bars)
     g.add_argument("--val-fraction", type=float, default=d.val_fraction)
     g.add_argument("--test-fraction", type=float, default=d.test_fraction)
+    g.add_argument(
+        "--allow-stale-horizon",
+        action="store_true",
+        help="label bars whose t+horizon slot was not a real print (not recommended)",
+    )
 
     g = p.add_argument_group("model")
     g.add_argument("--d-model", type=int, default=m.d_model)
@@ -432,7 +460,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--dropout", type=float, default=m.dropout)
     g.add_argument("--dynamic-weights", action="store_true")
     g.add_argument("--dynamic-strength", type=float, default=m.dynamic_strength)
-    g.add_argument("--no-heteroscedastic", action="store_true")
+    g.add_argument(
+        "--heteroscedastic",
+        action="store_true",
+        help="train a log-sigma head (requires --loss gaussian)",
+    )
+    g.add_argument(
+        "--no-heteroscedastic",
+        action="store_true",
+        help="force a single-output head even with --loss gaussian",
+    )
 
     g = p.add_argument_group("optim")
     g.add_argument("--batch-size", type=int, default=t.batch_size)
@@ -455,6 +492,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
 
+    if args.heteroscedastic and args.no_heteroscedastic:
+        raise SystemExit("use only one of --heteroscedastic / --no-heteroscedastic")
+    if args.loss == "gaussian":
+        heteroscedastic = not args.no_heteroscedastic
+    else:
+        heteroscedastic = args.heteroscedastic
+
     data_cfg = DataConfig(
         data_dir=args.data_dir,
         horizon=args.horizon,
@@ -464,6 +508,7 @@ def main(argv: list[str] | None = None) -> None:
         min_session_bars=args.min_session_bars,
         val_fraction=args.val_fraction,
         test_fraction=args.test_fraction,
+        require_horizon_traded=not args.allow_stale_horizon,
     )
     model_cfg = ForecastModelConfig(
         n_features=len(FEATURE_NAMES),
@@ -472,7 +517,7 @@ def main(argv: list[str] | None = None) -> None:
         d_state=args.d_state,
         expand=args.expand,
         dropout=args.dropout,
-        heteroscedastic=not args.no_heteroscedastic,
+        heteroscedastic=heteroscedastic,
         dynamic_weights=args.dynamic_weights,
         dynamic_strength=args.dynamic_strength,
     )

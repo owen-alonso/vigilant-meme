@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from mamba_lm.scan import (
@@ -19,6 +20,19 @@ def test_parallel_matches_sequential():
     h_seq = linear_recurrence_sequential(a, b)
     h_par = linear_recurrence_parallel(a, b)
     assert torch.allclose(h_seq, h_par, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("seq_len", [8, 17, 64])
+def test_parallel_backward_matches_sequential(seq_len):
+    torch.manual_seed(0)
+    a = (torch.rand(2, seq_len, 3, 2) * 0.4 + 0.5).requires_grad_(True)
+    b = torch.randn(2, seq_len, 3, 2, requires_grad=True)
+    a_p = a.detach().clone().requires_grad_(True)
+    b_p = b.detach().clone().requires_grad_(True)
+    linear_recurrence_sequential(a, b).sum().backward()
+    linear_recurrence_parallel(a_p, b_p).sum().backward()
+    assert torch.allclose(a.grad, a_p.grad, rtol=1e-4, atol=1e-4)
+    assert torch.allclose(b.grad, b_p.grad, rtol=1e-4, atol=1e-4)
 
 
 def test_discretize_static_and_dynamic_shapes():
