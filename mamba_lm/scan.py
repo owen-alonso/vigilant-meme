@@ -7,6 +7,11 @@ The recurrence is the standard diagonal S6 step:
 
 A_bar is always shaped [B, L, D, N] so a static A and a token-dependent A_t
 share one scan implementation.
+
+The default scan is a chunked associative scan. Hillis–Steele over the full
+length clones [B, L, D, N] log2(L) times and dominates training time; scanning
+short chunks serially (vectorized over batch) then combining chunk carries is
+mathematically the same prefix and much cheaper on GPU.
 """
 
 from __future__ import annotations
@@ -14,9 +19,13 @@ from __future__ import annotations
 from typing import Literal
 
 import torch
+import torch.nn.functional as F
 
 
 ScanAlgorithm = Literal["parallel", "sequential"]
+
+# Chosen from GPU fwd+bwd timings on [B=8, L=256, D=256, N=16] (RTX 4070).
+_SCAN_CHUNK = 8
 
 
 def discretize(
@@ -38,16 +47,13 @@ def discretize(
         deltaB_u: [B, L, D, N] = dt * B * u
     """
     if A.dim() == 2:
-        # A: [D, N] broadcasts against dt: [B, L, D, 1] -> [B, L, D, N]
         dt_A = dt.unsqueeze(-1) * A
     elif A.dim() == 4:
-        # A already token-dependent: [B, L, D, N]
         dt_A = dt.unsqueeze(-1) * A
     else:
         raise ValueError(f"A must be [D, N] or [B, L, D, N], got {tuple(A.shape)}")
 
     A_bar = torch.exp(dt_A)
-    # dt [B,L,D,1] * B [B,L,1,N] * u [B,L,D,1] -> [B, L, D, N]
     deltaB_u = dt.unsqueeze(-1) * B.unsqueeze(2) * u.unsqueeze(-1)
     return A_bar, deltaB_u
 
@@ -57,35 +63,82 @@ def linear_recurrence_sequential(a: torch.Tensor, b: torch.Tensor) -> torch.Tens
 
     a, b, h: [B, L, D, N]
     """
+    return _serial_scan(a, b)
+
+
+def _serial_scan(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """h_t = a_t * h_{t-1} + b_t along dim 1. a, b, h: [B, T, D, N]."""
     batch, seq_len, d_inner, d_state = a.shape
-    h_t = torch.zeros(batch, d_inner, d_state, dtype=a.dtype, device=a.device)
+    h = a.new_zeros(batch, d_inner, d_state)
     outputs = []
     for t in range(seq_len):
-        h_t = a[:, t] * h_t + b[:, t]
-        outputs.append(h_t)
+        h = a[:, t] * h + b[:, t]
+        outputs.append(h)
     return torch.stack(outputs, dim=1)
 
 
-def linear_recurrence_parallel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Vectorized Hillis–Steele prefix scan for h_t = a_t * h_{t-1} + b_t.
+def _associative_scan(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Hillis–Steele prefix scan along dim 1.
 
-    Pair operator: (a1, b1) ⊕ (a2, b2) = (a2 * a1, a2 * b1 + b2)
-
-    a, b, h: [B, L, D, N]
+    Cheap when T is small (chunk carries). The same algorithm over full L
+    clones [B, L, D, N] log2(L) times and is the training bottleneck we
+    replaced; do not use it as the default full-length scan.
     """
     seq_len = a.shape[1]
-    h_a = a
-    h_b = b
+    h_a, h_b = a, b
     k = 1
     while k < seq_len:
         a_next = h_a.clone()
         b_next = h_b.clone()
-        # Combine the length-k prefix ending at t-k into the prefix ending at t.
         a_next[:, k:] = h_a[:, k:] * h_a[:, :-k]
         b_next[:, k:] = h_a[:, k:] * h_b[:, :-k] + h_b[:, k:]
         h_a, h_b = a_next, b_next
         k *= 2
     return h_b
+
+
+def linear_recurrence_parallel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Chunked associative scan for h_t = a_t * h_{t-1} + b_t.
+
+    Pair operator: (a1, b1) ⊕ (a2, b2) = (a2 * a1, a2 * b1 + b2)
+
+    Short chunks are scanned serially (vectorized over batch and chunk).
+    Chunk carries are combined with Hillis–Steele on the much smaller
+    [B, n_chunks, D, N] tensors, then injected so the result matches a
+    full-length prefix scan without log2(L) clones of [B, L, D, N].
+    """
+    batch, seq_len, d_inner, d_state = a.shape
+    chunk = _SCAN_CHUNK
+    if seq_len <= chunk:
+        return _serial_scan(a, b)
+
+    pad = (chunk - seq_len % chunk) % chunk
+    if pad:
+        a = F.pad(a, (0, 0, 0, 0, 0, pad), value=1.0)
+        b = F.pad(b, (0, 0, 0, 0, 0, pad), value=0.0)
+    padded = a.shape[1]
+    n_chunks = padded // chunk
+    a = a.reshape(batch, n_chunks, chunk, d_inner, d_state)
+    b = b.reshape(batch, n_chunks, chunk, d_inner, d_state)
+
+    h = a.new_zeros(batch, n_chunks, d_inner, d_state)
+    acc_a = a.new_ones(batch, n_chunks, d_inner, d_state)
+    hs: list[torch.Tensor] = []
+    prefs: list[torch.Tensor] = []
+    for t in range(chunk):
+        acc_a = acc_a * a[:, :, t]
+        h = a[:, :, t] * h + b[:, :, t]
+        hs.append(h)
+        prefs.append(acc_a)
+    h_local = torch.stack(hs, dim=2)
+    a_pref = torch.stack(prefs, dim=2)
+
+    # State after each chunk, then incoming carry = previous chunk's state.
+    h_chunks = _associative_scan(a_pref[:, :, -1], h_local[:, :, -1])
+    zeros = a.new_zeros(batch, 1, d_inner, d_state)
+    hin = torch.cat([zeros, h_chunks[:, :-1]], dim=1).unsqueeze(2)
+    out = a_pref * hin + h_local
+    return out.reshape(batch, padded, d_inner, d_state)[:, :seq_len]
 
 
 def selective_scan(
@@ -105,7 +158,7 @@ def selective_scan(
         deltaB_u: [B, L, D, N]
         C:        [B, L, N]
         D:        [D]
-        algorithm: "parallel" (default) or "sequential" (reference)
+        algorithm: "parallel" (default, chunked) or "sequential" (reference)
 
     Returns:
         y: [B, L, D]
@@ -117,7 +170,6 @@ def selective_scan(
     else:
         raise ValueError(f"Unknown scan algorithm: {algorithm!r}")
 
-    # y_t = C_t · h_t  (sum over N) + D * u_t
     y = (h * C.unsqueeze(2)).sum(dim=-1)
     y = y + u * D
     return y

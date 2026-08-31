@@ -109,46 +109,74 @@ def _session_naive_datetime(series: pd.Series) -> pd.Series:
     return ts
 
 
-def load_bars(path: str | Path) -> pd.DataFrame:
-    """Read one parquet of 1-minute bars and normalize its column names."""
-    df = pd.read_parquet(path)
-    rename = {c: c.lower() for c in df.columns}
-    df = df.rename(columns=rename)
-    if "datetime" not in df.columns:
-        raise ValueError(f"{path}: expected a 'datetime' column, got {list(df.columns)}")
-    missing = [c.lower() for c in OHLCV_COLUMNS if c.lower() not in df.columns]
+def normalize_bars(df: pd.DataFrame, *, origin: str = "bars") -> pd.DataFrame:
+    """Normalize an OHLCV frame to the columns ``load_bars`` / generate expect.
+
+    Accepts parquet-style columns or a DatetimeIndex (Yahoo). Extra columns
+    such as Adj Close are dropped.
+    """
+    out = df.copy()
+    if "datetime" not in {str(c).lower() for c in out.columns}:
+        if isinstance(out.index, pd.DatetimeIndex):
+            out = out.reset_index()
+    renamed: dict[Any, str] = {}
+    for col in out.columns:
+        key = str(col).lower().replace(" ", "")
+        if key in {"date", "datetime", "timestamp", "index"}:
+            renamed[col] = "datetime"
+        else:
+            renamed[col] = str(col).lower()
+    out = out.rename(columns=renamed)
+    if "datetime" not in out.columns:
+        raise ValueError(f"{origin}: expected a 'datetime' column, got {list(out.columns)}")
+    missing = [c.lower() for c in OHLCV_COLUMNS if c.lower() not in out.columns]
     if missing:
-        raise ValueError(f"{path}: missing columns {missing}")
-    df["datetime"] = _session_naive_datetime(df["datetime"])
+        raise ValueError(f"{origin}: missing columns {missing}")
+    out["datetime"] = _session_naive_datetime(out["datetime"])
     keep = ["datetime", "open", "high", "low", "close", "volume"]
-    if "source" in df.columns:
+    if "source" in out.columns:
         keep.append("source")
-    df = df.loc[:, keep]
-    df = df.dropna(subset=["datetime", "close"])
-    nonpos = df["close"] <= 0
+    out = out.loc[:, keep]
+    out = out.dropna(subset=["datetime", "close"])
+    nonpos = out["close"] <= 0
     if nonpos.any():
         raise ValueError(
-            f"{path}: {int(nonpos.sum())} rows with close <= 0 (log-price is undefined)"
+            f"{origin}: {int(nonpos.sum())} rows with close <= 0 (log-price is undefined)"
         )
-    df = df.sort_values("datetime").drop_duplicates("datetime", keep="last")
-    return df.reset_index(drop=True)
+    out = out.sort_values("datetime").drop_duplicates("datetime", keep="last")
+    return out.reset_index(drop=True)
 
 
-def build_session_grid(df: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
+def load_bars(path: str | Path) -> pd.DataFrame:
+    """Read one parquet of 1-minute bars and normalize its column names."""
+    return normalize_bars(pd.read_parquet(path), origin=str(path))
+
+
+def build_session_grid(
+    df: pd.DataFrame,
+    cfg: DataConfig,
+    *,
+    keep_latest_session: bool = False,
+) -> pd.DataFrame:
     """Reindex sparse bars onto a dense ``(session, minute_of_session)`` grid.
 
     Untraded slots get ``traded=0``, ``volume=0`` and a forward-filled price.
-    Sessions with too few real prints are dropped entirely.
+    Sessions with too few real prints are dropped entirely, unless
+    ``keep_latest_session`` is set (live inference at the open).
     """
     dt = df["datetime"]
     mos = dt.dt.hour * 60 + dt.dt.minute - SESSION_START_MINUTE
     in_session = (mos >= 0) & (mos < BARS_PER_SESSION)
     df = df.loc[in_session].copy()
+    if df.empty:
+        raise ValueError("no bars fall inside the 09:30-15:59 session grid")
     df["session"] = dt.loc[in_session].dt.normalize()
     df["mos"] = mos.loc[in_session]
 
     counts = df.groupby("session")["close"].size()
     keep = counts.index[counts >= cfg.min_session_bars]
+    if keep_latest_session and len(counts):
+        keep = keep.union(pd.Index([counts.index.max()]))
     if len(keep) == 0:
         raise ValueError(
             f"no session has >= {cfg.min_session_bars} bars "
@@ -289,12 +317,51 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     return out
 
 
-def build_panel(path: str | Path, cfg: DataConfig) -> pd.DataFrame:
-    """Full raw-parquet -> feature-frame pipeline for one symbol."""
-    grid = build_session_grid(load_bars(path), cfg)
+def assemble_panel(
+    bars: pd.DataFrame,
+    cfg: DataConfig,
+    symbol: str,
+    *,
+    keep_latest_session: bool = False,
+) -> pd.DataFrame:
+    """Session-grid + features for an already-normalized OHLCV frame."""
+    grid = build_session_grid(
+        bars, cfg, keep_latest_session=keep_latest_session
+    )
     panel = compute_features(grid, cfg)
-    panel["symbol"] = symbol_from_path(path)
+    panel["symbol"] = str(symbol).upper()
     return panel
+
+
+def build_panel_from_bars(
+    df: pd.DataFrame,
+    cfg: DataConfig,
+    symbol: str,
+    *,
+    keep_latest_session: bool = False,
+) -> pd.DataFrame:
+    """OHLCV frame (Yahoo or parquet-like) -> feature panel."""
+    return assemble_panel(
+        normalize_bars(df, origin=symbol),
+        cfg,
+        symbol,
+        keep_latest_session=keep_latest_session,
+    )
+
+
+def build_panel(
+    path: str | Path,
+    cfg: DataConfig,
+    *,
+    keep_latest_session: bool = False,
+) -> pd.DataFrame:
+    """Full raw-parquet -> feature-frame pipeline for one symbol."""
+    return assemble_panel(
+        load_bars(path),
+        cfg,
+        symbol_from_path(path),
+        keep_latest_session=keep_latest_session,
+    )
 
 
 # --------------------------------------------------------------------------

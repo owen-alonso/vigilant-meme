@@ -2,8 +2,12 @@
 
 Usage:
     python -m forecast.generate --checkpoint checkpoints/forecast/best.pt
+    python -m forecast.generate --checkpoint checkpoints/forecast/best.pt --last 10
     python -m forecast.generate --checkpoint checkpoints/forecast/best.pt \\
-        --data data/AAPL_clean_1min.parquet --last 20 --csv aapl_forecast.csv
+        --symbols AAPL,MSFT --csv pred_moves.csv
+
+By default every parquet in the checkpoint's data_dir is scored. The printed
+table has one column per ticker; cells are predicted next-hour moves in bp.
 
 The checkpoint carries its own DataConfig and feature normalization, so the
 features built here are identical to the ones the model was trained on.
@@ -28,7 +32,13 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from forecast.config import DataConfig, ForecastModelConfig
-from forecast.data import FEATURE_NAMES, REPO_ROOT, build_panel, discover_symbol_files
+from forecast.data import (
+    FEATURE_NAMES,
+    REPO_ROOT,
+    build_panel,
+    discover_symbol_files,
+    symbol_from_path,
+)
 from forecast.model import ReturnForecaster
 
 
@@ -121,10 +131,10 @@ def choose_positions(
         stamp = pd.Timestamp(asof)
         matches = np.flatnonzero(panel["datetime"].to_numpy() <= np.datetime64(stamp))
         if matches.size == 0:
-            raise SystemExit(f"no bars at or before {stamp}")
+            raise ValueError(f"no bars at or before {stamp}")
         end = int(matches[-1])
         if end < context - 1:
-            raise SystemExit(
+            raise ValueError(
                 f"only {end + 1} bars before {stamp}; need {context} for context"
             )
         return np.array([end], dtype=np.int64)
@@ -132,131 +142,203 @@ def choose_positions(
     end = len(panel) - 1
     first = max(context - 1, end - last + 1)
     if first > end:
-        raise SystemExit(f"need at least {context} bars, panel has {len(panel)}")
+        raise ValueError(f"need at least {context} bars, panel has {len(panel)}")
     return np.arange(first, end + 1, dtype=np.int64)
+
+
+def parse_symbols(raw: str | None) -> list[str] | None:
+    if raw is None or not str(raw).strip():
+        return None
+    return [part.strip().upper() for part in str(raw).split(",") if part.strip()]
+
+
+def resolve_data_files(
+    data_arg: str | None,
+    data_dir: str | Path,
+    symbols: list[str] | None,
+) -> list[Path]:
+    """Parquet files to score: one file, a directory, or the checkpoint data_dir."""
+    if data_arg:
+        path = Path(data_arg)
+        if not path.is_absolute() and not path.exists():
+            path = REPO_ROOT / path
+        if path.is_dir():
+            files = discover_symbol_files(path)
+        else:
+            files = [path]
+    else:
+        files = discover_symbol_files(data_dir)
+
+    missing = [f for f in files if not f.exists()]
+    if missing:
+        raise FileNotFoundError(f"data file not found: {missing[0]}")
+
+    if symbols is not None:
+        wanted = set(symbols)
+        files = [f for f in files if symbol_from_path(f) in wanted]
+        have = {symbol_from_path(f) for f in files}
+        unknown = sorted(wanted - have)
+        if unknown:
+            raise FileNotFoundError(
+                "no parquet for symbol(s): " + ", ".join(unknown)
+            )
+    if not files:
+        raise FileNotFoundError("no symbol parquet files to forecast")
+    return files
+
+
+def predicted_move_wide(by_symbol: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Datetime index, one column per ticker, values = predicted move in bp."""
+    parts: list[pd.Series] = []
+    for sym in sorted(by_symbol):
+        df = by_symbol[sym]
+        parts.append(
+            pd.Series(
+                df["pred_return_bps"].to_numpy(dtype=np.float64),
+                index=pd.to_datetime(df["datetime"]),
+                name=sym,
+            )
+        )
+    return pd.concat(parts, axis=1, sort=False).sort_index()
+
+
+def latest_snapshot(by_symbol: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Rows are fields; each ticker is its own column (latest bar per file)."""
+    columns: dict[str, dict[str, str]] = {}
+    for sym in sorted(by_symbol):
+        row = by_symbol[sym].iloc[-1]
+        entry = {
+            "as of": _fmt_when(row["datetime"]),
+            "print": "yes" if bool(row["traded"]) else "no",
+            "last $": _fmt_px(float(row["close"])),
+            "pred (bp)": f"{float(row['pred_return_bps']):+.1f}",
+            "pred $ in 1h": _fmt_px(float(row["pred_price_1h"])),
+        }
+        if "realized_bps" in by_symbol[sym].columns:
+            realized = row["realized_bps"]
+            entry["realized (bp)"] = (
+                f"{float(realized):+.1f}" if pd.notna(realized) else "-"
+            )
+        columns[sym] = entry
+    return pd.DataFrame(columns)
 
 
 def _fmt_px(value: float) -> str:
     return f"{value:,.4f}"
 
 
-def _fmt_bps(value: float) -> str:
-    sign = "+" if value >= 0 else ""
-    return f"{sign}{value:.1f} bp"
-
-
 def _fmt_when(ts) -> str:
     return pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M")
 
 
-def format_forecast_report(
-    result: pd.DataFrame,
+def _format_wide_bp(wide: pd.DataFrame) -> str:
+    display = wide.copy()
+    display.index = pd.to_datetime(display.index).strftime("%Y-%m-%d %H:%M")
+    display.index.name = "when"
+    shown = display.apply(
+        lambda col: col.map(lambda v: f"{v:+.1f}" if pd.notna(v) else "-")
+    )
+    return shown.to_string()
+
+
+def format_stock_column_report(
+    by_symbol: dict[str, pd.DataFrame],
     *,
-    symbol: str,
     trained_on: str,
     checkpoint: Path,
-    data_path: Path,
     data_cfg: DataConfig,
     context: int,
     device: torch.device,
-    include_uncertainty: bool,
     notes: list[str],
 ) -> str:
-    """Human-readable terminal report. 1 bp = 0.01%."""
+    """Header plus a table whose columns are tickers (predicted move in bp)."""
     lines: list[str] = []
-    horizon_min = data_cfg.horizon
+    names = ", ".join(sorted(by_symbol))
     lines.append("=" * 72)
-    lines.append(f"  NEXT-HOUR RETURN FORECAST  |  {symbol}")
+    lines.append("  NEXT-HOUR RETURN FORECAST")
     lines.append("=" * 72)
-    lines.append(f"  Horizon     {horizon_min} minutes ahead  (same session)")
+    lines.append(f"  Horizon     {data_cfg.horizon} minutes ahead  (same session)")
     lines.append(f"  Context     last {context} minute bars")
-    lines.append(f"  Data        {data_path}")
+    lines.append(f"  Stocks      {names}")
     lines.append(f"  Checkpoint  {checkpoint}")
     lines.append(f"  Trained on  {trained_on or 'unknown'}")
     lines.append(f"  Device      {device}")
     lines.append("")
     lines.append("  Units: bp = basis points = 0.01%.  +10 bp means the model")
     lines.append("  expects the price about 0.10% higher in one hour.")
+    lines.append("  Each ticker is its own column. pred (bp) is the predicted move.")
     if notes:
         lines.append("")
         for note in notes:
             lines.append(f"  Note: {note}")
 
-    if result.empty:
+    if not by_symbol:
         lines.append("")
         lines.append("  No forecast rows.")
         lines.append("=" * 72)
         return "\n".join(lines)
 
-    latest = result.iloc[-1]
+    snapshot = latest_snapshot(by_symbol)
     lines.append("")
     lines.append("-" * 72)
-    lines.append(f"  LATEST  as of {_fmt_when(latest['datetime'])}")
+    lines.append("  LATEST  (one column per stock)")
     lines.append("-" * 72)
-    traded = "real print" if bool(latest["traded"]) else "untraded / filled slot"
-    lines.append(f"  Last price          {_fmt_px(float(latest['close']))}   ({traded})")
-    lines.append(
-        f"  Predicted move      {_fmt_bps(float(latest['pred_return_bps']))}"
-        f"   ->  {_fmt_px(float(latest['pred_price_1h']))} in 1 hour"
-    )
-    if include_uncertainty and "pred_uncertainty_bps" in result.columns:
-        unc = float(latest["pred_uncertainty_bps"])
-        lines.append(f"  Residual uncertainty +/-{unc:.1f} bp  (model-predicted, 1 sigma)")
-    if "realized_bps" in result.columns:
-        realized = latest["realized_bps"]
-        if pd.notna(realized):
-            lines.append(f"  Realized (since)    {_fmt_bps(float(realized))}")
-        else:
-            lines.append("  Realized (since)    not yet known (horizon still open)")
-
-    table = result.copy()
-    table["when"] = pd.to_datetime(table["datetime"]).dt.strftime("%Y-%m-%d %H:%M")
-    table["print"] = np.where(table["traded"], "yes", "no")
-    table["pred_bp"] = table["pred_return_bps"].map(lambda v: f"{v:+.1f}")
-    table["pred_px"] = table["pred_price_1h"].map(lambda v: f"{v:,.4f}")
-    table["last_px"] = table["close"].map(lambda v: f"{v:,.4f}")
-    show = ["when", "print", "last_px", "pred_bp", "pred_px"]
-    headers = {
-        "when": "when",
-        "print": "print",
-        "last_px": "last $",
-        "pred_bp": "pred (bp)",
-        "pred_px": "pred $ in 1h",
-    }
-    if include_uncertainty and "pred_uncertainty_bps" in table.columns:
-        table["unc_bp"] = table["pred_uncertainty_bps"].map(lambda v: f"+/-{v:.1f}")
-        show.append("unc_bp")
-        headers["unc_bp"] = "uncert. (bp)"
-    if "realized_bps" in table.columns:
-        table["real_bp"] = table["realized_bps"].map(
-            lambda v: f"{v:+.1f}" if pd.notna(v) else "-"
-        )
-        show.append("real_bp")
-        headers["real_bp"] = "realized (bp)"
-
-    lines.append("")
-    lines.append("-" * 72)
-    title = "  ALL REQUESTED BARS" if len(result) > 1 else "  DETAIL"
-    lines.append(title)
-    lines.append("-" * 72)
-    display = table[show].rename(columns=headers)
-    body = display.to_string(index=False)
-    for row in body.splitlines():
+    for row in snapshot.to_string().splitlines():
         lines.append("  " + row)
 
-    scored = result["realized_bps"].dropna() if "realized_bps" in result.columns else pd.Series(dtype=float)
-    if len(scored) >= 2:
-        pred = result.loc[scored.index, "pred_return_bps"].to_numpy()
-        real = scored.to_numpy()
-        ic = float(np.corrcoef(pred, real)[0, 1]) if np.std(pred) > 0 and np.std(real) > 0 else float("nan")
+    wide = predicted_move_wide(by_symbol)
+    if len(wide) > 1:
         lines.append("")
-        lines.append(
-            f"  On these {len(scored)} bars that already have an outcome: "
-            f"IC = {ic:+.3f}"
-        )
+        lines.append("-" * 72)
+        lines.append("  PREDICTED MOVE (bp)  |  one column per stock")
+        lines.append("-" * 72)
+        for row in _format_wide_bp(wide).splitlines():
+            lines.append("  " + row)
 
     lines.append("=" * 72)
     return "\n".join(lines)
+
+
+def _collect_shared_notes(
+    state: dict[str, Any],
+    symbols: list[str],
+    *,
+    context: int,
+    min_context: int,
+    include_unc: bool,
+) -> list[str]:
+    notes: list[str] = []
+    if context < min_context:
+        notes.append(
+            f"context={context} is shorter than training min_context="
+            f"{min_context}; the last bar of each window was never supervised."
+        )
+    if not include_unc:
+        notes.append(
+            "No trained uncertainty: the loss was not gaussian NLL. "
+            "Only the predicted mean is shown."
+        )
+    trained_on = [m["symbol"] for m in state.get("symbols", [])]
+    oos = [s for s in symbols if s not in trained_on]
+    if oos and trained_on:
+        notes.append(
+            "Out-of-sample symbol(s): "
+            + ", ".join(oos)
+            + " (not in the training set)."
+        )
+    for m in state.get("symbols", []):
+        train_mix = m.get("train_source_mix") or {}
+        test_mix = m.get("test_source_mix") or {}
+        if train_mix and test_mix:
+            train_top = max(train_mix, key=train_mix.get)
+            test_top = max(test_mix, key=test_mix.get)
+            if train_top != test_top:
+                notes.append(
+                    f"Train vendor was mostly {train_top}, test mostly {test_top}. "
+                    "Do not read a backtest IC as the same experiment."
+                )
+                break
+    return notes
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -265,8 +347,13 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument(
         "--data",
         default=None,
-        help="parquet of 1-minute OHLCV bars; defaults to the first file in the "
-        "checkpoint's data_dir",
+        help="one parquet, or a directory of parquets; default is every file "
+        "in the checkpoint's data_dir",
+    )
+    p.add_argument(
+        "--symbols",
+        default=None,
+        help="comma-separated tickers to include, e.g. AAPL,MSFT",
     )
     p.add_argument(
         "--context",
@@ -276,7 +363,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     p.add_argument("--last", type=int, default=1, help="forecast the newest N bars")
     p.add_argument("--asof", default=None, help="forecast a single bar, e.g. '2026-08-21 14:30'")
-    p.add_argument("--csv", default=None, help="write results to this path")
+    p.add_argument("--csv", default=None, help="write the predicted-move table (stocks as columns)")
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args(argv)
@@ -297,78 +384,66 @@ def main(argv: list[str] | None = None) -> None:
     context = args.context or data_cfg.seq_len
     include_unc = uncertainty_is_trained(model, state)
 
-    notes: list[str] = []
-    if context < data_cfg.min_context:
-        notes.append(
-            f"context={context} is shorter than training min_context="
-            f"{data_cfg.min_context}; the last bar of each window was never supervised."
+    try:
+        files = resolve_data_files(
+            args.data, data_cfg.data_dir, parse_symbols(args.symbols)
         )
-    if not include_unc:
-        notes.append(
-            "No trained uncertainty: the loss was not gaussian NLL. "
-            "Only the predicted mean is shown."
-        )
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
 
-    if args.data:
-        data_path = Path(args.data)
-        if not data_path.is_absolute() and not data_path.exists():
-            data_path = REPO_ROOT / data_path
-    else:
-        data_path = discover_symbol_files(data_cfg.data_dir)[0]
-    if not data_path.exists():
-        raise SystemExit(f"data file not found: {data_path}")
-    panel = build_panel(data_path, data_cfg)
-    symbol = str(panel["symbol"].iloc[0])
+    by_symbol: dict[str, pd.DataFrame] = {}
+    skip_notes: list[str] = []
+    for path in files:
+        symbol = symbol_from_path(path)
+        print(f"forecasting {symbol} ...", file=sys.stderr)
+        try:
+            panel = build_panel(path, data_cfg)
+            positions = choose_positions(
+                panel, context=context, last=args.last, asof=args.asof
+            )
+            result = forecast_panel(
+                model,
+                panel,
+                state,
+                device,
+                context=context,
+                positions=positions,
+                batch_size=args.batch_size,
+                include_uncertainty=include_unc,
+            )
+        except (ValueError, SystemExit) as exc:
+            skip_notes.append(f"skipped {symbol}: {exc}")
+            continue
+        by_symbol[symbol] = result
 
-    positions = choose_positions(
-        panel, context=context, last=args.last, asof=args.asof
-    )
-    result = forecast_panel(
-        model,
-        panel,
-        state,
-        device,
-        context=context,
-        positions=positions,
-        batch_size=args.batch_size,
-        include_uncertainty=include_unc,
-    )
+    if not by_symbol:
+        raise SystemExit("no symbols produced a forecast\n" + "\n".join(skip_notes))
 
     trained_on = ", ".join(m["symbol"] for m in state.get("symbols", []))
-    if symbol not in trained_on:
-        notes.append(
-            f"{symbol} was not in the training set; this is an out-of-sample symbol."
-        )
-    for m in state.get("symbols", []):
-        train_mix = m.get("train_source_mix") or {}
-        test_mix = m.get("test_source_mix") or {}
-        if train_mix and test_mix:
-            train_top = max(train_mix, key=train_mix.get)
-            test_top = max(test_mix, key=test_mix.get)
-            if train_top != test_top:
-                notes.append(
-                    f"Train vendor was mostly {train_top}, test mostly {test_top}. "
-                    "Do not read a backtest IC as the same experiment."
-                )
-                break
+    notes = _collect_shared_notes(
+        state,
+        sorted(by_symbol),
+        context=context,
+        min_context=data_cfg.min_context,
+        include_unc=include_unc,
+    )
+    notes.extend(skip_notes)
 
     print(
-        format_forecast_report(
-            result,
-            symbol=symbol,
+        format_stock_column_report(
+            by_symbol,
             trained_on=trained_on,
             checkpoint=ckpt_path,
-            data_path=data_path,
             data_cfg=data_cfg,
             context=context,
             device=device,
-            include_uncertainty=include_unc,
             notes=notes,
         )
     )
 
     if args.csv:
-        result.to_csv(args.csv, index=False)
+        wide = predicted_move_wide(by_symbol)
+        wide.to_csv(args.csv, index_label="datetime")
         print(f"\nWrote CSV: {args.csv}", file=sys.stderr)
 
 

@@ -170,7 +170,7 @@ def test_validate_loss_head_rejects_mismatches():
     with pytest.raises(ValueError):
         validate_loss_head(
             ForecastModelConfig(heteroscedastic=True),
-            ForecastTrainConfig(loss="huber"),
+            ForecastTrainConfig(loss="huber", sigma_aux_weight=0.0),
         )
     with pytest.raises(ValueError):
         validate_loss_head(
@@ -178,8 +178,8 @@ def test_validate_loss_head_rejects_mismatches():
             ForecastTrainConfig(loss="gaussian"),
         )
     validate_loss_head(
-        ForecastModelConfig(heteroscedastic=False),
-        ForecastTrainConfig(loss="huber"),
+        ForecastModelConfig(heteroscedastic=True),
+        ForecastTrainConfig(loss="huber", sigma_aux_weight=0.5),
     )
 
 

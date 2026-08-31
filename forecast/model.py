@@ -77,6 +77,15 @@ class ReturnForecaster(nn.Module):
             log_sigma = torch.zeros_like(mean)
         return mean, log_sigma
 
+    @staticmethod
+    def confidence_from_std(residual_std: torch.Tensor) -> torch.Tensor:
+        """Map residual std (volatility units) to a score in ``(0, 1]``.
+
+        A typical unit-vol residual (std = 1) scores 0.5. Tighter predicted
+        error raises confidence; ``std = 0`` is 1.0, ``std = 3`` is 0.25.
+        """
+        return 1.0 / (1.0 + residual_std.clamp(min=0.0))
+
     @torch.no_grad()
     def predict(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Prediction at the final bar of each sequence: ``([B], [B])``."""
@@ -85,6 +94,43 @@ class ReturnForecaster(nn.Module):
         try:
             mean, log_sigma = self(features)
             return mean[:, -1], log_sigma[:, -1]
+        finally:
+            self.train(was_training)
+
+    @torch.no_grad()
+    def predict_with_confidence(
+        self,
+        features: torch.Tensor,
+        *,
+        mc_samples: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Final-bar mean, log-sigma, and confidence in ``(0, 1]``.
+
+        ``mc_samples > 1`` turns input dropout on and uses the spread of
+        sampled means as the residual std (for checkpoints with no trained
+        sigma head). Otherwise confidence comes from ``exp(log_sigma)``.
+        """
+        was_training = self.training
+        try:
+            if mc_samples > 1:
+                self.train()
+                samples: list[torch.Tensor] = []
+                for _ in range(mc_samples):
+                    mean, _log_sigma = self(features)
+                    samples.append(mean[:, -1].float())
+                stacked = torch.stack(samples, dim=0)
+                mean_hat = stacked.mean(dim=0)
+                spread = stacked.std(dim=0, unbiased=False)
+                log_sigma_hat = torch.log(spread.clamp(min=1e-6))
+                confidence = self.confidence_from_std(spread)
+                return mean_hat, log_sigma_hat, confidence
+
+            self.eval()
+            mean, log_sigma = self(features)
+            mean_hat = mean[:, -1]
+            log_sigma_hat = log_sigma[:, -1]
+            confidence = self.confidence_from_std(torch.exp(log_sigma_hat.float()))
+            return mean_hat, log_sigma_hat, confidence
         finally:
             self.train(was_training)
 

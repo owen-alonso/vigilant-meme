@@ -82,6 +82,13 @@ def masked_loss(
         per_bar = 0.5 * (inv_var * (mean - target).pow(2)) + log_sigma
     else:
         raise ValueError(f"unknown loss {cfg.loss!r}")
+    if cfg.loss != "gaussian" and cfg.sigma_aux_weight > 0:
+        # Mean is detached so Huber/MSE still own the location; sigma learns
+        # residual scale, which generate.py turns into a confidence score.
+        resid_sq = (mean.detach() - target).pow(2)
+        inv_var = torch.exp(-2.0 * log_sigma)
+        aux = 0.5 * (inv_var * resid_sq) + log_sigma
+        per_bar = per_bar + cfg.sigma_aux_weight * aux
     return (per_bar * weights).sum() / denom
 
 
@@ -528,6 +535,15 @@ def main(argv: list[str] | None = None) -> None:
         lr=args.lr,
         weight_decay=args.weight_decay,
         loss=args.loss,
+        # CLI does not expose sigma_aux_weight. Default Huber is mean-only;
+        # gaussian NLL trains the sigma head itself. Do not leave the
+        # dataclass default (0.5) on a mean-only head — validate_loss_head
+        # would reject the run.
+        sigma_aux_weight=(
+            0.0
+            if (not heteroscedastic or args.loss == "gaussian")
+            else 0.5
+        ),
         precision=args.precision,
         seed=args.seed,
         eval_interval=args.eval_interval,

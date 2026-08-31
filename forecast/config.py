@@ -77,9 +77,9 @@ class ForecastModelConfig:
     expand: int = 2
     d_conv: int = 4
     dropout: float = 0.1
-    # Extra log-sigma head. Only trained when ForecastTrainConfig.loss is
-    # "gaussian"; keep False unless you opt into that loss.
-    heteroscedastic: bool = False
+    # Residual-std head. Trained by gaussian NLL, or by sigma_aux_weight when
+    # the mean loss is Huber/MSE. generate.py maps it to a confidence score.
+    heteroscedastic: bool = True
 
     dynamic_weights: bool = False
     dynamic_A: bool = True
@@ -120,6 +120,9 @@ class ForecastTrainConfig:
     grad_clip: float = 1.0
     loss: LossName = "huber"
     huber_delta: float = 1.0
+    # Huber/MSE: extra detached-residual NLL so the log-sigma head is trained.
+    # Ignored when loss is gaussian (that NLL already trains the head).
+    sigma_aux_weight: float = 0.5
     precision: Precision = "bf16"
     seed: int = 42
     log_interval: int = 25
@@ -138,11 +141,17 @@ class ForecastTrainConfig:
 
 
 def validate_loss_head(model_cfg: ForecastModelConfig, train_cfg: ForecastTrainConfig) -> None:
-    """Huber/MSE must not ship an untrained uncertainty head; gaussian needs one."""
+    """Gaussian NLL needs a sigma head; Huber/MSE need aux weight if that head exists."""
     if train_cfg.loss == "gaussian" and not model_cfg.heteroscedastic:
         raise ValueError("loss='gaussian' requires ForecastModelConfig.heteroscedastic=True")
-    if train_cfg.loss != "gaussian" and model_cfg.heteroscedastic:
+    if train_cfg.sigma_aux_weight < 0:
+        raise ValueError("sigma_aux_weight must be >= 0")
+    if model_cfg.heteroscedastic and train_cfg.loss != "gaussian" and train_cfg.sigma_aux_weight <= 0:
         raise ValueError(
-            "heteroscedastic=True is only trained under loss='gaussian'; "
-            "set heteroscedastic=False or switch the loss"
+            "heteroscedastic=True with Huber/MSE needs sigma_aux_weight > 0 "
+            "so the confidence head is actually trained"
+        )
+    if not model_cfg.heteroscedastic and train_cfg.sigma_aux_weight > 0:
+        raise ValueError(
+            "sigma_aux_weight > 0 requires ForecastModelConfig.heteroscedastic=True"
         )
