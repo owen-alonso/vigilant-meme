@@ -136,6 +136,7 @@ def run_comparison(
     d_model: int = 128,
     n_layer: int = 4,
     d_state: int = 16,
+    expand: int = 2,
     vocab_size: int = 64,
     batch_size: int = 4,
     seq_len: int = 256,
@@ -147,7 +148,7 @@ def run_comparison(
         n_layer=n_layer,
         d_state=d_state,
         vocab_size=vocab_size,
-        expand=2,
+        expand=expand,
     )
     baseline = benchmark_model(
         MambaConfig(**shared, dynamic_weights=False),

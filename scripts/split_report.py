@@ -7,7 +7,7 @@ Run this before trusting a test-set number.
 
 from __future__ import annotations
 
-import sys
+import argparse
 
 import pandas as pd
 
@@ -16,9 +16,14 @@ from forecast.data import build_session_grid, load_bars, split_session_bounds
 from mamba_lm.paths import resolve_path
 
 
-def main(path: str = "data/SPAB_clean_1min.parquet") -> None:
+def main(path: str) -> None:
     cfg = DataConfig()
     resolved = resolve_path(path)
+    if not resolved.exists():
+        raise SystemExit(
+            f"data file not found: {resolved}\n"
+            "Pass a parquet path, e.g. scripts/split_report.py data/YOUR_SYMBOL_clean_1min.parquet"
+        )
     raw = load_bars(resolved)
     grid = build_session_grid(raw, cfg)
     sessions = grid["session"].drop_duplicates().sort_values().to_numpy()
@@ -62,5 +67,20 @@ def _has_source(path) -> bool:
     return "source" in pd.read_parquet(path).columns
 
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Report bar density per train/val/test split.")
+    p.add_argument(
+        "path",
+        nargs="?",
+        default="data/SPAB_clean_1min.parquet",
+        help="parquet file to inspect (default: data/SPAB_clean_1min.parquet)",
+    )
+    return p
+
+
 if __name__ == "__main__":
-    main(*sys.argv[1:])
+    args = build_arg_parser().parse_args()
+    try:
+        main(args.path)
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc

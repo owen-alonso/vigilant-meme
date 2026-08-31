@@ -48,5 +48,8 @@ def test_uncertainty_is_trained_requires_gaussian():
     model = ReturnForecaster(ForecastModelConfig(n_features=18, heteroscedastic=False))
     assert not uncertainty_is_trained(model, {"train_config": {"loss": "huber"}})
     model_h = ReturnForecaster(ForecastModelConfig(n_features=18, heteroscedastic=True))
-    assert not uncertainty_is_trained(model_h, {"train_config": {"loss": "huber"}})
+    assert not uncertainty_is_trained(model_h, {"train_config": {"loss": "huber", "sigma_aux_weight": 0.0}})
     assert uncertainty_is_trained(model_h, {"train_config": {"loss": "gaussian"}})
+    assert uncertainty_is_trained(
+        model_h, {"train_config": {"loss": "huber", "sigma_aux_weight": 0.5}}
+    )

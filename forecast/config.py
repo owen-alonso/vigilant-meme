@@ -119,9 +119,9 @@ class ForecastTrainConfig:
     grad_clip: float = 1.0
     loss: LossName = "huber"
     huber_delta: float = 1.0
-    # Huber/MSE: extra detached-residual NLL so the log-sigma head is trained.
-    # Ignored when loss is gaussian (that NLL already trains the head).
-    sigma_aux_weight: float = 0.5
+    # Residual-std head. Trained by gaussian NLL, or by sigma_aux_weight when
+    # the mean loss is Huber/MSE. Default 0 matches heteroscedastic=False.
+    sigma_aux_weight: float = 0.0
     precision: Precision = "bf16"
     seed: int = 42
     log_interval: int = 25
