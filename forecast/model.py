@@ -17,6 +17,7 @@ import torch.nn as nn
 
 from forecast.config import ForecastModelConfig
 from mamba_lm.mamba import MambaLayer
+from mamba_lm.model import collect_mixer_diagnostics
 from mamba_lm.rmsnorm import RMSNorm
 
 
@@ -136,19 +137,4 @@ class ReturnForecaster(nn.Module):
 
     def collect_dynamic_diagnostics(self) -> list[dict[str, Any]]:
         """Per-layer Dynamic A scale stats from the most recent forward pass."""
-        reports: list[dict[str, Any]] = []
-        for i, layer in enumerate(self.layers):
-            scale = layer.mixer.last_A_scale
-            if scale is None:
-                continue
-            s = scale.detach().float()
-            reports.append(
-                {
-                    "layer": i,
-                    "dynamic_A_mean": float(s.mean()),
-                    "dynamic_A_std": float(s.std(unbiased=False)),
-                    "dynamic_A_min": float(s.min()),
-                    "dynamic_A_max": float(s.max()),
-                }
-            )
-        return reports
+        return collect_mixer_diagnostics(self.layers)

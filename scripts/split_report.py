@@ -16,7 +16,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from forecast.config import DataConfig
-from forecast.data import build_session_grid, load_bars
+from forecast.data import build_session_grid, load_bars, split_session_bounds
 
 
 def main(path: str = "data/SPAB_clean_1min.parquet") -> None:
@@ -25,9 +25,8 @@ def main(path: str = "data/SPAB_clean_1min.parquet") -> None:
     grid = build_session_grid(raw, cfg)
     sessions = grid["session"].drop_duplicates().sort_values().to_numpy()
     n = len(sessions)
-    n_test = int(round(n * cfg.test_fraction))
-    n_val = int(round(n * cfg.val_fraction))
-    train_end, val_end = sessions[n - n_val - n_test], sessions[n - n_test]
+    cut_train, cut_val = split_session_bounds(n, cfg)
+    train_end, val_end = sessions[cut_train], sessions[cut_val]
 
     source = pd.read_parquet(path, columns=["datetime", "source"]) if _has_source(path) else None
 

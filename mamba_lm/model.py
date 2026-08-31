@@ -41,17 +41,18 @@ class MambaLM(nn.Module):
 
     def collect_dynamic_diagnostics(self) -> list[dict[str, Any]]:
         """Per-layer A-scale stats from the most recent dynamic forward."""
-        reports: list[dict[str, Any]] = []
-        for i, layer in enumerate(self.layers):
-            mixer = layer.mixer
-            if mixer.last_A_scale is None:
-                continue
-            stats = {
-                "layer": i,
-                **_scale_stats(mixer.last_A_scale),
-            }
-            reports.append(stats)
-        return reports
+        return collect_mixer_diagnostics(self.layers)
+
+
+def collect_mixer_diagnostics(layers: nn.ModuleList) -> list[dict[str, Any]]:
+    """Per-layer Dynamic A scale stats from the most recent forward pass."""
+    reports: list[dict[str, Any]] = []
+    for i, layer in enumerate(layers):
+        scale = layer.mixer.last_A_scale
+        if scale is None:
+            continue
+        reports.append({"layer": i, **_scale_stats(scale)})
+    return reports
 
 
 def format_dynamic_diagnostics(reports: list[dict[str, Any]]) -> str:

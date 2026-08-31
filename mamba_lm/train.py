@@ -6,7 +6,7 @@ import copy
 import math
 import time
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -16,107 +16,33 @@ from mamba_lm.checkpoint import save_checkpoint
 from mamba_lm.config import MambaConfig, TrainConfig
 from mamba_lm.data import build_datasets
 from mamba_lm.model import MambaLM, format_dynamic_diagnostics
+from mamba_lm.paths import anchor_to_repo
 from mamba_lm.reporting import (
     clip_grad_norm_unique,
     format_parameter_report,
     parameter_report,
-    unique_parameters,
+)
+from mamba_lm.training_utils import (
+    autocast_context,
+    build_optimizer,
+    cycle_loader,
+    grads_finite,
+    lr_linear_warmup,
+    require_nonempty_loader,
+    select_device,
+    set_seed,
 )
 
-
-def select_device(prefer_cuda: bool = True) -> torch.device:
-    if prefer_cuda and torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-
-def set_seed(seed: int) -> None:
-    import random
-
-    import numpy as np
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+__all__ = [
+    "autocast_context",
+    "build_optimizer",
+    "evaluate",
+    "select_device",
+    "set_seed",
+    "train",
+]
 
 
-def autocast_context(device: torch.device, precision: str, log_fn: Any | None = None):
-    """AMP context. CPU fp16 is not reliable; fall back to bf16 or fp32 and say so."""
-    if precision == "fp32":
-        return torch.autocast(device_type=device.type, enabled=False)
-    if precision == "fp16" and device.type == "cpu":
-        bf16_ok = bool(getattr(torch.cpu, "is_bf16_supported", lambda: False)())
-        if bf16_ok:
-            if log_fn:
-                log_fn("precision=fp16 is not available on CPU; using bf16 autocast")
-            return torch.autocast(
-                device_type="cpu", dtype=torch.bfloat16, enabled=True
-            )
-        if log_fn:
-            log_fn("precision=fp16 is not available on CPU; using fp32")
-        return torch.autocast(device_type="cpu", enabled=False)
-    dtype = torch.float16 if precision == "fp16" else torch.bfloat16
-    return torch.autocast(device_type=device.type, dtype=dtype, enabled=True)
-
-
-def build_optimizer(model: MambaLM, train_cfg: TrainConfig) -> torch.optim.AdamW:
-    decay: list[torch.nn.Parameter] = []
-    no_decay: list[torch.nn.Parameter] = []
-    seen: set[int] = set()
-    for name, param in model.named_parameters():
-        if not param.requires_grad or id(param) in seen:
-            continue
-        seen.add(id(param))
-        if param.dim() < 2 or name.endswith("bias") or "norm" in name or name.endswith("A_log") or name.endswith(".D"):
-            no_decay.append(param)
-        else:
-            decay.append(param)
-    return torch.optim.AdamW(
-        [
-            {"params": decay, "weight_decay": train_cfg.weight_decay},
-            {"params": no_decay, "weight_decay": 0.0},
-        ],
-        lr=train_cfg.lr,
-        betas=(0.9, 0.95),
-    )
-
-
-def _lr_at(step: int, train_cfg: TrainConfig) -> float:
-    if train_cfg.warmup_steps <= 0:
-        return train_cfg.lr
-    if step < train_cfg.warmup_steps:
-        return train_cfg.lr * float(step + 1) / float(train_cfg.warmup_steps)
-    return train_cfg.lr
-
-
-def _require_nonempty_loader(loader: DataLoader, name: str) -> None:
-    if len(loader) == 0:
-        raise RuntimeError(
-            f"{name} DataLoader is empty (dataset size={len(loader.dataset)}, "
-            f"batch_size={loader.batch_size}, drop_last={loader.drop_last}). "
-            "Shrink batch_size or collect more data."
-        )
-
-
-def _cycle(loader: DataLoader) -> Iterator:
-    _require_nonempty_loader(loader, "train")
-    while True:
-        for batch in loader:
-            yield batch
-
-
-def _grads_finite(model: torch.nn.Module) -> bool:
-    for param in unique_parameters(model):
-        if param.grad is None:
-            continue
-        if not torch.isfinite(param.grad).all():
-            return False
-    return True
-
-
-@torch.no_grad()
 def evaluate(
     model: MambaLM,
     loader: DataLoader,
@@ -179,7 +105,6 @@ def train(
     if log_fn:
         log_fn(format_parameter_report(report))
         log_fn(f"device={device} precision={train_cfg.precision} vocab={tokenizer.vocab_size}")
-        # Log the fp16-on-CPU fallback once, if it applies.
         autocast_context(device, train_cfg.precision, log_fn=log_fn)
 
     train_loader = DataLoader(
@@ -196,13 +121,17 @@ def train(
         drop_last=False,
         num_workers=train_cfg.num_workers,
     )
-    _require_nonempty_loader(train_loader, "train")
-    optimizer = build_optimizer(model, train_cfg)
+    require_nonempty_loader(train_loader, "train")
+    optimizer = build_optimizer(
+        model, lr=train_cfg.lr, weight_decay=train_cfg.weight_decay
+    )
     use_scaler = train_cfg.precision == "fp16" and device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=use_scaler)
 
-    checkpoint_dir = Path(train_cfg.checkpoint_dir)
+    checkpoint_dir = anchor_to_repo(train_cfg.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if log_fn:
+        log_fn(f"checkpoints -> {checkpoint_dir}")
 
     extra = {"tokenizer": tokenizer.to_dict(), "train_config": train_cfg.to_dict()}
 
@@ -228,10 +157,12 @@ def train(
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
-    data_iter = _cycle(train_loader)
+    data_iter = cycle_loader(train_loader)
     model.train()
     for step in range(train_cfg.max_steps):
-        lr = _lr_at(step, train_cfg)
+        lr = lr_linear_warmup(
+            step, lr=train_cfg.lr, warmup_steps=train_cfg.warmup_steps
+        )
         for group in optimizer.param_groups:
             group["lr"] = lr
 
@@ -252,7 +183,7 @@ def train(
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        if not _grads_finite(model):
+        if not grads_finite(model):
             skipped_inf += 1
             if log_fn:
                 log_fn(

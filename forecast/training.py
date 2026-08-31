@@ -22,7 +22,7 @@ import math
 import sys
 import time
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import numpy as np
 import torch
@@ -40,15 +40,21 @@ from forecast.config import (
     ForecastTrainConfig,
     validate_loss_head,
 )
-from forecast.data import FEATURE_NAMES, REPO_ROOT, build_datasets
+from forecast.data import FEATURE_NAMES, build_datasets
 from forecast.model import ReturnForecaster
+from mamba_lm.checkpoint_io import load_checkpoint_dict
 from mamba_lm.model import format_dynamic_diagnostics
+from mamba_lm.paths import anchor_to_repo
 from mamba_lm.reporting import clip_grad_norm_unique
-from mamba_lm.train import (
-    _grads_finite,
-    _require_nonempty_loader,
+from mamba_lm.training_utils import (
     autocast_context,
+    build_optimizer,
+    cycle_loader,
+    grads_finite,
+    lr_warmup_cosine,
+    require_nonempty_loader,
     select_device,
+    set_seed,
 )
 
 
@@ -139,61 +145,17 @@ def compute_metrics(
 
 
 # --------------------------------------------------------------------------
-# Training utilities
+# Training utilities (forecast-specific)
 # --------------------------------------------------------------------------
 
 
-def set_seed(seed: int) -> None:
-    import random
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def build_optimizer(
-    model: ReturnForecaster, cfg: ForecastTrainConfig
-) -> torch.optim.AdamW:
-    decay: list[torch.nn.Parameter] = []
-    no_decay: list[torch.nn.Parameter] = []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if (
-            param.dim() < 2
-            or name.endswith("bias")
-            or "norm" in name
-            or name.endswith("A_log")
-            or name.endswith(".D")
-        ):
-            no_decay.append(param)
-        else:
-            decay.append(param)
-    return torch.optim.AdamW(
-        [
-            {"params": decay, "weight_decay": cfg.weight_decay},
-            {"params": no_decay, "weight_decay": 0.0},
-        ],
-        lr=cfg.lr,
-        betas=(0.9, 0.95),
-    )
-
-
 def lr_at(step: int, total_steps: int, cfg: ForecastTrainConfig) -> float:
-    warmup = max(1, int(total_steps * cfg.warmup_frac))
-    if step < warmup:
-        return cfg.lr * (step + 1) / warmup
-    progress = (step - warmup) / max(1, total_steps - warmup)
-    return 0.1 * cfg.lr + 0.9 * cfg.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
-
-
-def _cycle(loader: DataLoader) -> Iterator:
-    _require_nonempty_loader(loader, "train")
-    while True:
-        for batch in loader:
-            yield batch
+    return lr_warmup_cosine(
+        step,
+        total_steps=total_steps,
+        lr=cfg.lr,
+        warmup_frac=cfg.warmup_frac,
+    )
 
 
 @torch.no_grad()
@@ -299,22 +261,20 @@ def train(
     )
 
     steps_per_epoch = len(train_loader)
-    _require_nonempty_loader(train_loader, "train")
+    require_nonempty_loader(train_loader, "train")
     if train_cfg.max_steps is None:
         total_steps = steps_per_epoch * train_cfg.epochs
     else:
         total_steps = train_cfg.max_steps
     if total_steps < 1:
         raise RuntimeError("total_steps is 0; check epochs, max_steps, and dataset size")
-    optimizer = build_optimizer(model, train_cfg)
+    optimizer = build_optimizer(
+        model, lr=train_cfg.lr, weight_decay=train_cfg.weight_decay
+    )
     use_scaler = train_cfg.precision == "fp16" and device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=use_scaler)
 
-    # Anchor outputs to the repo root so runs launched from forecast/ or an IDE
-    # do not scatter checkpoint trees around the working directory.
-    ckpt_dir = Path(train_cfg.checkpoint_dir)
-    if not ckpt_dir.is_absolute():
-        ckpt_dir = REPO_ROOT / ckpt_dir
+    ckpt_dir = anchor_to_repo(train_cfg.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     if log_fn:
         log_fn(f"checkpoints -> {ckpt_dir}")
@@ -340,7 +300,7 @@ def train(
     best_ic = -float("inf")
     best_step = -1
     evals_without_gain = 0
-    data_iter = _cycle(train_loader)
+    data_iter = cycle_loader(train_loader)
     running: list[float] = []
     t0 = time.perf_counter()
     model.train()
@@ -365,7 +325,7 @@ def train(
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        if not _grads_finite(model):
+        if not grads_finite(model):
             if log_fn:
                 log_fn(f"step {step + 1}: non-finite gradients, skipping optimizer step")
             scaler.update()
@@ -415,7 +375,7 @@ def train(
     # Final test evaluation uses the best checkpoint, not the last one.
     best_path = ckpt_dir / "best.pt"
     if best_path.exists():
-        state = torch.load(best_path, map_location=device, weights_only=False)
+        state = load_checkpoint_dict(best_path, map_location=device)
         model.load_state_dict(state["model"])
     test = evaluate(model, test_loader, device, train_cfg)
     if log_fn:

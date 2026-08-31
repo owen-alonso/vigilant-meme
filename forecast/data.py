@@ -31,6 +31,7 @@ import torch
 from torch.utils.data import Dataset
 
 from forecast.config import BARS_PER_SESSION, SESSION_START_MINUTE, DataConfig
+from mamba_lm.paths import REPO_ROOT, anchor_to_repo, resolve_path
 
 
 FEATURE_NAMES: tuple[str, ...] = (
@@ -60,23 +61,6 @@ OHLCV_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 # --------------------------------------------------------------------------
 # Loading and gridding
 # --------------------------------------------------------------------------
-
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
-
-def resolve_path(path: str | Path) -> Path:
-    """Resolve a relative path against the CWD, then against the repo root.
-
-    Defaults like ``data_dir="data"`` should mean the repo's ``data/`` whether
-    the entry point was launched from the repo root, from ``forecast/``, or
-    from an IDE with its own working directory.
-    """
-    candidate = Path(path)
-    if candidate.is_absolute() or candidate.exists():
-        return candidate
-    from_root = REPO_ROOT / candidate
-    return from_root if from_root.exists() else candidate
 
 
 def discover_symbol_files(data_dir: str | Path) -> list[Path]:
@@ -463,7 +447,8 @@ def _source_mix(frame: pd.DataFrame) -> dict[str, float]:
     return {str(k): float(v) for k, v in counts.items()}
 
 
-def _split_bounds(n_sessions: int, cfg: DataConfig) -> tuple[int, int]:
+def split_session_bounds(n_sessions: int, cfg: DataConfig) -> tuple[int, int]:
+    """Return ``(train_end_idx, val_end_idx)`` for chronological session splits."""
     n_test = int(round(n_sessions * cfg.test_fraction))
     n_val = int(round(n_sessions * cfg.val_fraction))
     n_train = n_sessions - n_val - n_test
@@ -473,6 +458,10 @@ def _split_bounds(n_sessions: int, cfg: DataConfig) -> tuple[int, int]:
             f"val_fraction={cfg.val_fraction}, test_fraction={cfg.test_fraction}"
         )
     return n_train, n_train + n_val
+
+
+def _split_bounds(n_sessions: int, cfg: DataConfig) -> tuple[int, int]:
+    return split_session_bounds(n_sessions, cfg)
 
 
 def build_datasets(

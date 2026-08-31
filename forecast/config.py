@@ -79,7 +79,7 @@ class ForecastModelConfig:
     dropout: float = 0.1
     # Residual-std head. Trained by gaussian NLL, or by sigma_aux_weight when
     # the mean loss is Huber/MSE. generate.py maps it to a confidence score.
-    heteroscedastic: bool = True
+    heteroscedastic: bool = False
 
     dynamic_weights: bool = False
     dynamic_A: bool = True

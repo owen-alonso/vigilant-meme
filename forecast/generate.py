@@ -34,18 +34,19 @@ if __package__ in (None, ""):
 from forecast.config import DataConfig, ForecastModelConfig
 from forecast.data import (
     FEATURE_NAMES,
-    REPO_ROOT,
     build_panel,
     discover_symbol_files,
     symbol_from_path,
 )
 from forecast.model import ReturnForecaster
+from mamba_lm.checkpoint_io import load_checkpoint_dict
+from mamba_lm.paths import anchor_to_repo, resolve_path
 
 
 def load_forecaster(
     checkpoint: str | Path, device: torch.device
 ) -> tuple[ReturnForecaster, dict[str, Any]]:
-    state = torch.load(checkpoint, map_location=device, weights_only=False)
+    state = load_checkpoint_dict(checkpoint, map_location=device)
     model_cfg = ForecastModelConfig.from_dict(state["model_config"])
     model = ReturnForecaster(model_cfg).to(device)
     model.load_state_dict(state["model"])
@@ -159,9 +160,7 @@ def resolve_data_files(
 ) -> list[Path]:
     """Parquet files to score: one file, a directory, or the checkpoint data_dir."""
     if data_arg:
-        path = Path(data_arg)
-        if not path.is_absolute() and not path.exists():
-            path = REPO_ROOT / path
+        path = resolve_path(data_arg)
         if path.is_dir():
             files = discover_symbol_files(path)
         else:
@@ -371,9 +370,7 @@ def main(argv: list[str] | None = None) -> None:
     device = torch.device(
         "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
     )
-    ckpt_path = Path(args.checkpoint)
-    if not ckpt_path.is_absolute() and not ckpt_path.exists():
-        ckpt_path = REPO_ROOT / ckpt_path
+    ckpt_path = resolve_path(args.checkpoint)
     if not ckpt_path.exists():
         raise SystemExit(
             f"checkpoint not found: {ckpt_path}\nTrain one first: python -m forecast.training"

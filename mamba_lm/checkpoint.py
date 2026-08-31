@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 
+from mamba_lm.checkpoint_io import load_checkpoint_dict
 from mamba_lm.config import MambaConfig
 from mamba_lm.model import MambaLM
 
@@ -52,7 +53,7 @@ def load_checkpoint(
     baseline checkpoint can initialize a Dynamic A model (controller stays at
     its zero init).
     """
-    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    ckpt = load_checkpoint_dict(path, map_location=map_location)
     config = MambaConfig.from_dict(ckpt["config"])
 
     if model is not None:
@@ -78,7 +79,7 @@ def model_from_checkpoint(
     map_location: str | torch.device | None = None,
     override: dict[str, Any] | None = None,
 ) -> tuple[MambaLM, dict[str, Any]]:
-    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    ckpt = load_checkpoint_dict(path, map_location=map_location)
     cfg_dict = dict(ckpt["config"])
     if override:
         cfg_dict.update(override)

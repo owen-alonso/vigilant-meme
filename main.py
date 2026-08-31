@@ -19,7 +19,7 @@ def _model_cfg(args: argparse.Namespace) -> MambaConfig:
         d_state=args.d_state,
         expand=args.expand,
         dynamic_weights=args.dynamic_weights,
-        dynamic_A=True,
+        dynamic_A=args.dynamic_weights,
         dynamic_strength=args.dynamic_strength,
     )
 
