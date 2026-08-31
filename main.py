@@ -9,7 +9,8 @@ from mamba_lm.config import MambaConfig, TrainConfig
 from mamba_lm.experiment import run_training_comparison
 from mamba_lm.model import MambaLM
 from mamba_lm.reporting import format_parameter_report, parameter_report
-from mamba_lm.train import select_device, train
+from mamba_lm.training_utils import select_device
+from mamba_lm.train import train
 
 
 def _model_cfg(args: argparse.Namespace) -> MambaConfig:
@@ -19,7 +20,7 @@ def _model_cfg(args: argparse.Namespace) -> MambaConfig:
         d_state=args.d_state,
         expand=args.expand,
         dynamic_weights=args.dynamic_weights,
-        dynamic_A=True,
+        dynamic_A=args.dynamic_weights,
         dynamic_strength=args.dynamic_strength,
     )
 

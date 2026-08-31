@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
+import tempfile
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 import torch
 from torch.utils.data import Dataset
 
+from mamba_lm.paths import anchor_to_repo
 from mamba_lm.tokenizer import CharTokenizer
 
 
@@ -15,17 +19,51 @@ TINY_SHAKESPEARE_URL = (
     "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/"
     "tinyshakespeare/input.txt"
 )
+TINY_SHAKESPEARE_SHA256 = (
+    "86c4e6aa9db7c042ec79f339dcb96d42b0075e16b8fc2e86bf0ca57e2dc565ed"
+)
+TINY_SHAKESPEARE_MIN_BYTES = 1_000_000
+
+
+def _validate_tiny_shakespeare(data: bytes) -> None:
+    if len(data) < TINY_SHAKESPEARE_MIN_BYTES:
+        raise ValueError(
+            f"tiny shakespeare download too small ({len(data)} bytes); "
+            "refusing to cache a truncated or error response"
+        )
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != TINY_SHAKESPEARE_SHA256:
+        raise ValueError(
+            "tiny shakespeare SHA-256 mismatch; "
+            f"expected {TINY_SHAKESPEARE_SHA256}, got {digest}"
+        )
 
 
 def download_tiny_shakespeare(data_dir: str | Path) -> Path:
-    data_dir = Path(data_dir)
+    data_dir = anchor_to_repo(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     path = data_dir / "tinyshakespeare.txt"
-    if path.exists() and path.stat().st_size > 0:
-        return path
-    with urlopen(TINY_SHAKESPEARE_URL, timeout=60) as response:
-        text = response.read()
-    path.write_bytes(text)
+    if path.exists() and path.stat().st_size >= TINY_SHAKESPEARE_MIN_BYTES:
+        existing = path.read_bytes()
+        try:
+            _validate_tiny_shakespeare(existing)
+            return path
+        except ValueError:
+            path.unlink(missing_ok=True)
+
+    try:
+        with urlopen(TINY_SHAKESPEARE_URL, timeout=60) as response:
+            if getattr(response, "status", 200) != 200:
+                raise ValueError(f"HTTP {response.status} fetching tiny shakespeare")
+            text = response.read()
+    except (HTTPError, URLError) as exc:
+        raise RuntimeError(f"failed to download tiny shakespeare: {exc}") from exc
+
+    _validate_tiny_shakespeare(text)
+    with tempfile.NamedTemporaryFile(dir=data_dir, delete=False) as tmp:
+        tmp.write(text)
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(path)
     return path
 
 

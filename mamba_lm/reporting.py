@@ -32,8 +32,7 @@ def clip_grad_norm_unique(model: nn.Module, max_norm: float) -> float:
 
 
 def _is_dynamic_param(name: str) -> bool:
-    parts = name.split(".")
-    return "controller" in parts or "modulator" in parts
+    return "controller" in name.split(".")
 
 
 def parameter_report(model: nn.Module) -> dict[str, Any]:

@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from mamba_lm.config import MambaConfig
+from mamba_lm.diagnostics import get_ssm_diagnostics
 from mamba_lm.mamba import MambaLayer
 from mamba_lm.rmsnorm import RMSNorm
 
@@ -41,17 +42,18 @@ class MambaLM(nn.Module):
 
     def collect_dynamic_diagnostics(self) -> list[dict[str, Any]]:
         """Per-layer A-scale stats from the most recent dynamic forward."""
-        reports: list[dict[str, Any]] = []
-        for i, layer in enumerate(self.layers):
-            mixer = layer.mixer
-            if mixer.last_A_scale is None:
-                continue
-            stats = {
-                "layer": i,
-                **_scale_stats(mixer.last_A_scale),
-            }
-            reports.append(stats)
-        return reports
+        return collect_mixer_diagnostics(self.layers)
+
+
+def collect_mixer_diagnostics(layers: nn.ModuleList) -> list[dict[str, Any]]:
+    """Per-layer Dynamic A scale stats from the most recent forward pass."""
+    reports: list[dict[str, Any]] = []
+    for i, layer in enumerate(layers):
+        diag = get_ssm_diagnostics(layer.mixer)
+        if diag is None or diag.a_scale is None:
+            continue
+        reports.append({"layer": i, **_scale_stats(diag.a_scale)})
+    return reports
 
 
 def format_dynamic_diagnostics(reports: list[dict[str, Any]]) -> str:

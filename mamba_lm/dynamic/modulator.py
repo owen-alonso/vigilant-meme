@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 
 from mamba_lm.config import MambaConfig
 from mamba_lm.dynamic.params import DynamicParameters
 
 
-class DynamicParameterModulator(nn.Module):
+class DynamicParameterModulator:
     """Turn raw controller logits into a stable, token-dependent A_t.
 
     V1 (elementwise)::
@@ -23,7 +22,6 @@ class DynamicParameterModulator(nn.Module):
     """
 
     def __init__(self, config: MambaConfig) -> None:
-        super().__init__()
         if config.dynamic_parameterization != "elementwise":
             raise NotImplementedError(
                 "V1 modulator only supports parameterization='elementwise'"
@@ -61,29 +59,16 @@ class DynamicParameterModulator(nn.Module):
                 f"A_base must be [D, N={self.d_state}], got {tuple(A_base.shape)}"
             )
 
-        # Keep A modulation in fp32 even under autocast: A is a sensitive SSM quantity.
         delta_fp32 = delta_A.float()
-        # tanh bounds the controller; strength (default 0.1) keeps scale in ~[0.9, 1.1].
         scale = 1.0 + self.strength * torch.tanh(delta_fp32)
-        scale = scale.clamp(min=self.eps)  # [B, L, N], strictly positive
+        scale = scale.clamp(min=self.eps)
 
-        # A_base [D, N] * scale [B, L, 1, N] -> [B, L, D, N]
-        # Every channel D shares the same per-token, per-state-dim timescale.
         A_t = A_base.unsqueeze(0).unsqueeze(0) * scale.unsqueeze(2)
         return A_t.to(dtype=A_base.dtype), scale
 
-    def summarize_scale(self, scale: torch.Tensor) -> dict[str, float]:
-        """Cheap sequence-level stats (no per-token dumps)."""
-        s = scale.detach().float()
-        return {
-            "mean": float(s.mean().item()),
-            "std": float(s.std(unbiased=False).item()),
-            "min": float(s.min().item()),
-            "max": float(s.max().item()),
-        }
-
-    def extra_repr(self) -> str:
+    def __repr__(self) -> str:
         return (
-            f"parameterization={self.parameterization}, "
-            f"strength={self.strength}, eps={self.eps}"
+            f"DynamicParameterModulator("
+            f"parameterization={self.parameterization!r}, "
+            f"strength={self.strength}, eps={self.eps})"
         )

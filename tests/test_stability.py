@@ -7,7 +7,7 @@ import torch
 
 from mamba_lm.mamba import MambaBlock
 from mamba_lm.model import MambaLM
-from tests.helpers import dynamic_config, perturb_controller, tiny_config
+from tests.helpers import block_scale, dynamic_config, perturb_controller, tiny_config
 
 
 def test_hundreds_of_fp32_forwards_finite():
@@ -21,8 +21,9 @@ def test_hundreds_of_fp32_forwards_finite():
             y = block(x)
             assert torch.isfinite(y).all(), f"non-finite output at iter {i}"
             assert y.abs().max() < 1e6, f"exploding output at iter {i}: {y.abs().max()}"
-            assert torch.isfinite(block.last_A_scale).all()
-            assert (block.last_A_scale > 0).all()
+            scale = block_scale(block)
+            assert torch.isfinite(scale).all()
+            assert (scale > 0).all()
 
 
 def test_mixed_precision_forwards_finite():

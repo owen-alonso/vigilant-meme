@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, fields
 from typing import Any, Literal
 
 from mamba_lm.config import MambaConfig
+from mamba_lm.config_utils import filter_dataclass_fields
 
 
 Precision = Literal["fp32", "fp16", "bf16"]
@@ -62,8 +63,7 @@ class DataConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DataConfig:
-        allowed = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in allowed})
+        return cls(**filter_dataclass_fields(cls, data))
 
 
 @dataclass
@@ -79,7 +79,7 @@ class ForecastModelConfig:
     dropout: float = 0.1
     # Residual-std head. Trained by gaussian NLL, or by sigma_aux_weight when
     # the mean loss is Huber/MSE. generate.py maps it to a confidence score.
-    heteroscedastic: bool = True
+    heteroscedastic: bool = False
 
     dynamic_weights: bool = False
     dynamic_A: bool = True
@@ -105,8 +105,7 @@ class ForecastModelConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ForecastModelConfig:
-        allowed = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in allowed})
+        return cls(**filter_dataclass_fields(cls, data))
 
 
 @dataclass
@@ -136,8 +135,7 @@ class ForecastTrainConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ForecastTrainConfig:
-        allowed = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in allowed})
+        return cls(**filter_dataclass_fields(cls, data))
 
 
 def validate_loss_head(model_cfg: ForecastModelConfig, train_cfg: ForecastTrainConfig) -> None:
