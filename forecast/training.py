@@ -364,13 +364,25 @@ def train(
                         log_fn(f"early stop: no val IC gain in {evals_without_gain} evals")
                     break
 
-    # Final test evaluation uses the best checkpoint, not the last one.
+    # Final test evaluation uses the best checkpoint when available.
     best_path = ckpt_dir / "best.pt"
+    last_path = ckpt_dir / "last.pt"
     if best_path.exists():
-        state = load_forecast_checkpoint(best_path, map_location=device, model=model)
+        load_forecast_checkpoint(best_path, map_location=device, model=model)
+    elif last_path.exists():
+        load_forecast_checkpoint(last_path, map_location=device, model=model)
+        if log_fn:
+            log_fn("warning: no best.pt saved; TEST uses last.pt weights")
+    elif log_fn:
+        log_fn("warning: no checkpoint saved; TEST uses final in-memory weights")
     test = evaluate(model, test_loader, device, train_cfg)
     if log_fn:
-        log_fn(f"TEST (best step {best_step}): {_fmt(test)}")
+        if best_path.exists():
+            log_fn(f"TEST (best step {best_step}): {_fmt(test)}")
+        elif last_path.exists():
+            log_fn(f"TEST (last checkpoint; no best.pt was saved): {_fmt(test)}")
+        else:
+            log_fn(f"TEST (in-memory weights; no checkpoint saved): {_fmt(test)}")
 
     summary = {
         "best_val_ic": best_ic,
@@ -421,7 +433,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "--heteroscedastic",
         action="store_true",
-        help="train a log-sigma head (requires --loss gaussian)",
+        help="train a log-sigma head (with --loss gaussian, or Huber/MSE + aux weight)",
     )
     g.add_argument(
         "--no-heteroscedastic",

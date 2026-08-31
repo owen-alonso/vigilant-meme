@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+import torch
+
 from mamba_lm.config import MambaConfig, TrainConfig
 from mamba_lm.reporting import format_parameter_report
 from mamba_lm.train import train
@@ -14,6 +16,7 @@ def run_training_comparison(
     model_cfg: MambaConfig | None = None,
     train_cfg: TrainConfig | None = None,
     *,
+    device: torch.device | None = None,
     log_fn=print,
 ) -> dict[str, Any]:
     model_cfg = model_cfg or MambaConfig(
@@ -45,7 +48,7 @@ def run_training_comparison(
             cfg._validate_dynamic_v1()
         tcfg = copy.deepcopy(train_cfg)
         tcfg.checkpoint_dir = f"{train_cfg.checkpoint_dir}/{name}"
-        results[name] = train(cfg, tcfg, log_fn=log_fn)
+        results[name] = train(cfg, tcfg, device=device, log_fn=log_fn)
 
     if log_fn:
         log_fn("\n======== comparison ========")

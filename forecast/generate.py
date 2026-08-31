@@ -20,6 +20,7 @@ back by the volatility known at the forecast bar and reports basis points
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +37,7 @@ from forecast.data import (
     symbol_from_path,
 )
 from forecast.model import ReturnForecaster
-from mamba_lm.paths import resolve_path
+from mamba_lm.paths import anchor_to_repo, resolve_path
 
 
 @torch.no_grad()
@@ -419,8 +420,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.csv:
         wide = predicted_move_wide(by_symbol)
-        wide.to_csv(args.csv, index_label="datetime")
-        print(f"\nWrote CSV: {args.csv}", file=sys.stderr)
+        csv_path = anchor_to_repo(args.csv)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        wide.to_csv(csv_path, index_label="datetime")
+        print(f"\nWrote CSV: {csv_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
