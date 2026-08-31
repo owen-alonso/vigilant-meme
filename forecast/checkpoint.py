@@ -98,6 +98,11 @@ def load_forecaster(
 
 
 def uncertainty_is_trained(model: ReturnForecaster, state: dict[str, Any]) -> bool:
-    """Only the gaussian NLL trains log_sigma; otherwise the column is noise."""
+    """True when the checkpoint actually trained the log-sigma head."""
+    if not model.config.heteroscedastic:
+        return False
     train_cfg = state.get("train_config") or {}
-    return bool(model.config.heteroscedastic) and train_cfg.get("loss") == "gaussian"
+    loss = train_cfg.get("loss")
+    if loss == "gaussian":
+        return True
+    return float(train_cfg.get("sigma_aux_weight", 0)) > 0
