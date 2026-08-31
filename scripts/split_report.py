@@ -8,30 +8,34 @@ Run this before trusting a test-set number.
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 import pandas as pd
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from forecast.config import DataConfig
 from forecast.data import build_session_grid, load_bars, split_session_bounds
+from mamba_lm.paths import resolve_path
 
 
 def main(path: str = "data/SPAB_clean_1min.parquet") -> None:
     cfg = DataConfig()
-    raw = load_bars(path)
+    resolved = resolve_path(path)
+    raw = load_bars(resolved)
     grid = build_session_grid(raw, cfg)
     sessions = grid["session"].drop_duplicates().sort_values().to_numpy()
     n = len(sessions)
     cut_train, cut_val = split_session_bounds(n, cfg)
     train_end, val_end = sessions[cut_train], sessions[cut_val]
 
-    source = pd.read_parquet(path, columns=["datetime", "source"]) if _has_source(path) else None
+    source = (
+        pd.read_parquet(resolved, columns=["datetime", "source"])
+        if _has_source(resolved)
+        else None
+    )
 
-    print(f"{path}: {n} sessions, split at {pd.Timestamp(train_end).date()} / "
-          f"{pd.Timestamp(val_end).date()}\n")
+    print(
+        f"{resolved}: {n} sessions, split at {pd.Timestamp(train_end).date()} / "
+        f"{pd.Timestamp(val_end).date()}\n"
+    )
     bounds = [
         ("train", grid["session"] < train_end),
         ("val", (grid["session"] >= train_end) & (grid["session"] < val_end)),
@@ -54,7 +58,7 @@ def main(path: str = "data/SPAB_clean_1min.parquet") -> None:
         print(line)
 
 
-def _has_source(path: str) -> bool:
+def _has_source(path) -> bool:
     return "source" in pd.read_parquet(path).columns
 
 

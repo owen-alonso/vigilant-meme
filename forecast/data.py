@@ -31,7 +31,7 @@ import torch
 from torch.utils.data import Dataset
 
 from forecast.config import BARS_PER_SESSION, SESSION_START_MINUTE, DataConfig
-from mamba_lm.paths import REPO_ROOT, anchor_to_repo, resolve_path
+from mamba_lm.paths import REPO_ROOT, resolve_path
 
 
 FEATURE_NAMES: tuple[str, ...] = (
@@ -460,10 +460,6 @@ def split_session_bounds(n_sessions: int, cfg: DataConfig) -> tuple[int, int]:
     return n_train, n_train + n_val
 
 
-def _split_bounds(n_sessions: int, cfg: DataConfig) -> tuple[int, int]:
-    return split_session_bounds(n_sessions, cfg)
-
-
 def build_datasets(
     cfg: DataConfig,
     *,
@@ -486,7 +482,7 @@ def build_datasets(
         panel = build_panel(path, cfg)
         symbol = str(panel["symbol"].iloc[0])
         sessions = panel["session"].drop_duplicates().sort_values().to_numpy()
-        cut_train, cut_val = _split_bounds(len(sessions), cfg)
+        cut_train, cut_val = split_session_bounds(len(sessions), cfg)
         train_end, val_end = sessions[cut_train], sessions[cut_val]
 
         is_train = panel["session"] < train_end

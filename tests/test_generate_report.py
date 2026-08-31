@@ -9,7 +9,8 @@ import pandas as pd
 import torch
 
 from forecast.config import DataConfig, ForecastModelConfig
-from forecast.generate import format_stock_column_report, uncertainty_is_trained
+from forecast.generate import format_stock_column_report
+from forecast.checkpoint import uncertainty_is_trained
 from forecast.model import ReturnForecaster
 
 

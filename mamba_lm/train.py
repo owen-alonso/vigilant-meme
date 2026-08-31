@@ -43,6 +43,7 @@ __all__ = [
 ]
 
 
+@torch.no_grad()
 def evaluate(
     model: MambaLM,
     loader: DataLoader,

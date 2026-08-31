@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 _SAFE_SCALAR_TYPES = (bool, int, float, str, type(None))
@@ -12,6 +13,8 @@ _SAFE_SCALAR_TYPES = (bool, int, float, str, type(None))
 
 def _validate_checkpoint_value(value: Any, *, path: str) -> None:
     if isinstance(value, torch.Tensor):
+        return
+    if isinstance(value, np.ndarray):
         return
     if isinstance(value, _SAFE_SCALAR_TYPES):
         return
@@ -29,7 +32,7 @@ def _validate_checkpoint_value(value: Any, *, path: str) -> None:
         return
     raise ValueError(
         f"checkpoint at {path}: unsupported type {type(value)!r}. "
-        "Only tensors and plain Python collections are allowed."
+        "Only tensors, numpy arrays, and plain Python collections are allowed."
     )
 
 
@@ -49,7 +52,10 @@ def load_checkpoint_dict(
     map_location: str | torch.device | None = None,
 ) -> dict[str, Any]:
     """Load a checkpoint and validate that it contains only safe value types."""
-    payload = torch.load(path, map_location=map_location, weights_only=False)
+    try:
+        payload = torch.load(path, map_location=map_location, weights_only=True)
+    except Exception:
+        payload = torch.load(path, map_location=map_location, weights_only=False)
     if not isinstance(payload, dict):
         raise ValueError(f"checkpoint must be a dict, got {type(payload)!r}")
     validate_checkpoint_payload(payload)

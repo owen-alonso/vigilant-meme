@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -29,11 +28,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-if __package__ in (None, ""):
-    # Run as a plain script (`python forecast/training.py`, or from an IDE):
-    # put the repo root on sys.path so the package imports below resolve.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
+from forecast.checkpoint import load_forecast_checkpoint, save_forecast_checkpoint
 from forecast.config import (
     DataConfig,
     ForecastModelConfig,
@@ -42,7 +37,6 @@ from forecast.config import (
 )
 from forecast.data import FEATURE_NAMES, build_datasets
 from forecast.model import ReturnForecaster
-from mamba_lm.checkpoint_io import load_checkpoint_dict
 from mamba_lm.model import format_dynamic_diagnostics
 from mamba_lm.paths import anchor_to_repo
 from mamba_lm.reporting import clip_grad_norm_unique
@@ -280,20 +274,18 @@ def train(
         log_fn(f"checkpoints -> {ckpt_dir}")
 
     def save(path: Path, step: int, metrics: dict[str, float]) -> None:
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "model_config": model_cfg.to_dict(),
-                "data_config": data_cfg.to_dict(),
-                "train_config": train_cfg.to_dict(),
-                "feature_names": bundle["feature_names"],
-                "feature_mean": bundle["feature_mean"],
-                "feature_std": bundle["feature_std"],
-                "symbols": bundle["meta"],
-                "step": step,
-                "metrics": metrics,
-            },
+        save_forecast_checkpoint(
             path,
+            model=model,
+            model_cfg=model_cfg,
+            data_cfg=data_cfg,
+            train_cfg=train_cfg,
+            feature_names=bundle["feature_names"],
+            feature_mean=bundle["feature_mean"],
+            feature_std=bundle["feature_std"],
+            symbols=bundle["meta"],
+            step=step,
+            metrics=metrics,
         )
 
     history: list[dict[str, Any]] = []
@@ -375,8 +367,7 @@ def train(
     # Final test evaluation uses the best checkpoint, not the last one.
     best_path = ckpt_dir / "best.pt"
     if best_path.exists():
-        state = load_checkpoint_dict(best_path, map_location=device)
-        model.load_state_dict(state["model"])
+        state = load_forecast_checkpoint(best_path, map_location=device, model=model)
     test = evaluate(model, test_loader, device, train_cfg)
     if log_fn:
         log_fn(f"TEST (best step {best_step}): {_fmt(test)}")

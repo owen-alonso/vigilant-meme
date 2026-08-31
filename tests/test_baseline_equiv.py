@@ -6,7 +6,7 @@ import torch
 
 from mamba_lm.mamba import MambaBlock
 from mamba_lm.model import MambaLM
-from tests.helpers import dynamic_config, tiny_config
+from tests.helpers import block_scale, dynamic_config, tiny_config
 
 
 def test_zero_init_block_matches_baseline():
@@ -22,9 +22,8 @@ def test_zero_init_block_matches_baseline():
         y_base = baseline(x)
         y_dyn = dynamic(x)
     assert torch.allclose(y_base, y_dyn, rtol=1e-5, atol=1e-5)
-    # Zero-init controller => scale identically 1.
-    assert dynamic.last_A_scale is not None
-    assert torch.allclose(dynamic.last_A_scale, torch.ones_like(dynamic.last_A_scale))
+    scale = block_scale(dynamic)
+    assert torch.allclose(scale, torch.ones_like(scale))
 
 
 def test_zero_strength_matches_baseline():
@@ -34,7 +33,6 @@ def test_zero_strength_matches_baseline():
     baseline = MambaBlock(base_cfg)
     dynamic = MambaBlock(dyn_cfg)
     dynamic.load_state_dict(baseline.state_dict(), strict=False)
-    # Non-zero controller weights still cannot move A when strength is 0.
     torch.nn.init.normal_(dynamic.controller.out_proj.weight, std=0.2)
 
     x = torch.randn(2, 8, base_cfg.d_model)
@@ -67,4 +65,3 @@ def test_same_seed_constructs_matching_baseline_weights():
     assert shared
     for key in shared:
         assert torch.equal(base_sd[key], dyn_sd[key]), key
-

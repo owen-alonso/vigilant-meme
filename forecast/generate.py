@@ -20,7 +20,6 @@ back by the volatility known at the forecast bar and reports basis points
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -28,10 +27,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from forecast.config import DataConfig, ForecastModelConfig
+from forecast.checkpoint import load_forecaster, uncertainty_is_trained
+from forecast.config import DataConfig
 from forecast.data import (
     FEATURE_NAMES,
     build_panel,
@@ -39,25 +36,7 @@ from forecast.data import (
     symbol_from_path,
 )
 from forecast.model import ReturnForecaster
-from mamba_lm.checkpoint_io import load_checkpoint_dict
-from mamba_lm.paths import anchor_to_repo, resolve_path
-
-
-def load_forecaster(
-    checkpoint: str | Path, device: torch.device
-) -> tuple[ReturnForecaster, dict[str, Any]]:
-    state = load_checkpoint_dict(checkpoint, map_location=device)
-    model_cfg = ForecastModelConfig.from_dict(state["model_config"])
-    model = ReturnForecaster(model_cfg).to(device)
-    model.load_state_dict(state["model"])
-    model.eval()
-    return model, state
-
-
-def uncertainty_is_trained(model: ReturnForecaster, state: dict[str, Any]) -> bool:
-    """Only the gaussian NLL trains log_sigma; otherwise the column is noise."""
-    train_cfg = state.get("train_config") or {}
-    return bool(model.config.heteroscedastic) and train_cfg.get("loss") == "gaussian"
+from mamba_lm.paths import resolve_path
 
 
 @torch.no_grad()

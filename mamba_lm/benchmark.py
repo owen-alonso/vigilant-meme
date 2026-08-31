@@ -11,7 +11,7 @@ import torch
 from mamba_lm.config import MambaConfig
 from mamba_lm.model import MambaLM
 from mamba_lm.reporting import format_parameter_report, parameter_report
-from mamba_lm.train import select_device, set_seed
+from mamba_lm.training_utils import select_device, set_seed
 
 
 def _sync(device: torch.device) -> None:

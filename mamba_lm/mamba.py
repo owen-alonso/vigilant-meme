@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mamba_lm.config import MambaConfig
+from mamba_lm.diagnostics import SsmDiagnostics, record_ssm_diagnostics
 from mamba_lm.dynamic.controller import DynamicWeightController
 from mamba_lm.dynamic.modulator import DynamicParameterModulator
 from mamba_lm.rmsnorm import RMSNorm
@@ -77,10 +78,6 @@ class MambaBlock(nn.Module):
             self.controller = None
             self.modulator = None
 
-        # Populated during dynamic forwards for tests / diagnostics.
-        self.last_delta_A: torch.Tensor | None = None
-        self.last_A_scale: torch.Tensor | None = None
-
     def _init_dt_proj(self, config: MambaConfig) -> None:
         dt_init_std = config.resolved_dt_rank() ** -0.5 * config.dt_scale
         if config.dt_init == "constant":
@@ -134,15 +131,16 @@ class MambaBlock(nn.Module):
         if self.controller is not None and self.modulator is not None:
             params = self.controller(x)
             A, scale = self.modulator.modulate_A(A_base, params)
-            # Detach so diagnostics do not keep the autograd graph alive.
-            self.last_delta_A = (
-                params.delta_A.detach() if params.delta_A is not None else None
+            record_ssm_diagnostics(
+                self,
+                SsmDiagnostics(
+                    delta_A=params.delta_A.detach() if params.delta_A is not None else None,
+                    a_scale=scale.detach(),
+                ),
             )
-            self.last_A_scale = scale.detach()
         else:
             A = A_base  # [D, N]
-            self.last_delta_A = None
-            self.last_A_scale = None
+            record_ssm_diagnostics(self, None)
 
         y = ssm_forward(x.float(), dt, A, B.float(), C.float(), self.D.float())
         return y.to(dtype=x.dtype)

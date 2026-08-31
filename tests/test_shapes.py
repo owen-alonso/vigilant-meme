@@ -7,7 +7,13 @@ import torch
 
 from mamba_lm.mamba import MambaBlock
 from mamba_lm.model import MambaLM
-from tests.helpers import dynamic_config, perturb_controller, tiny_config
+from tests.helpers import (
+    block_delta_a,
+    block_scale,
+    dynamic_config,
+    perturb_controller,
+    tiny_config,
+)
 
 
 @pytest.mark.parametrize("batch", [1, 2, 5])
@@ -29,11 +35,10 @@ def test_dynamic_block_shapes(batch, seq_len):
     x = torch.randn(batch, seq_len, cfg.d_model)
     y = block(x)
     assert y.shape == (batch, seq_len, cfg.d_model)
-    assert block.last_delta_A is not None
-    assert block.last_A_scale is not None
-    # delta_A / scale: [B, L, N]
-    assert block.last_delta_A.shape == (batch, seq_len, cfg.d_state)
-    assert block.last_A_scale.shape == (batch, seq_len, cfg.d_state)
+    assert block_delta_a(block) is not None
+    scale = block_scale(block)
+    assert block_delta_a(block).shape == (batch, seq_len, cfg.d_state)
+    assert scale.shape == (batch, seq_len, cfg.d_state)
 
 
 def test_lm_logits_shape():
@@ -51,5 +56,7 @@ def test_baseline_has_no_controller():
     assert block.modulator is None
     x = torch.randn(2, 5, 32)
     block(x)
-    assert block.last_delta_A is None
-    assert block.last_A_scale is None
+    assert block_delta_a(block) is None
+    from mamba_lm.diagnostics import get_ssm_diagnostics
+
+    assert get_ssm_diagnostics(block) is None
