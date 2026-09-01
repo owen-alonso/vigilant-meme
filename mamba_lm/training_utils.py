@@ -2,11 +2,78 @@
 
 from __future__ import annotations
 
+import ctypes
 import math
-from typing import Any, Iterator
+import sys
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
 
 import torch
 from torch.utils.data import DataLoader
+
+# Windows EXECUTION_STATE flags for SetThreadExecutionState.
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def _set_windows_execution_state(flags: int) -> bool:
+    """Return True if the call succeeded. No-op on non-Windows."""
+    if sys.platform != "win32":
+        return False
+    kernel32 = ctypes.windll.kernel32
+    kernel32.SetThreadExecutionState.argtypes = (ctypes.c_uint,)
+    kernel32.SetThreadExecutionState.restype = ctypes.c_uint
+    return int(kernel32.SetThreadExecutionState(flags)) != 0
+
+
+@contextmanager
+def keep_awake(
+    log_fn: Any | None = None,
+    *,
+    interval_sec: float = 30.0,
+) -> Iterator[None]:
+    """Keep the machine from sleeping while a training loop is running.
+
+    On Windows this calls ``SetThreadExecutionState(ES_CONTINUOUS |
+    ES_SYSTEM_REQUIRED)`` and refreshes it on ``interval_sec`` so idle-CPU
+    GPU training cannot be suspended. Display power-off is still allowed.
+    Other platforms are a no-op. Always clears the inhibit on exit,
+    including Ctrl+C.
+    """
+    stop = threading.Event()
+    thread: threading.Thread | None = None
+    armed = False
+
+    if sys.platform == "win32":
+        armed = _set_windows_execution_state(_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED)
+        if log_fn:
+            if armed:
+                log_fn("keep_awake: system sleep inhibited until training ends")
+            else:
+                log_fn(
+                    "keep_awake: SetThreadExecutionState failed; "
+                    "the machine may still sleep"
+                )
+
+        def _pulse() -> None:
+            while not stop.wait(max(0.1, float(interval_sec))):
+                _set_windows_execution_state(_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED)
+
+        thread = threading.Thread(target=_pulse, name="keep_awake", daemon=True)
+        thread.start()
+
+    try:
+        yield
+    finally:
+        stop.set()
+        if thread is not None:
+            thread.join(timeout=1.0)
+        if sys.platform == "win32":
+            _set_windows_execution_state(_ES_CONTINUOUS)
+            if armed and log_fn:
+                log_fn("keep_awake: system sleep restored")
 
 
 def select_device(prefer_cuda: bool = True) -> torch.device:

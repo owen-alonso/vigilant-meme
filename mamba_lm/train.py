@@ -27,6 +27,7 @@ from mamba_lm.training_utils import (
     build_optimizer,
     cycle_loader,
     grads_finite,
+    keep_awake,
     lr_linear_warmup,
     require_nonempty_loader,
     select_device,
@@ -92,6 +93,19 @@ def train(
     log_fn: Any | None = print,
 ) -> dict[str, Any]:
     """Run a controlled training session. Returns metrics for comparisons."""
+    with keep_awake(log_fn=log_fn):
+        return _train(
+            model_cfg, train_cfg, device=device, log_fn=log_fn
+        )
+
+
+def _train(
+    model_cfg: MambaConfig,
+    train_cfg: TrainConfig,
+    *,
+    device: torch.device | None = None,
+    log_fn: Any | None = print,
+) -> dict[str, Any]:
     device = device or select_device()
     set_seed(train_cfg.seed)
 

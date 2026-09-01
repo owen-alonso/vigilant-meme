@@ -6,8 +6,11 @@ import pytest
 import torch
 
 from mamba_lm.training_utils import (
+    _ES_CONTINUOUS,
+    _ES_SYSTEM_REQUIRED,
     autocast_context,
     grads_finite,
+    keep_awake,
     lr_linear_warmup,
     lr_warmup_cosine,
 )
@@ -31,6 +34,50 @@ def test_autocast_context_cpu_fp16_falls_back():
     device = torch.device("cpu")
     with autocast_context(device, "fp16") as ctx:
         assert ctx is not None
+
+
+def test_keep_awake_inhibits_sleep_then_restores(monkeypatch):
+    calls: list[int] = []
+
+    def fake_set(flags: int) -> bool:
+        calls.append(flags)
+        return True
+
+    monkeypatch.setattr("mamba_lm.training_utils.sys.platform", "win32")
+    monkeypatch.setattr(
+        "mamba_lm.training_utils._set_windows_execution_state", fake_set
+    )
+    logs: list[str] = []
+    with keep_awake(log_fn=logs.append, interval_sec=60.0):
+        assert calls == [_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED]
+        assert any("sleep inhibited" in line for line in logs)
+    assert calls[-1] == _ES_CONTINUOUS
+    assert any("sleep restored" in line for line in logs)
+
+
+def test_keep_awake_clears_after_error(monkeypatch):
+    calls: list[int] = []
+    monkeypatch.setattr("mamba_lm.training_utils.sys.platform", "win32")
+    monkeypatch.setattr(
+        "mamba_lm.training_utils._set_windows_execution_state",
+        lambda flags: calls.append(flags) or True,
+    )
+    with pytest.raises(RuntimeError, match="boom"):
+        with keep_awake(interval_sec=60.0):
+            raise RuntimeError("boom")
+    assert calls[-1] == _ES_CONTINUOUS
+
+
+def test_keep_awake_is_noop_off_windows(monkeypatch):
+    calls: list[int] = []
+    monkeypatch.setattr("mamba_lm.training_utils.sys.platform", "linux")
+    monkeypatch.setattr(
+        "mamba_lm.training_utils._set_windows_execution_state",
+        lambda flags: calls.append(flags) or True,
+    )
+    with keep_awake():
+        pass
+    assert calls == []
 
 
 def test_grads_finite_detects_nan():

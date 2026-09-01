@@ -45,6 +45,7 @@ from mamba_lm.training_utils import (
     build_optimizer,
     cycle_loader,
     grads_finite,
+    keep_awake,
     lr_warmup_cosine,
     require_nonempty_loader,
     select_device,
@@ -208,6 +209,24 @@ def _fmt(metrics: dict[str, float]) -> str:
 
 
 def train(
+    data_cfg: DataConfig,
+    model_cfg: ForecastModelConfig,
+    train_cfg: ForecastTrainConfig,
+    *,
+    device: torch.device | None = None,
+    log_fn: Any | None = print,
+) -> dict[str, Any]:
+    with keep_awake(log_fn=log_fn):
+        return _train(
+            data_cfg,
+            model_cfg,
+            train_cfg,
+            device=device,
+            log_fn=log_fn,
+        )
+
+
+def _train(
     data_cfg: DataConfig,
     model_cfg: ForecastModelConfig,
     train_cfg: ForecastTrainConfig,
