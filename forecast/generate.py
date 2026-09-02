@@ -24,6 +24,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# `python forecast/generate.py` (and IDEs) are not package imports.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import numpy as np
 import pandas as pd
 import torch

@@ -16,7 +16,7 @@ from forecast.data import (
     load_bars,
 )
 from forecast.model import ReturnForecaster
-from forecast.training import masked_loss
+from forecast.training import decide_val_plateau, masked_loss
 
 
 def _tiny_cfg(**kwargs) -> DataConfig:
@@ -204,3 +204,56 @@ def test_masked_loss_all_masked_is_nan():
     mask = torch.zeros_like(mean)
     loss = masked_loss(mean, log_sigma, target, mask, ForecastTrainConfig(loss="huber"))
     assert torch.isnan(loss)
+
+
+def test_val_plateau_cuts_lr_instead_of_stopping():
+    kwargs = dict(
+        plateau_evals=2,
+        plateau_factor=0.5,
+        min_scale=0.01,
+        early_stop_evals=0,
+    )
+    n, scale, stop, restore, msg = decide_val_plateau(
+        improved=False,
+        evals_without_gain=0,
+        lr_scale=1.0,
+        **kwargs,
+    )
+    assert (n, scale, stop, restore) == (1, 1.0, False, False)
+    assert msg is None
+
+    n, scale, stop, restore, msg = decide_val_plateau(
+        improved=False,
+        evals_without_gain=1,
+        lr_scale=1.0,
+        **kwargs,
+    )
+    assert stop is False
+    assert restore is True
+    assert n == 0
+    assert scale == pytest.approx(0.5)
+    assert msg is not None and "continuing" in msg
+
+    n, scale, stop, restore, msg = decide_val_plateau(
+        improved=True,
+        evals_without_gain=3,
+        lr_scale=0.5,
+        **kwargs,
+    )
+    assert (n, scale, stop, restore) == (0, 0.5, False, False)
+
+
+def test_val_plateau_early_stop_still_optional():
+    n, scale, stop, restore, msg = decide_val_plateau(
+        improved=False,
+        evals_without_gain=1,
+        lr_scale=1.0,
+        plateau_evals=8,
+        plateau_factor=0.5,
+        min_scale=0.01,
+        early_stop_evals=2,
+    )
+    assert stop is True
+    assert restore is False
+    assert scale == 1.0
+    assert msg is not None and "early stop" in msg

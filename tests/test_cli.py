@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 from mamba_lm.cli import _model_cfg
 from mamba_lm.config import MambaConfig
@@ -37,6 +38,20 @@ def test_uncertainty_is_trained_for_huber_aux():
     model = ReturnForecaster(ForecastModelConfig(n_features=18, heteroscedastic=True))
     state = {"train_config": {"loss": "huber", "sigma_aux_weight": 0.5}}
     assert uncertainty_is_trained(model, state)
+
+
+def test_forecast_training_script_help_from_file():
+    """`python forecast/training.py -h` must work without PYTHONPATH."""
+    repo = Path(__file__).resolve().parents[1]
+    proc = subprocess.run(
+        [sys.executable, str(repo / "forecast" / "training.py"), "-h"],
+        cwd=repo / "forecast",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "next-hour" in proc.stdout.lower() or "usage:" in proc.stdout.lower()
 
 
 def test_mamba_lm_console_script_runs_report():

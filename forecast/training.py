@@ -19,9 +19,16 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import time
 from pathlib import Path
 from typing import Any
+
+# `python forecast/training.py` (and IDEs) are not package imports.
+# Put the repo root on sys.path so `forecast.*` / `mamba_lm.*` resolve.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import numpy as np
 import torch
@@ -151,6 +158,43 @@ def lr_at(step: int, total_steps: int, cfg: ForecastTrainConfig) -> float:
         lr=cfg.lr,
         warmup_frac=cfg.warmup_frac,
     )
+
+
+def decide_val_plateau(
+    *,
+    improved: bool,
+    evals_without_gain: int,
+    lr_scale: float,
+    plateau_evals: int,
+    plateau_factor: float,
+    min_scale: float,
+    early_stop_evals: int,
+) -> tuple[int, float, bool, bool, str | None]:
+    """Handle a val-IC eval: maybe drop LR, restore best, or (optionally) stop.
+
+    Returns ``(evals_without_gain, lr_scale, stop, restore_best, log_message)``.
+    """
+    if improved:
+        return 0, lr_scale, False, False, None
+    n = evals_without_gain + 1
+    if early_stop_evals > 0 and n >= early_stop_evals:
+        return n, lr_scale, True, False, (
+            f"early stop: no val IC gain in {n} evals"
+        )
+    if plateau_evals > 0 and n >= plateau_evals:
+        factor = min(1.0, max(1e-6, float(plateau_factor)))
+        floor = max(0.0, float(min_scale))
+        new_scale = max(floor, lr_scale * factor)
+        if new_scale < lr_scale:
+            return 0, new_scale, False, True, (
+                f"val IC plateau for {n} evals: lr scale "
+                f"{lr_scale:.3g} -> {new_scale:.3g} (restoring best.pt, continuing)"
+            )
+        return 0, lr_scale, False, False, (
+            f"val IC plateau for {n} evals: lr scale already at floor "
+            f"({lr_scale:.3g}), continuing"
+        )
+    return n, lr_scale, False, False, None
 
 
 @torch.no_grad()
@@ -311,6 +355,7 @@ def _train(
     best_ic = -float("inf")
     best_step = -1
     evals_without_gain = 0
+    lr_scale = 1.0
     data_iter = cycle_loader(train_loader)
     running: list[float] = []
     t0 = time.perf_counter()
@@ -320,7 +365,7 @@ def _train(
         log_fn(f"steps/epoch={steps_per_epoch} total_steps={total_steps}")
 
     for step in range(total_steps):
-        lr = lr_at(step, total_steps, train_cfg)
+        lr = lr_at(step, total_steps, train_cfg) * lr_scale
         for group in optimizer.param_groups:
             group["lr"] = lr
 
@@ -370,18 +415,33 @@ def _train(
             save(ckpt_dir / "last.pt", step + 1, val)
 
             ic = val["ic"]
-            if np.isfinite(ic) and ic > best_ic:
+            improved = bool(np.isfinite(ic) and ic > best_ic)
+            if improved:
                 best_ic, best_step = ic, step + 1
-                evals_without_gain = 0
                 save(ckpt_dir / "best.pt", step + 1, val)
                 if log_fn:
                     log_fn(f"  new best val_ic={ic:+.4f} -> {ckpt_dir / 'best.pt'}")
-            else:
-                evals_without_gain += 1
-                if evals_without_gain >= train_cfg.early_stop_evals:
-                    if log_fn:
-                        log_fn(f"early stop: no val IC gain in {evals_without_gain} evals")
-                    break
+            evals_without_gain, lr_scale, stop, restore_best, plateau_msg = (
+                decide_val_plateau(
+                    improved=improved,
+                    evals_without_gain=evals_without_gain,
+                    lr_scale=lr_scale,
+                    plateau_evals=train_cfg.lr_plateau_evals,
+                    plateau_factor=train_cfg.lr_plateau_factor,
+                    min_scale=train_cfg.lr_plateau_min_scale,
+                    early_stop_evals=train_cfg.early_stop_evals,
+                )
+            )
+            if plateau_msg and log_fn:
+                log_fn(f"  {plateau_msg}")
+            if restore_best:
+                best_path = ckpt_dir / "best.pt"
+                if best_path.exists():
+                    load_forecast_checkpoint(
+                        best_path, map_location=device, model=model
+                    )
+            if stop:
+                break
 
     # Final test evaluation uses the best checkpoint when available.
     best_path = ckpt_dir / "best.pt"
@@ -473,7 +533,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--log-interval", type=int, default=t.log_interval)
     g.add_argument("--num-workers", type=int, default=t.num_workers)
     g.add_argument("--checkpoint-dir", default=t.checkpoint_dir)
-    g.add_argument("--early-stop-evals", type=int, default=t.early_stop_evals)
+    g.add_argument(
+        "--early-stop-evals",
+        type=int,
+        default=t.early_stop_evals,
+        help="stop after N evals with no val-IC gain (0 = never; default)",
+    )
+    g.add_argument(
+        "--lr-plateau-evals",
+        type=int,
+        default=t.lr_plateau_evals,
+        help="after N evals with no val-IC gain, cut LR and restore best.pt (0 = off)",
+    )
+    g.add_argument(
+        "--lr-plateau-factor",
+        type=float,
+        default=t.lr_plateau_factor,
+        help="multiply the scheduled LR by this on a val-IC plateau",
+    )
     g.add_argument("--cpu", action="store_true", help="force CPU")
     return p
 
@@ -533,6 +610,8 @@ def main(argv: list[str] | None = None) -> None:
         num_workers=args.num_workers,
         checkpoint_dir=args.checkpoint_dir,
         early_stop_evals=args.early_stop_evals,
+        lr_plateau_evals=args.lr_plateau_evals,
+        lr_plateau_factor=args.lr_plateau_factor,
     )
     train(
         data_cfg,

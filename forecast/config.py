@@ -128,7 +128,13 @@ class ForecastTrainConfig:
     eval_interval: int = 250
     num_workers: int = 0
     checkpoint_dir: str = "checkpoints/forecast"
-    early_stop_evals: int = 8  # stop after N evals with no val-IC improvement
+    # 0 = never stop. A positive N still aborts after N evals with no val-IC gain.
+    early_stop_evals: int = 0
+    # After this many evals with no new best val IC, multiply the scheduled LR
+    # (warmup/cosine) by lr_plateau_factor and restore best.pt. 0 disables.
+    lr_plateau_evals: int = 8
+    lr_plateau_factor: float = 0.5
+    lr_plateau_min_scale: float = 0.01
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
