@@ -174,84 +174,96 @@ def _train(
 
     data_iter = cycle_loader(train_loader)
     model.train()
-    for step in range(train_cfg.max_steps):
-        lr = lr_linear_warmup(
-            step, lr=train_cfg.lr, warmup_steps=train_cfg.warmup_steps
-        )
-        for group in optimizer.param_groups:
-            group["lr"] = lr
-
-        x, y = next(data_iter)
-        x = x.to(device)
-        y = y.to(device)
-
-        optimizer.zero_grad(set_to_none=True)
-        with autocast_context(device, train_cfg.precision):
-            logits = model(x)
-        loss = F.cross_entropy(
-            logits.float().reshape(-1, logits.size(-1)),
-            y.reshape(-1),
-        )
-
-        if not torch.isfinite(loss):
-            raise RuntimeError(f"non-finite loss at step {step}: {loss}")
-
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        if not grads_finite(model):
-            skipped_inf += 1
-            if log_fn:
-                log_fn(
-                    f"step {step:5d}: non-finite gradients, skipping optimizer step "
-                    f"(skipped={skipped_inf})"
-                )
-            scaler.update()
-            continue
-
-        grad_norm = clip_grad_norm_unique(model, train_cfg.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-
-        train_losses.append(float(loss.item()))
-        grad_norms.append(grad_norm)
-        tokens_seen += y.numel()
-
-        if (step + 1) % train_cfg.log_interval == 0 or step == 0:
-            elapsed = max(time.perf_counter() - t0, 1e-8)
-            tps = tokens_seen / elapsed
-            diag = model.collect_dynamic_diagnostics()
-            if diag:
-                diagnostics.append({"step": step, "layers": diag})
-            if log_fn:
-                msg = (
-                    f"step {step:5d}/{train_cfg.max_steps}  "
-                    f"loss={loss.item():.4f}  "
-                    f"grad_norm={grad_norm:.3f}  "
-                    f"lr={lr:.2e}  "
-                    f"tok/s={tps:.0f}"
-                )
-                extra_diag = format_dynamic_diagnostics(diag)
-                if extra_diag:
-                    msg += f"  {extra_diag}"
-                log_fn(msg)
-
-        if (step + 1) % train_cfg.eval_interval == 0 or step + 1 == train_cfg.max_steps:
-            val = evaluate(
-                model, val_loader, device, train_cfg.precision, train_cfg.eval_batches
+    last_completed = 0
+    interrupted = False
+    try:
+        for step in range(train_cfg.max_steps):
+            lr = lr_linear_warmup(
+                step, lr=train_cfg.lr, warmup_steps=train_cfg.warmup_steps
             )
-            val_losses.append(val["val_loss"])
-            if log_fn:
-                log_fn(
-                    f"eval step {step}  val_loss={val['val_loss']:.4f}  "
-                    f"ppl={val['val_ppl']:.2f}"
-                )
-            _save(checkpoint_dir / "last.pt", step)
-            if math.isfinite(val["val_loss"]) and val["val_loss"] < best_val:
-                best_val = val["val_loss"]
-                best_step = step
-                _save(checkpoint_dir / "best.pt", step)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+
+            x, y = next(data_iter)
+            x = x.to(device)
+            y = y.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            with autocast_context(device, train_cfg.precision):
+                logits = model(x)
+            loss = F.cross_entropy(
+                logits.float().reshape(-1, logits.size(-1)),
+                y.reshape(-1),
+            )
+
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"non-finite loss at step {step}: {loss}")
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            if not grads_finite(model):
+                skipped_inf += 1
                 if log_fn:
-                    log_fn(f"  new best val_loss={best_val:.4f} -> {checkpoint_dir / 'best.pt'}")
+                    log_fn(
+                        f"step {step:5d}: non-finite gradients, skipping optimizer step "
+                        f"(skipped={skipped_inf})"
+                    )
+                scaler.update()
+                continue
+
+            grad_norm = clip_grad_norm_unique(model, train_cfg.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+
+            train_losses.append(float(loss.item()))
+            grad_norms.append(grad_norm)
+            tokens_seen += y.numel()
+            last_completed = step + 1
+
+            if (step + 1) % train_cfg.log_interval == 0 or step == 0:
+                elapsed = max(time.perf_counter() - t0, 1e-8)
+                tps = tokens_seen / elapsed
+                diag = model.collect_dynamic_diagnostics()
+                if diag:
+                    diagnostics.append({"step": step, "layers": diag})
+                if log_fn:
+                    msg = (
+                        f"step {step:5d}/{train_cfg.max_steps}  "
+                        f"loss={loss.item():.4f}  "
+                        f"grad_norm={grad_norm:.3f}  "
+                        f"lr={lr:.2e}  "
+                        f"tok/s={tps:.0f}"
+                    )
+                    extra_diag = format_dynamic_diagnostics(diag)
+                    if extra_diag:
+                        msg += f"  {extra_diag}"
+                    log_fn(msg)
+
+            if (step + 1) % train_cfg.eval_interval == 0 or step + 1 == train_cfg.max_steps:
+                val = evaluate(
+                    model, val_loader, device, train_cfg.precision, train_cfg.eval_batches
+                )
+                val_losses.append(val["val_loss"])
+                if log_fn:
+                    log_fn(
+                        f"eval step {step}  val_loss={val['val_loss']:.4f}  "
+                        f"ppl={val['val_ppl']:.2f}"
+                    )
+                _save(checkpoint_dir / "last.pt", step)
+                if math.isfinite(val["val_loss"]) and val["val_loss"] < best_val:
+                    best_val = val["val_loss"]
+                    best_step = step
+                    _save(checkpoint_dir / "best.pt", step)
+                    if log_fn:
+                        log_fn(f"  new best val_loss={best_val:.4f} -> {checkpoint_dir / 'best.pt'}")
+    except KeyboardInterrupt:
+        interrupted = True
+        _save(checkpoint_dir / "last.pt", max(0, last_completed - 1))
+        if log_fn:
+            log_fn(
+                f"keyboard interrupt at step {last_completed}/{train_cfg.max_steps}; "
+                f"saved {checkpoint_dir / 'last.pt'}"
+            )
 
     elapsed = max(time.perf_counter() - t0, 1e-8)
     peak_mem = (
@@ -275,6 +287,8 @@ def _train(
         "final_val_loss": val_losses[-1] if val_losses else None,
         "best_val_loss": best_val if math.isfinite(best_val) else None,
         "best_step": best_step,
+        "interrupted": interrupted,
+        "last_step": last_completed,
         "skipped_inf_steps": skipped_inf,
         "mean_grad_norm": sum(grad_norms) / max(1, len(grad_norms)),
     }

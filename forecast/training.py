@@ -1,4 +1,4 @@
-"""Train the next-hour return forecaster.
+"""Train the equity return forecaster.
 
 Usage:
     python -m forecast.training
@@ -40,6 +40,8 @@ from forecast.config import (
     DataConfig,
     ForecastModelConfig,
     ForecastTrainConfig,
+    interval_data_kwargs,
+    interval_model_kwargs,
     validate_loss_head,
 )
 from forecast.data import FEATURE_NAMES, build_datasets
@@ -97,7 +99,47 @@ def masked_loss(
         inv_var = torch.exp(-2.0 * log_sigma)
         aux = 0.5 * (inv_var * resid_sq) + log_sigma
         per_bar = per_bar + cfg.sigma_aux_weight * aux
-    return (per_bar * weights).sum() / denom
+    location = (per_bar * weights).sum() / denom
+    if cfg.ic_loss_weight <= 0:
+        return location
+    ic_term = masked_correlation_loss(
+        mean, target, mask, winsor=cfg.ic_winsor
+    )
+    if not torch.isfinite(ic_term):
+        return location
+    return location + cfg.ic_loss_weight * ic_term
+
+
+def masked_correlation_loss(
+    mean: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    winsor: float = 3.0,
+) -> torch.Tensor:
+    """``1 - Pearson`` on labelled bars, averaged over sequences in the batch.
+
+    Pred and target are winsorized so a split-sized jump cannot dominate.
+    Huber still owns prediction scale; this term is scale-free.
+    """
+    weights = mask.to(dtype=mean.dtype)
+    cap = float(winsor)
+    pred = mean.clamp(-cap, cap)
+    y = target.clamp(-cap, cap)
+    n = weights.sum(dim=-1)
+    denom_n = n.clamp(min=1.0)
+    mu_p = (pred * weights).sum(dim=-1) / denom_n
+    mu_y = (y * weights).sum(dim=-1) / denom_n
+    pc = (pred - mu_p.unsqueeze(-1)) * weights
+    yc = (y - mu_y.unsqueeze(-1)) * weights
+    cov = (pc * yc).sum(dim=-1)
+    var_p = (pc * pc).sum(dim=-1)
+    var_y = (yc * yc).sum(dim=-1)
+    valid = (n >= 2) & (var_p > 1e-8) & (var_y > 1e-8)
+    if not bool(valid.any()):
+        return mean.new_zeros(())
+    rho = cov[valid] / torch.sqrt(var_p[valid] * var_y[valid]).clamp(min=1e-8)
+    return 1.0 - rho.mean()
 
 
 def _pearson(a: np.ndarray, b: np.ndarray) -> float:
@@ -111,8 +153,22 @@ def _pearson(a: np.ndarray, b: np.ndarray) -> float:
     return float((a * b).sum() / denom)
 
 
+def _rankdata(x: np.ndarray) -> np.ndarray:
+    """Ordinal ranks (ties keep first-come order). Good enough for Spearman IC."""
+    order = np.argsort(x, kind="mergesort")
+    ranks = np.empty(x.size, dtype=np.float64)
+    ranks[order] = np.arange(x.size, dtype=np.float64)
+    return ranks
+
+
+def _spearman(a: np.ndarray, b: np.ndarray) -> float:
+    if a.size < 2:
+        return float("nan")
+    return _pearson(_rankdata(a), _rankdata(b))
+
+
 def compute_metrics(
-    pred: np.ndarray, target: np.ndarray, scale: np.ndarray
+    pred: np.ndarray, target: np.ndarray, scale: np.ndarray, *, winsor: float = 3.0
 ) -> dict[str, float]:
     """Forecast-quality metrics over labelled bars.
 
@@ -133,8 +189,17 @@ def compute_metrics(
     )
     pred_bps = pred * scale * 1e4
     target_bps = target * scale * 1e4
+    cap = float(winsor)
+    ic_raw = _pearson(pred, target)
+    ic_winsor = _pearson(np.clip(pred, -cap, cap), np.clip(target, -cap, cap))
+    ic_spearman = _spearman(pred, target)
+    select_parts = [v for v in (ic_winsor, ic_spearman) if np.isfinite(v)]
+    ic_select = float(np.mean(select_parts)) if select_parts else float("nan")
     return {
-        "ic": _pearson(pred, target),
+        "ic": ic_select,
+        "ic_raw": ic_raw,
+        "ic_winsor": ic_winsor,
+        "ic_spearman": ic_spearman,
         "mse": mse,
         "baseline_mse": baseline_mse,
         "r2": 1.0 - mse / baseline_mse if baseline_mse > 0 else float("nan"),
@@ -234,14 +299,18 @@ def evaluate(
         np.concatenate(preds) if preds else np.empty(0),
         np.concatenate(targets) if targets else np.empty(0),
         np.concatenate(scales) if scales else np.empty(0),
+        winsor=train_cfg.ic_winsor,
     )
     metrics["loss"] = weighted_loss / total_weight if total_weight > 0 else float("nan")
     return metrics
 
 
 def _fmt(metrics: dict[str, float]) -> str:
+    spearman = metrics.get("ic_spearman", float("nan"))
+    raw = metrics.get("ic_raw", metrics.get("ic", float("nan")))
     return (
         f"loss={metrics['loss']:.5f} ic={metrics['ic']:+.4f} "
+        f"spearman={spearman:+.4f} raw={raw:+.4f} "
         f"r2={metrics['r2']:+.5f} dir={metrics['direction']:.4f} "
         f"pred_std={metrics['pred_std_bps']:.2f}bps n={int(metrics['n'])}"
     )
@@ -292,8 +361,10 @@ def _train(
         log_fn(
             f"device={device} params={n_params:,} features={model_cfg.n_features} "
             f"seq_len={data_cfg.seq_len} horizon={data_cfg.horizon} "
+            f"linear_skip={model_cfg.linear_skip} "
             f"dynamic_weights={model_cfg.dynamic_weights} "
-            f"loss={train_cfg.loss} heteroscedastic={model_cfg.heteroscedastic}"
+            f"loss={train_cfg.loss} ic_loss_weight={train_cfg.ic_loss_weight} "
+            f"heteroscedastic={model_cfg.heteroscedastic}"
         )
         autocast_context(device, train_cfg.precision, log_fn=log_fn)
 
@@ -364,110 +435,147 @@ def _train(
     if log_fn:
         log_fn(f"steps/epoch={steps_per_epoch} total_steps={total_steps}")
 
-    for step in range(total_steps):
-        lr = lr_at(step, total_steps, train_cfg) * lr_scale
-        for group in optimizer.param_groups:
-            group["lr"] = lr
+    last_completed = 0
+    interrupted = False
+    try:
+        for step in range(total_steps):
+            lr = lr_at(step, total_steps, train_cfg) * lr_scale
+            for group in optimizer.param_groups:
+                group["lr"] = lr
 
-        x, y, mask, _scale = next(data_iter)
-        x, y, mask = x.to(device), y.to(device), mask.to(device)
+            x, y, mask, _scale = next(data_iter)
+            x, y, mask = x.to(device), y.to(device), mask.to(device)
 
-        optimizer.zero_grad(set_to_none=True)
-        with autocast_context(device, train_cfg.precision):
-            mean, log_sigma = model(x)
-        loss = masked_loss(mean.float(), log_sigma.float(), y, mask, train_cfg)
-        if not torch.isfinite(loss):
-            raise RuntimeError(f"non-finite loss at step {step}")
+            optimizer.zero_grad(set_to_none=True)
+            with autocast_context(device, train_cfg.precision):
+                mean, log_sigma = model(x)
+            loss = masked_loss(mean.float(), log_sigma.float(), y, mask, train_cfg)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"non-finite loss at step {step}")
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        if not grads_finite(model):
-            if log_fn:
-                log_fn(f"step {step + 1}: non-finite gradients, skipping optimizer step")
-            scaler.update()
-            continue
-        grad_norm = clip_grad_norm_unique(model, train_cfg.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        running.append(float(loss.detach()))
-
-        if (step + 1) % train_cfg.log_interval == 0 or step == 0:
-            elapsed = max(time.perf_counter() - t0, 1e-8)
-            if log_fn:
-                msg = (
-                    f"step {step + 1:6d}/{total_steps}  "
-                    f"loss={np.mean(running[-train_cfg.log_interval:]):.5f}  "
-                    f"grad={grad_norm:.3f}  lr={lr:.2e}  "
-                    f"{(step + 1) / elapsed:.2f} it/s"
-                )
-                diag = model.collect_dynamic_diagnostics()
-                extra_diag = format_dynamic_diagnostics(diag)
-                if extra_diag:
-                    msg += f"  {extra_diag}"
-                log_fn(msg)
-
-        if (step + 1) % train_cfg.eval_interval == 0 or step + 1 == total_steps:
-            val = evaluate(model, val_loader, device, train_cfg)
-            val["step"] = float(step + 1)
-            history.append(val)
-            if log_fn:
-                log_fn(f"  eval step {step + 1}: {_fmt(val)}")
-            save(ckpt_dir / "last.pt", step + 1, val)
-
-            ic = val["ic"]
-            improved = bool(np.isfinite(ic) and ic > best_ic)
-            if improved:
-                best_ic, best_step = ic, step + 1
-                save(ckpt_dir / "best.pt", step + 1, val)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            if not grads_finite(model):
                 if log_fn:
-                    log_fn(f"  new best val_ic={ic:+.4f} -> {ckpt_dir / 'best.pt'}")
-            evals_without_gain, lr_scale, stop, restore_best, plateau_msg = (
-                decide_val_plateau(
-                    improved=improved,
-                    evals_without_gain=evals_without_gain,
-                    lr_scale=lr_scale,
-                    plateau_evals=train_cfg.lr_plateau_evals,
-                    plateau_factor=train_cfg.lr_plateau_factor,
-                    min_scale=train_cfg.lr_plateau_min_scale,
-                    early_stop_evals=train_cfg.early_stop_evals,
+                    log_fn(f"step {step + 1}: non-finite gradients, skipping optimizer step")
+                scaler.update()
+                continue
+            grad_norm = clip_grad_norm_unique(model, train_cfg.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            running.append(float(loss.detach()))
+            last_completed = step + 1
+
+            if (step + 1) % train_cfg.log_interval == 0 or step == 0:
+                elapsed = max(time.perf_counter() - t0, 1e-8)
+                if log_fn:
+                    msg = (
+                        f"step {step + 1:6d}/{total_steps}  "
+                        f"loss={np.mean(running[-train_cfg.log_interval:]):.5f}  "
+                        f"grad={grad_norm:.3f}  lr={lr:.2e}  "
+                        f"{(step + 1) / elapsed:.2f} it/s"
+                    )
+                    diag = model.collect_dynamic_diagnostics()
+                    extra_diag = format_dynamic_diagnostics(diag)
+                    if extra_diag:
+                        msg += f"  {extra_diag}"
+                    log_fn(msg)
+
+            if (step + 1) % train_cfg.eval_interval == 0 or step + 1 == total_steps:
+                val = evaluate(model, val_loader, device, train_cfg)
+                val["step"] = float(step + 1)
+                history.append(val)
+                if log_fn:
+                    log_fn(f"  eval step {step + 1}: {_fmt(val)}")
+                save(ckpt_dir / "last.pt", step + 1, val)
+
+                ic = val["ic"]
+                improved = bool(np.isfinite(ic) and ic > best_ic)
+                if improved:
+                    best_ic, best_step = ic, step + 1
+                    save(ckpt_dir / "best.pt", step + 1, val)
+                    if log_fn:
+                        log_fn(f"  new best val_ic={ic:+.4f} -> {ckpt_dir / 'best.pt'}")
+                evals_without_gain, lr_scale, stop, restore_best, plateau_msg = (
+                    decide_val_plateau(
+                        improved=improved,
+                        evals_without_gain=evals_without_gain,
+                        lr_scale=lr_scale,
+                        plateau_evals=train_cfg.lr_plateau_evals,
+                        plateau_factor=train_cfg.lr_plateau_factor,
+                        min_scale=train_cfg.lr_plateau_min_scale,
+                        early_stop_evals=train_cfg.early_stop_evals,
+                    )
+                )
+                if plateau_msg and log_fn:
+                    log_fn(f"  {plateau_msg}")
+                if restore_best:
+                    best_path = ckpt_dir / "best.pt"
+                    if best_path.exists():
+                        load_forecast_checkpoint(
+                            best_path, map_location=device, model=model
+                        )
+                if stop:
+                    break
+    except KeyboardInterrupt:
+        interrupted = True
+        if history:
+            metrics = {
+                k: float(v)
+                for k, v in history[-1].items()
+                if isinstance(v, (int, float))
+            }
+        else:
+            metrics = {"ic": float("nan"), "n": 0.0}
+        metrics["step"] = float(last_completed)
+        save(ckpt_dir / "last.pt", last_completed, metrics)
+        if log_fn:
+            log_fn(
+                f"keyboard interrupt at step {last_completed}/{total_steps}; "
+                f"saved {ckpt_dir / 'last.pt'}"
+                + (
+                    f" (best.pt still step {best_step})"
+                    if best_step >= 0
+                    else " (no best.pt yet)"
                 )
             )
-            if plateau_msg and log_fn:
-                log_fn(f"  {plateau_msg}")
-            if restore_best:
-                best_path = ckpt_dir / "best.pt"
-                if best_path.exists():
-                    load_forecast_checkpoint(
-                        best_path, map_location=device, model=model
-                    )
-            if stop:
-                break
 
     # Final test evaluation uses the best checkpoint when available.
     best_path = ckpt_dir / "best.pt"
     last_path = ckpt_dir / "last.pt"
-    if best_path.exists():
-        load_forecast_checkpoint(best_path, map_location=device, model=model)
-    elif last_path.exists():
-        load_forecast_checkpoint(last_path, map_location=device, model=model)
+    if interrupted:
+        test = {
+            k: float(v)
+            for k, v in (history[-1].items() if history else [])
+            if isinstance(v, (int, float))
+        }
         if log_fn:
-            log_fn("warning: no best.pt saved; TEST uses last.pt weights")
-    elif log_fn:
-        log_fn("warning: no checkpoint saved; TEST uses final in-memory weights")
-    test = evaluate(model, test_loader, device, train_cfg)
-    if log_fn:
+            log_fn("TEST skipped (interrupted). Generate with best.pt if it exists, else last.pt.")
+    else:
         if best_path.exists():
-            log_fn(f"TEST (best step {best_step}): {_fmt(test)}")
+            load_forecast_checkpoint(best_path, map_location=device, model=model)
         elif last_path.exists():
-            log_fn(f"TEST (last checkpoint; no best.pt was saved): {_fmt(test)}")
-        else:
-            log_fn(f"TEST (in-memory weights; no checkpoint saved): {_fmt(test)}")
+            load_forecast_checkpoint(last_path, map_location=device, model=model)
+            if log_fn:
+                log_fn("warning: no best.pt saved; TEST uses last.pt weights")
+        elif log_fn:
+            log_fn("warning: no checkpoint saved; TEST uses final in-memory weights")
+        test = evaluate(model, test_loader, device, train_cfg)
+        if log_fn:
+            if best_path.exists():
+                log_fn(f"TEST (best step {best_step}): {_fmt(test)}")
+            elif last_path.exists():
+                log_fn(f"TEST (last checkpoint; no best.pt was saved): {_fmt(test)}")
+            else:
+                log_fn(f"TEST (in-memory weights; no checkpoint saved): {_fmt(test)}")
 
     summary = {
         "best_val_ic": best_ic,
         "best_step": best_step,
         "history": history,
         "test": test,
+        "interrupted": interrupted,
+        "last_step": last_completed,
         "n_params": n_params,
         "device": str(device),
         "elapsed_sec": time.perf_counter() - t0,
@@ -483,15 +591,36 @@ def _train(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Train the next-hour return forecaster.")
+    p = argparse.ArgumentParser(description="Train the equity return forecaster.")
     d, m, t = DataConfig(), ForecastModelConfig(), ForecastTrainConfig()
 
     g = p.add_argument_group("data")
     g.add_argument("--data-dir", default=d.data_dir)
-    g.add_argument("--horizon", type=int, default=d.horizon, help="bars ahead (60 = 1h)")
-    g.add_argument("--seq-len", type=int, default=d.seq_len)
-    g.add_argument("--stride", type=int, default=d.stride)
-    g.add_argument("--min-context", type=int, default=d.min_context)
+    g.add_argument(
+        "--interval",
+        default=d.interval,
+        choices=("daily", "weekly", "monthly", "1min", "5min", "15min", "30min", "60min"),
+        help="bar size; match the parquet interval you downloaded",
+    )
+    g.add_argument("--horizon", type=int, default=d.horizon, help="bars ahead (1 = next daily bar)")
+    g.add_argument(
+        "--seq-len",
+        type=int,
+        default=None,
+        help="window length (default: 128 daily, 52 weekly, 256 for 1min)",
+    )
+    g.add_argument(
+        "--stride",
+        type=int,
+        default=None,
+        help="train window stride (default depends on --interval)",
+    )
+    g.add_argument(
+        "--min-context",
+        type=int,
+        default=None,
+        help="unsupervised prefix of each window (default depends on --interval)",
+    )
     g.add_argument("--min-session-bars", type=int, default=d.min_session_bars)
     g.add_argument("--val-fraction", type=float, default=d.val_fraction)
     g.add_argument("--test-fraction", type=float, default=d.test_fraction)
@@ -510,6 +639,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--dynamic-weights", action="store_true")
     g.add_argument("--dynamic-strength", type=float, default=m.dynamic_strength)
     g.add_argument(
+        "--no-linear-skip",
+        action="store_true",
+        help="disable the features->mean skip (Mamba-only readout)",
+    )
+    g.add_argument(
         "--heteroscedastic",
         action="store_true",
         help="train a log-sigma head (with --loss gaussian, or Huber/MSE + aux weight)",
@@ -527,6 +661,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--lr", type=float, default=t.lr)
     g.add_argument("--weight-decay", type=float, default=t.weight_decay)
     g.add_argument("--loss", choices=("huber", "mse", "gaussian"), default=t.loss)
+    g.add_argument(
+        "--ic-loss-weight",
+        type=float,
+        default=t.ic_loss_weight,
+        help="weight on 1-Pearson mixed into the mean loss (0 disables)",
+    )
     g.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default=t.precision)
     g.add_argument("--seed", type=int, default=t.seed)
     g.add_argument("--eval-interval", type=int, default=t.eval_interval)
@@ -555,9 +695,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: list[str] | None = None) -> None:
-    args = build_arg_parser().parse_args(argv)
-
+def configs_from_cli(
+    args: argparse.Namespace,
+) -> tuple[DataConfig, ForecastModelConfig, ForecastTrainConfig]:
+    """Map parsed CLI flags onto configs, filling interval-specific lookbacks."""
     if args.heteroscedastic and args.no_heteroscedastic:
         raise SystemExit("use only one of --heteroscedastic / --no-heteroscedastic")
     if args.loss == "gaussian":
@@ -565,16 +706,27 @@ def main(argv: list[str] | None = None) -> None:
     else:
         heteroscedastic = args.heteroscedastic
 
+    preset = interval_data_kwargs(args.interval)
+    ssm = interval_model_kwargs(args.interval)
     data_cfg = DataConfig(
         data_dir=args.data_dir,
+        interval=args.interval,
         horizon=args.horizon,
-        seq_len=args.seq_len,
-        stride=args.stride,
-        min_context=args.min_context,
+        seq_len=preset["seq_len"] if args.seq_len is None else args.seq_len,
+        stride=preset["stride"] if args.stride is None else args.stride,
+        min_context=(
+            preset["min_context"] if args.min_context is None else args.min_context
+        ),
         min_session_bars=args.min_session_bars,
         val_fraction=args.val_fraction,
         test_fraction=args.test_fraction,
         require_horizon_traded=not args.allow_stale_horizon,
+        vol_halflife=preset["vol_halflife"],
+        z_window=preset["z_window"],
+        z_min_periods=preset["z_min_periods"],
+        warmup_bars=preset["warmup_bars"],
+        max_abs_log_return=preset["max_abs_log_return"],
+        supervise_last=preset["supervise_last"],
     )
     model_cfg = ForecastModelConfig(
         n_features=len(FEATURE_NAMES),
@@ -584,6 +736,9 @@ def main(argv: list[str] | None = None) -> None:
         expand=args.expand,
         dropout=args.dropout,
         heteroscedastic=heteroscedastic,
+        linear_skip=not args.no_linear_skip,
+        dt_min=ssm["dt_min"],
+        dt_max=ssm["dt_max"],
         dynamic_weights=args.dynamic_weights,
         dynamic_strength=args.dynamic_strength,
     )
@@ -594,10 +749,7 @@ def main(argv: list[str] | None = None) -> None:
         lr=args.lr,
         weight_decay=args.weight_decay,
         loss=args.loss,
-        # CLI does not expose sigma_aux_weight. Default Huber is mean-only;
-        # gaussian NLL trains the sigma head itself. Do not leave the
-        # dataclass default (0.5) on a mean-only head — validate_loss_head
-        # would reject the run.
+        ic_loss_weight=args.ic_loss_weight,
         sigma_aux_weight=(
             0.0
             if (not heteroscedastic or args.loss == "gaussian")
@@ -613,6 +765,12 @@ def main(argv: list[str] | None = None) -> None:
         lr_plateau_evals=args.lr_plateau_evals,
         lr_plateau_factor=args.lr_plateau_factor,
     )
+    return data_cfg, model_cfg, train_cfg
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_arg_parser().parse_args(argv)
+    data_cfg, model_cfg, train_cfg = configs_from_cli(args)
     train(
         data_cfg,
         model_cfg,

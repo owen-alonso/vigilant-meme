@@ -1,21 +1,17 @@
-"""Turn raw 1-minute OHLCV bars into sequences with a next-hour return target.
+"""Turn raw OHLCV bars into sequences with a forward-return target.
 
-Pipeline per symbol:
+Alpha Vantage daily bars (default): one row per trading day, next-day target.
 
-1.  Snap bars onto a regular 390-bar intraday grid (09:30..15:59). Vendor files
-    are sparse for illiquid names, so "60 bars ahead" is only equal to "one hour
-    ahead" once the grid is regular.
-2.  Forward-fill price into untraded slots and mark them, so the model can tell
-    a real print from a stale quote.
-3.  Build scale-free, strictly causal features. Nothing here uses information
-    from bar ``t + 1`` onwards, so the same code runs at inference time.
-4.  Attach the target: the 60-bar-ahead log return, divided by a volatility
-    estimate known at ``t``.
+1-minute bars (premium TIME_SERIES_INTRADAY): snap onto a regular 390-bar
+intraday grid (09:30..15:59), forward-fill untraded slots, and target the
+same-session 60-bar return.
 
-The target is deliberately volatility-normalized. Raw one-hour returns swing
-between calm and stressed regimes by more than an order of magnitude, and a
-plain MSE on them just fits the loudest days. ``generate.py`` multiplies the
-prediction back by that same scale to report an expected return.
+Then:
+
+- Build scale-free, strictly causal features. Nothing here uses information
+  from bar ``t + 1`` onwards, so the same code runs at inference time.
+- Attach the target: the horizon-bar-ahead log return, divided by a volatility
+  estimate known at ``t``.
 """
 
 from __future__ import annotations
@@ -63,20 +59,27 @@ OHLCV_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 # --------------------------------------------------------------------------
 
 
-def discover_symbol_files(data_dir: str | Path) -> list[Path]:
+def discover_symbol_files(
+    data_dir: str | Path, interval: str | None = None
+) -> list[Path]:
     resolved = resolve_path(data_dir)
-    paths = sorted(resolved.glob("*.parquet"))
+    paths: list[Path] = []
+    if interval:
+        paths = sorted(resolved.glob(f"*_{interval}.parquet"))
+    if not paths:
+        paths = sorted(resolved.glob("*.parquet"))
     if not paths:
         raise FileNotFoundError(
             f"no .parquet files found in {resolved.resolve()} "
             f"(looked for data_dir={str(data_dir)!r} relative to "
-            f"{Path.cwd()} and {REPO_ROOT})"
+            f"{Path.cwd()} and {REPO_ROOT}). "
+            "Pull bars with: python -m forecast.download --symbols AAPL"
         )
     return paths
 
 
 def symbol_from_path(path: str | Path) -> str:
-    """``data/SPAB_clean_1min.parquet`` -> ``SPAB``."""
+    """``data/AAPL_daily.parquet`` -> ``AAPL``."""
     return Path(path).stem.split("_")[0].upper()
 
 
@@ -96,7 +99,7 @@ def _session_naive_datetime(series: pd.Series) -> pd.Series:
 def normalize_bars(df: pd.DataFrame, *, origin: str = "bars") -> pd.DataFrame:
     """Normalize an OHLCV frame to the columns ``load_bars`` / generate expect.
 
-    Accepts parquet-style columns or a DatetimeIndex (Yahoo). Extra columns
+    Accepts the Alpha Vantage cache schema or a DatetimeIndex. Extra columns
     such as Adj Close are dropped.
     """
     out = df.copy()
@@ -120,6 +123,8 @@ def normalize_bars(df: pd.DataFrame, *, origin: str = "bars") -> pd.DataFrame:
     keep = ["datetime", "open", "high", "low", "close", "volume"]
     if "source" in out.columns:
         keep.append("source")
+    if "interval" in out.columns:
+        keep.append("interval")
     out = out.loc[:, keep]
     out = out.dropna(subset=["datetime", "close"])
     nonpos = out["close"] <= 0
@@ -132,7 +137,7 @@ def normalize_bars(df: pd.DataFrame, *, origin: str = "bars") -> pd.DataFrame:
 
 
 def load_bars(path: str | Path) -> pd.DataFrame:
-    """Read one parquet of 1-minute bars and normalize its column names."""
+    """Read one parquet of OHLCV bars and normalize its column names."""
     return normalize_bars(pd.read_parquet(path), origin=str(path))
 
 
@@ -205,6 +210,29 @@ def build_session_grid(
     return grid.loc[:, cols]
 
 
+def build_daily_index(df: pd.DataFrame) -> pd.DataFrame:
+    """One trading day per row. No session grid; weekends are simply absent."""
+    out = df.copy()
+    out["session"] = pd.to_datetime(out["datetime"]).dt.normalize()
+    out["mos"] = 0
+    out["traded"] = 1.0
+    out = out.sort_values("datetime").drop_duplicates("session", keep="last")
+    cols = [
+        "datetime",
+        "session",
+        "mos",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "traded",
+    ]
+    if "source" in out.columns:
+        cols.append("source")
+    return out.loc[:, cols].reset_index(drop=True)
+
+
 # --------------------------------------------------------------------------
 # Features and target
 # --------------------------------------------------------------------------
@@ -218,15 +246,44 @@ def _causal_zscore(s: pd.Series, window: int, min_periods: int) -> pd.Series:
     return (s - mean) / std.clip(lower=1e-8)
 
 
+def _return_lags(cfg: DataConfig) -> tuple[int, ...]:
+    if cfg.interval == "weekly":
+        return (1, 4, 13, 26, 52)
+    if cfg.interval == "monthly":
+        return (1, 3, 6, 12, 24)
+    if cfg.is_calendar():
+        return (1, 5, 10, 15, 21)
+    return (1, 5, 15, 60, 390)
+
+
+def _vol_lag(cfg: DataConfig) -> int:
+    return {"daily": 21, "weekly": 12, "monthly": 6}.get(cfg.interval, BARS_PER_SESSION)
+
+
+def _stale_denom(cfg: DataConfig) -> float:
+    periods = {"daily": 252.0, "weekly": 52.0, "monthly": 12.0}.get(
+        cfg.interval, float(BARS_PER_SESSION)
+    )
+    return math.log(periods)
+
+
+def _gap_limit_days(cfg: DataConfig) -> int:
+    if cfg.interval == "weekly":
+        return max(cfg.max_session_gap_days, 21)
+    if cfg.interval == "monthly":
+        return max(cfg.max_session_gap_days, 45)
+    return cfg.max_session_gap_days
+
+
 def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
-    """Attach features, the next-hour target, its scale, and a validity mask."""
+    """Attach features, the forward-return target, its scale, and a validity mask."""
     out = grid.copy()
     close = out["close"].astype(np.float64)
     log_close = np.log(close)
 
     session_dates = pd.to_datetime(out["session"])
     gap_days = session_dates.diff().dt.days.fillna(0)
-    large_join = gap_days > cfg.max_session_gap_days
+    large_join = gap_days > _gap_limit_days(cfg)
     join_id = large_join.cumsum()
 
     r1 = log_close.diff().mask(large_join, np.nan)
@@ -237,17 +294,18 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     # Scale of a horizon-length return under a random walk.
     out["scale"] = sigma * math.sqrt(cfg.horizon)
 
-    for k in (1, 5, 15, 60, 390):
+    lags = _return_lags(cfg)
+    for name, k in zip(("ret_1", "ret_5", "ret_15", "ret_60", "ret_390"), lags):
         crossed = join_id != join_id.shift(k)
         raw = log_close.diff(k).mask(crossed, np.nan)
-        out[f"ret_{k}"] = raw / (sigma * math.sqrt(k))
+        out[name] = raw / (sigma * math.sqrt(k))
 
     out["range_hl"] = ((out["high"] - out["low"]) / close) / sigma
     out["body_co"] = ((close - out["open"]) / close) / sigma
 
     log_sigma = np.log(sigma)
     out["vol_level"] = _causal_zscore(log_sigma, cfg.z_window, cfg.z_min_periods)
-    out["vol_change"] = log_sigma.diff(BARS_PER_SESSION)
+    out["vol_change"] = log_sigma.diff(_vol_lag(cfg))
 
     log_volume = np.log1p(out["volume"])
     out["volume_z"] = _causal_zscore(log_volume, cfg.z_window, cfg.z_min_periods)
@@ -260,13 +318,23 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     last_traded = pd.Series(
         np.where(out["traded"].to_numpy() > 0, position, np.nan), index=out.index
     ).ffill()
-    out["staleness"] = np.log1p(position - last_traded) / math.log(BARS_PER_SESSION)
+    out["staleness"] = np.log1p(position - last_traded) / _stale_denom(cfg)
 
-    out["new_session"] = (out["mos"] == 0).astype(np.float64)
-    tod = out["mos"].astype(np.float64) / (BARS_PER_SESSION - 1)
-    out["tod_frac"] = tod
-    out["tod_sin"] = np.sin(2.0 * math.pi * tod)
-    out["tod_cos"] = np.cos(2.0 * math.pi * tod)
+    if cfg.is_calendar():
+        month = pd.to_datetime(out["datetime"]).dt.to_period("M")
+        out["new_session"] = (month != month.shift(1)).fillna(True).astype(np.float64)
+        doy = (pd.to_datetime(out["datetime"]).dt.dayofyear.astype(np.float64) - 1.0) / 365.0
+        out["tod_frac"] = doy
+        out["tod_sin"] = np.sin(2.0 * math.pi * doy)
+        out["tod_cos"] = np.cos(2.0 * math.pi * doy)
+        same_session = np.ones(len(out), dtype=bool)
+    else:
+        out["new_session"] = (out["mos"] == 0).astype(np.float64)
+        tod = out["mos"].astype(np.float64) / (BARS_PER_SESSION - 1)
+        out["tod_frac"] = tod
+        out["tod_sin"] = np.sin(2.0 * math.pi * tod)
+        out["tod_cos"] = np.cos(2.0 * math.pi * tod)
+        same_session = (out["mos"] + cfg.horizon) < BARS_PER_SESSION
     out["dow_frac"] = out["datetime"].dt.dayofweek.astype(np.float64) / 4.0
 
     # Target: log return realized `horizon` bars later, in volatility units.
@@ -277,8 +345,7 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     out["horizon_traded"] = horizon_traded.fillna(0.0)
 
     # A bar is trainable only if it is a real print, the horizon lands inside
-    # the same session, and every feature has enough history behind it.
-    same_session = (out["mos"] + cfg.horizon) < BARS_PER_SESSION
+    # the same session (intraday), and every feature has enough history.
     finite = out[list(FEATURE_NAMES)].to_numpy(dtype=np.float64)
     features_ok = np.isfinite(finite).all(axis=1)
     valid = (
@@ -291,6 +358,10 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     )
     if cfg.require_horizon_traded:
         valid = valid & (horizon_traded > 0)
+    if cfg.max_abs_log_return > 0:
+        valid = valid & (out["target_raw"].abs() <= cfg.max_abs_log_return)
+    if cfg.max_abs_target > 0:
+        valid = valid & (out["target"].abs() <= cfg.max_abs_target)
     out["valid"] = valid
 
     for name in FEATURE_NAMES:
@@ -308,10 +379,13 @@ def assemble_panel(
     *,
     keep_latest_session: bool = False,
 ) -> pd.DataFrame:
-    """Session-grid + features for an already-normalized OHLCV frame."""
-    grid = build_session_grid(
-        bars, cfg, keep_latest_session=keep_latest_session
-    )
+    """Grid + features for an already-normalized OHLCV frame."""
+    if cfg.is_calendar():
+        grid = build_daily_index(bars)
+    else:
+        grid = build_session_grid(
+            bars, cfg, keep_latest_session=keep_latest_session
+        )
     panel = compute_features(grid, cfg)
     panel["symbol"] = str(symbol).upper()
     return panel
@@ -324,7 +398,7 @@ def build_panel_from_bars(
     *,
     keep_latest_session: bool = False,
 ) -> pd.DataFrame:
-    """OHLCV frame (Yahoo or parquet-like) -> feature panel."""
+    """OHLCV frame (Alpha Vantage cache or parquet-like) -> feature panel."""
     return assemble_panel(
         normalize_bars(df, origin=symbol),
         cfg,
@@ -392,6 +466,7 @@ class SequenceDataset(Dataset):
         feature_std: np.ndarray | None = None,
         min_context: int = 0,
         require_valid: int = 1,
+        supervise_last: int = 0,
     ) -> None:
         if seq_len < 1:
             raise ValueError("seq_len must be positive")
@@ -399,9 +474,12 @@ class SequenceDataset(Dataset):
             raise ValueError("stride must be positive")
         if not 0 <= min_context < seq_len:
             raise ValueError(f"min_context must be in [0, seq_len); got {min_context}")
+        if supervise_last < 0:
+            raise ValueError("supervise_last must be >= 0")
         self.symbols = list(symbols)
         self.seq_len = seq_len
         self.min_context = min_context
+        self.supervise_last = min(int(supervise_last), seq_len)
         self.feature_mean = feature_mean
         self.feature_std = feature_std
 
@@ -409,7 +487,10 @@ class SequenceDataset(Dataset):
         for i, sym in enumerate(self.symbols):
             length = len(sym.target)
             for start in range(0, max(0, length - seq_len + 1), stride):
-                scorable = sym.valid[start + min_context : start + seq_len]
+                if self.supervise_last > 0:
+                    scorable = sym.valid[start + seq_len - self.supervise_last : start + seq_len]
+                else:
+                    scorable = sym.valid[start + min_context : start + seq_len]
                 if int(scorable.sum()) >= require_valid:
                     self.windows.append((i, start))
 
@@ -429,6 +510,8 @@ class SequenceDataset(Dataset):
             x = (x - self.feature_mean) / self.feature_std
         mask = sym.valid[start:stop].copy()
         mask[: self.min_context] = False
+        if self.supervise_last > 0:
+            mask[: -self.supervise_last] = False
         return (
             torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)),
             torch.from_numpy(sym.target[start:stop].copy()),
@@ -460,6 +543,22 @@ def split_session_bounds(n_sessions: int, cfg: DataConfig) -> tuple[int, int]:
     return n_train, n_train + n_val
 
 
+def embargo_calendar_horizon(panel: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
+    """Drop labels whose horizon close sits outside this split.
+
+    Intraday targets cannot leave their session, so a session-boundary cut is
+    already an embargo. Daily/weekly/monthly bars *are* sessions, so the last
+    ``horizon`` train labels would otherwise be the first val/test returns.
+    """
+    if panel.empty or not cfg.is_calendar() or int(cfg.horizon) < 1:
+        return panel
+    out = panel.copy()
+    valid = out["valid"].to_numpy(dtype=bool).copy()
+    valid[max(0, len(out) - int(cfg.horizon)) :] = False
+    out["valid"] = valid
+    return out
+
+
 def build_datasets(
     cfg: DataConfig,
     *,
@@ -471,7 +570,9 @@ def build_datasets(
     Splits are cut at session boundaries. Because a target never reaches past
     the end of its own session, no label can straddle a split boundary.
     """
-    paths = list(paths) if paths is not None else discover_symbol_files(cfg.data_dir)
+    paths = list(paths) if paths is not None else discover_symbol_files(
+        cfg.data_dir, interval=cfg.interval
+    )
 
     train_syms: list[SymbolArrays] = []
     val_syms: list[SymbolArrays] = []
@@ -489,9 +590,15 @@ def build_datasets(
         is_val = (panel["session"] >= train_end) & (panel["session"] < val_end)
         is_test = panel["session"] >= val_end
 
-        train_syms.append(panel_to_arrays(panel[is_train], symbol))
-        val_syms.append(panel_to_arrays(panel[is_val], symbol))
-        test_syms.append(panel_to_arrays(panel[is_test], symbol))
+        train_syms.append(
+            panel_to_arrays(embargo_calendar_horizon(panel[is_train], cfg), symbol)
+        )
+        val_syms.append(
+            panel_to_arrays(embargo_calendar_horizon(panel[is_val], cfg), symbol)
+        )
+        test_syms.append(
+            panel_to_arrays(embargo_calendar_horizon(panel[is_test], cfg), symbol)
+        )
         train_mix = _source_mix(panel[is_train])
         val_mix = _source_mix(panel[is_val])
         test_mix = _source_mix(panel[is_test])
@@ -538,7 +645,13 @@ def build_datasets(
     eval_stride = max(1, cfg.seq_len - cfg.min_context)
     common = {"feature_mean": mean, "feature_std": std, "min_context": cfg.min_context}
     datasets = {
-        "train": SequenceDataset(train_syms, cfg.seq_len, cfg.stride, **common),
+        "train": SequenceDataset(
+            train_syms,
+            cfg.seq_len,
+            cfg.stride,
+            supervise_last=cfg.supervise_last,
+            **common,
+        ),
         "val": SequenceDataset(val_syms, cfg.seq_len, eval_stride, **common),
         "test": SequenceDataset(test_syms, cfg.seq_len, eval_stride, **common),
     }

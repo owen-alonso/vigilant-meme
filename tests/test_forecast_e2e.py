@@ -7,7 +7,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import torch
 
@@ -21,7 +20,7 @@ from forecast.generate import main as generate_main
 from forecast.training import train
 
 
-def _write_symbol_parquet(data_dir: Path, symbol: str, n_sessions: int = 6) -> None:
+def _write_symbol_parquet(data_dir: Path, symbol: str, n_sessions: int = 120) -> None:
     rows: list[pd.DataFrame] = []
     day = 0
     while len(rows) < n_sessions:
@@ -29,22 +28,20 @@ def _write_symbol_parquet(data_dir: Path, symbol: str, n_sessions: int = 6) -> N
         day += 1
         if base.dayofweek >= 5:
             continue
-        n = 390
-        close = 10.0 + np.linspace(0, 0.5, n)
-        dt = pd.date_range(base.replace(hour=9, minute=30), periods=n, freq="min")
+        close = 10.0 + 0.01 * len(rows)
         rows.append(
             pd.DataFrame(
                 {
-                    "datetime": dt,
-                    "Open": close,
-                    "High": close + 0.01,
-                    "Low": close - 0.01,
-                    "Close": close,
-                    "Volume": np.full(n, 1000.0),
+                    "datetime": [base],
+                    "Open": [close],
+                    "High": [close + 0.01],
+                    "Low": [close - 0.01],
+                    "Close": [close],
+                    "Volume": [1000.0],
                 }
             )
         )
-    pd.concat(rows).to_parquet(data_dir / f"{symbol}_clean_1min.parquet")
+    pd.concat(rows).to_parquet(data_dir / f"{symbol}_daily.parquet")
 
 
 def test_default_forecast_configs_are_valid():
@@ -59,19 +56,25 @@ def test_train_then_generate(tmp_path: Path):
     ckpt_dir = tmp_path / "ckpt"
     data_cfg = DataConfig(
         data_dir=str(data_dir),
-        horizon=60,
-        seq_len=64,
-        stride=32,
-        min_context=16,
-        min_session_bars=30,
+        interval="daily",
+        horizon=1,
+        seq_len=16,
+        stride=8,
+        min_context=4,
+        warmup_bars=8,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=5,
+        min_session_bars=1,
     )
     model_cfg = ForecastModelConfig(n_features=18, d_model=32, n_layer=2, d_state=8)
     train_cfg = ForecastTrainConfig(
-        batch_size=4,
+        batch_size=1,
         max_steps=12,
         eval_interval=6,
         log_interval=4,
         checkpoint_dir=str(ckpt_dir),
+        ic_loss_weight=0.0,
         precision="fp32",
     )
     train(
@@ -105,4 +108,52 @@ def test_train_then_generate(tmp_path: Path):
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
-    assert "NEXT-HOUR RETURN FORECAST" in proc.stdout
+    assert "NEXT-DAY RETURN FORECAST" in proc.stdout
+
+
+def test_train_saves_last_on_keyboard_interrupt(tmp_path: Path, monkeypatch):
+    from forecast.training import cycle_loader
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_symbol_parquet(data_dir, "AAA")
+    ckpt_dir = tmp_path / "ckpt"
+
+    real_cycle = cycle_loader
+
+    def interrupting_cycle(loader):
+        inner = real_cycle(loader)
+        yield next(inner)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("forecast.training.cycle_loader", interrupting_cycle)
+    summary = train(
+        DataConfig(
+            data_dir=str(data_dir),
+            interval="daily",
+            horizon=1,
+            seq_len=16,
+            stride=8,
+            min_context=4,
+            warmup_bars=8,
+            vol_halflife=5,
+            z_window=10,
+            z_min_periods=5,
+            min_session_bars=1,
+        ),
+        ForecastModelConfig(n_features=18, d_model=32, n_layer=2, d_state=8),
+        ForecastTrainConfig(
+            batch_size=1,
+            max_steps=12,
+            eval_interval=6,
+            log_interval=4,
+            checkpoint_dir=str(ckpt_dir),
+            ic_loss_weight=0.0,
+            precision="fp32",
+        ),
+        device=torch.device("cpu"),
+        log_fn=None,
+    )
+    assert summary["interrupted"] is True
+    assert (ckpt_dir / "last.pt").exists()
+    assert summary["last_step"] >= 1

@@ -51,6 +51,21 @@ class ReturnForecaster(nn.Module):
         # for a return series, and it keeps early gradients small.
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
+        # Mixer out_proj is zero so each Mamba block starts as identity.
+        # The skip then *is* the lagged-return baseline at step 0.
+        for layer in self.layers:
+            nn.init.zeros_(layer.mixer.out_proj.weight)
+            if layer.mixer.out_proj.bias is not None:
+                nn.init.zeros_(layer.mixer.out_proj.bias)
+        self.skip = nn.Linear(config.n_features, 1)
+        if config.linear_skip:
+            nn.init.xavier_uniform_(self.skip.weight, gain=0.1)
+            nn.init.zeros_(self.skip.bias)
+        else:
+            nn.init.zeros_(self.skip.weight)
+            nn.init.zeros_(self.skip.bias)
+            self.skip.weight.requires_grad_(False)
+            self.skip.bias.requires_grad_(False)
 
     def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if features.dim() != 3:
@@ -68,8 +83,9 @@ class ReturnForecaster(nn.Module):
             x = layer(x)
         x = self.norm_f(x)
         out = self.head(x)  # [B, L, 1 or 2]
+        skip = self.skip(features).squeeze(-1)
 
-        mean = out[..., 0]
+        mean = out[..., 0] + skip
         if self.config.heteroscedastic:
             # Bounded so the NLL cannot escape by predicting infinite variance.
             # Unit-vol targets make [-3, 1] a usable residual-std range.

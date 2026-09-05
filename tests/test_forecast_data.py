@@ -13,14 +13,23 @@ from forecast.data import (
     _session_naive_datetime,
     build_session_grid,
     compute_features,
+    embargo_calendar_horizon,
     load_bars,
 )
 from forecast.model import ReturnForecaster
-from forecast.training import decide_val_plateau, masked_loss
+from forecast.training import (
+    compute_metrics,
+    configs_from_cli,
+    decide_val_plateau,
+    masked_correlation_loss,
+    masked_loss,
+    build_arg_parser,
+)
 
 
 def _tiny_cfg(**kwargs) -> DataConfig:
     defaults = dict(
+        interval="1min",
         horizon=2,
         warmup_bars=3,
         vol_halflife=2,
@@ -257,3 +266,107 @@ def test_val_plateau_early_stop_still_optional():
     assert restore is False
     assert scale == 1.0
     assert msg is not None and "early stop" in msg
+
+
+def _daily_grid(n: int = 60, split_at: int | None = None) -> pd.DataFrame:
+    dates = pd.bdate_range("2020-01-02", periods=n)
+    close = np.linspace(100.0, 110.0, n)
+    if split_at is not None:
+        close = close.copy()
+        close[split_at:] = close[split_at:] * 0.25
+    return pd.DataFrame(
+        {
+            "datetime": dates,
+            "session": pd.to_datetime(dates).normalize(),
+            "mos": np.zeros(n, dtype=int),
+            "open": close,
+            "high": close + 0.1,
+            "low": close - 0.1,
+            "close": close,
+            "volume": np.full(n, 1000.0),
+            "traded": np.ones(n),
+        }
+    )
+
+
+def test_split_sized_forward_return_is_unlabelled():
+    cfg = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+        max_abs_log_return=0.40,
+        max_abs_target=8.0,
+    )
+    panel = compute_features(_daily_grid(50, split_at=30), cfg)
+    pre_split = panel.iloc[29]
+    assert abs(float(pre_split["target_raw"])) > 0.40
+    assert not bool(pre_split["valid"])
+
+
+def test_calendar_embargo_drops_last_horizon_labels():
+    cfg = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+        max_abs_log_return=0.40,
+    )
+    panel = compute_features(_daily_grid(80), cfg)
+    assert bool(panel.iloc[38]["valid"])
+    train = embargo_calendar_horizon(panel.iloc[:40], cfg)
+    assert not bool(train["valid"].iloc[-1])
+
+
+def test_linear_skip_is_the_init_readout():
+    import torch
+
+    model = ReturnForecaster(
+        ForecastModelConfig(n_features=18, d_model=16, n_layer=1, dropout=0.0)
+    )
+    model.eval()
+    x = torch.randn(2, 8, 18)
+    mean, _ = model(x)
+    skip = model.skip(x).squeeze(-1)
+    assert torch.allclose(mean, skip, atol=1e-5)
+    assert not torch.allclose(model.skip.weight, torch.zeros_like(model.skip.weight))
+
+
+def test_correlation_loss_rewards_alignment():
+    import torch
+
+    mean = torch.tensor([[0.2, 0.4, -0.1, 0.3]])
+    target = mean.clone()
+    mask = torch.ones_like(mean)
+    aligned = masked_correlation_loss(mean, target, mask)
+    flipped = masked_correlation_loss(-mean, target, mask)
+    assert float(aligned) < float(flipped)
+    assert float(aligned) == pytest.approx(0.0, abs=1e-5)
+
+
+def test_winsorized_ic_downweights_split_outlier():
+    pred = np.array([0.3, 0.2, 0.1, 0.05, 0.0], dtype=np.float64)
+    target = np.array([0.3, 0.2, 0.1, 0.05, -40.0], dtype=np.float64)
+    scale = np.ones(5, dtype=np.float64)
+    metrics = compute_metrics(pred, target, scale, winsor=3.0)
+    inlier = compute_metrics(pred[:-1], target[:-1], scale[:-1], winsor=3.0)
+    assert inlier["ic_raw"] == pytest.approx(1.0, abs=1e-6)
+    # Spearman treats the jump as one rank, not 40 vol units.
+    assert metrics["ic_spearman"] > metrics["ic_raw"]
+    assert abs(metrics["ic"] - inlier["ic"]) < abs(metrics["ic_raw"] - inlier["ic_raw"])
+
+
+def test_weekly_cli_uses_week_scale_context():
+    args = build_arg_parser().parse_args(["--interval", "weekly"])
+    data_cfg, model_cfg, train_cfg = configs_from_cli(args)
+    assert data_cfg.seq_len == 52
+    assert data_cfg.vol_halflife == 12
+    assert data_cfg.z_window == 52
+    assert data_cfg.supervise_last == 8
+    assert model_cfg.linear_skip is True
+    assert model_cfg.dt_min == pytest.approx(0.05)
+    assert train_cfg.ic_loss_weight == pytest.approx(0.5)

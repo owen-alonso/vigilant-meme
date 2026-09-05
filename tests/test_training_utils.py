@@ -7,7 +7,7 @@ import torch
 
 from mamba_lm.training_utils import (
     _ES_CONTINUOUS,
-    _ES_SYSTEM_REQUIRED,
+    _KEEP_AWAKE_FLAGS,
     autocast_context,
     grads_finite,
     keep_awake,
@@ -49,10 +49,10 @@ def test_keep_awake_inhibits_sleep_then_restores(monkeypatch):
     )
     logs: list[str] = []
     with keep_awake(log_fn=logs.append, interval_sec=60.0):
-        assert calls == [_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED]
-        assert any("sleep inhibited" in line for line in logs)
+        assert calls == [_KEEP_AWAKE_FLAGS]
+        assert any("sleep and display inhibited" in line for line in logs)
     assert calls[-1] == _ES_CONTINUOUS
-    assert any("sleep restored" in line for line in logs)
+    assert any("sleep and display restored" in line for line in logs)
 
 
 def test_keep_awake_clears_after_error(monkeypatch):

@@ -11,6 +11,7 @@ import torch
 from forecast.config import DataConfig, ForecastModelConfig, ForecastTrainConfig
 from forecast.model import ReturnForecaster
 from mamba_lm.checkpoint_io import load_checkpoint_dict
+import torch.nn as nn
 
 
 def _to_numpy_list(value: Any) -> list[float]:
@@ -25,6 +26,25 @@ def _to_numpy(value: Any) -> np.ndarray:
     if isinstance(value, np.ndarray):
         return value.astype(np.float32)
     return np.asarray(value, dtype=np.float32)
+
+
+def _load_forecaster_weights(model: ReturnForecaster, state_dict: dict[str, Any]) -> None:
+    """Load weights. Pre-skip checkpoints keep a frozen zero skip (old readout)."""
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    missing = list(incompatible.missing_keys)
+    unexpected = list(incompatible.unexpected_keys)
+    skip_missing = [k for k in missing if k.startswith("skip.")]
+    other_missing = [k for k in missing if not k.startswith("skip.")]
+    if other_missing or unexpected:
+        raise RuntimeError(
+            "checkpoint does not match the forecast model "
+            f"(missing={other_missing}, unexpected={unexpected})"
+        )
+    if skip_missing:
+        nn.init.zeros_(model.skip.weight)
+        nn.init.zeros_(model.skip.bias)
+        model.skip.weight.requires_grad_(False)
+        model.skip.bias.requires_grad_(False)
 
 
 def save_forecast_checkpoint(
@@ -81,7 +101,7 @@ def load_forecast_checkpoint(
     state["feature_std"] = _to_numpy(state["feature_std"])
 
     if model is not None:
-        model.load_state_dict(state["model"])
+        _load_forecaster_weights(model, state["model"])
 
     return state
 
@@ -92,7 +112,7 @@ def load_forecaster(
     state = load_forecast_checkpoint(checkpoint, map_location=device)
     model_cfg = ForecastModelConfig.from_dict(state["model_config"])
     model = ReturnForecaster(model_cfg).to(device)
-    model.load_state_dict(state["model"])
+    _load_forecaster_weights(model, state["model"])
     model.eval()
     return model, state
 
