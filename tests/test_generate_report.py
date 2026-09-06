@@ -36,7 +36,7 @@ def test_format_stock_column_report_headings():
         device=torch.device("cpu"),
         notes=["No trained uncertainty: the loss was not gaussian NLL."],
     )
-    assert "NEXT-HOUR RETURN FORECAST" in text
+    assert "NEXT-DAY RETURN FORECAST" in text
     assert "SPAB" in text
     assert "Predicted move" in text or "pred (bp)" in text
     assert "basis points" in text

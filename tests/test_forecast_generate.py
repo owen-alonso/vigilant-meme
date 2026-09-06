@@ -81,5 +81,6 @@ def test_resolve_data_files_filters_symbols(tmp_path: Path):
 
 def test_resolve_data_files_unknown_symbol(tmp_path: Path):
     (tmp_path / "AAPL_clean_1min.parquet").write_bytes(b"x")
-    with pytest.raises(FileNotFoundError, match="ZZZZ"):
+    with pytest.raises(FileNotFoundError, match="ZZZZ") as exc:
         resolve_data_files(str(tmp_path), tmp_path, ["ZZZZ"])
+    assert "AAPL" in str(exc.value)

@@ -38,10 +38,17 @@ FEATURE_NAMES: tuple[str, ...] = (
     "ret_390",
     "range_hl",
     "body_co",
+    "close_loc",
+    "wick_up",
+    "wick_dn",
     "vol_level",
     "vol_change",
     "volume_z",
     "turnover_z",
+    "ret_vol",
+    "peer_ret_1",
+    "mkt_ret_1",
+    "idio_ret_1",
     "traded",
     "staleness",
     "new_session",
@@ -50,6 +57,8 @@ FEATURE_NAMES: tuple[str, ...] = (
     "tod_frac",
     "dow_frac",
 )
+
+CROSS_SECTION_FEATURES: tuple[str, ...] = ("peer_ret_1", "mkt_ret_1", "idio_ret_1")
 
 OHLCV_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 
@@ -287,6 +296,7 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     join_id = large_join.cumsum()
 
     r1 = log_close.diff().mask(large_join, np.nan)
+    out["ret_raw"] = r1.fillna(0.0)
     # EWM realized vol, shifted so bar t's own return is excluded.
     ewm_var = r1.pow(2).ewm(halflife=cfg.vol_halflife, min_periods=cfg.vol_halflife).mean()
     sigma = np.sqrt(ewm_var).shift(1).clip(lower=cfg.vol_floor)
@@ -302,6 +312,12 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
 
     out["range_hl"] = ((out["high"] - out["low"]) / close) / sigma
     out["body_co"] = ((close - out["open"]) / close) / sigma
+    hl = (out["high"] - out["low"]).clip(lower=1e-12)
+    out["close_loc"] = (2.0 * (close - out["low"]) / hl) - 1.0
+    upper = np.maximum(close, out["open"])
+    lower = np.minimum(close, out["open"])
+    out["wick_up"] = ((out["high"] - upper) / close) / sigma
+    out["wick_dn"] = ((lower - out["low"]) / close) / sigma
 
     log_sigma = np.log(sigma)
     out["vol_level"] = _causal_zscore(log_sigma, cfg.z_window, cfg.z_min_periods)
@@ -312,6 +328,11 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     out["turnover_z"] = _causal_zscore(
         np.log1p(out["volume"] * close), cfg.z_window, cfg.z_min_periods
     )
+    out["ret_vol"] = out["ret_1"] * out["volume_z"]
+    # Filled by attach_cross_section_features when more than one symbol exists.
+    out["peer_ret_1"] = 0.0
+    out["mkt_ret_1"] = 0.0
+    out["idio_ret_1"] = 0.0
 
     # Bars elapsed since the last real print, so stale prices are discountable.
     position = np.arange(len(out), dtype=np.float64)
@@ -369,6 +390,161 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
         out[name] = out[name].clip(-cfg.clip, cfg.clip)
     out["target"] = out["target"].fillna(0.0)
     out["target_raw"] = out["target_raw"].fillna(0.0)
+    return out
+
+
+def _cross_section_key(panel: pd.DataFrame, cfg: DataConfig) -> pd.Series:
+    """Align names on session dates (calendar) or exact timestamps (intraday)."""
+    if cfg.is_calendar():
+        return pd.to_datetime(panel["session"]).dt.tz_localize(None).dt.normalize()
+    return pd.to_datetime(panel["datetime"])
+
+
+def attach_cross_section_features(
+    panels: dict[str, pd.DataFrame],
+    cfg: DataConfig,
+) -> dict[str, pd.DataFrame]:
+    """Peer / market return known at bar ``t``. Strictly causal.
+
+    ``mkt_ret_1`` is the benchmark ticker's ``ret_1`` when that parquet is in
+    ``panels``, otherwise the equal-weight mean of trading names.
+    ``peer_ret_1`` averages the other *trading* names (benchmark excluded).
+    ``idio_ret_1`` is own ``ret_1`` minus ``mkt_ret_1``.
+    """
+    if not panels:
+        return panels
+    bench = str(cfg.benchmark_symbol or "").upper()
+    trade_syms = [s for s in panels if s != bench]
+    clip = float(cfg.clip)
+
+    mkt: pd.Series | None = None
+    if bench in panels:
+        bpanel = panels[bench]
+        mkt = pd.Series(
+            bpanel["ret_1"].to_numpy(dtype=np.float64),
+            index=pd.Index(_cross_section_key(bpanel, cfg).to_numpy()),
+        ).groupby(level=0).mean()
+    elif len(trade_syms) >= 2:
+        parts: list[pd.DataFrame] = []
+        for sym in trade_syms:
+            panel = panels[sym]
+            traded = panel["traded"].to_numpy(dtype=np.float64) > 0
+            if not bool(traded.any()):
+                continue
+            parts.append(
+                pd.DataFrame(
+                    {
+                        "key": _cross_section_key(panel, cfg).to_numpy()[traded],
+                        "symbol": sym,
+                        "ret_1": panel["ret_1"].to_numpy(dtype=np.float64)[traded],
+                    }
+                )
+            )
+        if len(parts) >= 2:
+            long = pd.concat(parts, ignore_index=True)
+            wide = long.pivot_table(
+                index="key", columns="symbol", values="ret_1", aggfunc="mean"
+            )
+            mkt = wide.mean(axis=1, skipna=True)
+
+    peer_wide: pd.DataFrame | None = None
+    if len(trade_syms) >= 2:
+        parts = []
+        for sym in trade_syms:
+            panel = panels[sym]
+            traded = panel["traded"].to_numpy(dtype=np.float64) > 0
+            if not bool(traded.any()):
+                continue
+            parts.append(
+                pd.DataFrame(
+                    {
+                        "key": _cross_section_key(panel, cfg).to_numpy()[traded],
+                        "symbol": sym,
+                        "ret_1": panel["ret_1"].to_numpy(dtype=np.float64)[traded],
+                    }
+                )
+            )
+        if len(parts) >= 2:
+            long = pd.concat(parts, ignore_index=True)
+            peer_wide = long.pivot_table(
+                index="key", columns="symbol", values="ret_1", aggfunc="mean"
+            )
+
+    if mkt is None and peer_wide is None:
+        return panels
+
+    out: dict[str, pd.DataFrame] = {}
+    for sym, panel in panels.items():
+        p = panel.copy()
+        keys = _cross_section_key(p, cfg)
+        if mkt is not None:
+            mkt_vals = keys.map(mkt).to_numpy(dtype=np.float64)
+            mkt_vals = np.where(np.isfinite(mkt_vals), mkt_vals, 0.0)
+        else:
+            mkt_vals = np.zeros(len(p), dtype=np.float64)
+        own = p["ret_1"].to_numpy(dtype=np.float64)
+        peer = np.zeros(len(p), dtype=np.float64)
+        if peer_wide is not None and sym in getattr(peer_wide, "columns", []):
+            others = peer_wide.drop(columns=[sym], errors="ignore")
+            if others.shape[1] > 0:
+                peer_s = others.mean(axis=1, skipna=True)
+                peer = keys.map(peer_s).to_numpy(dtype=np.float64)
+                peer = np.where(np.isfinite(peer), peer, 0.0)
+        p["peer_ret_1"] = np.clip(peer, -clip, clip)
+        p["mkt_ret_1"] = np.clip(mkt_vals, -clip, clip)
+        p["idio_ret_1"] = np.clip(own - mkt_vals, -clip, clip)
+        out[sym] = p
+    return out
+
+
+def attach_residual_target(
+    panels: dict[str, pd.DataFrame],
+    cfg: DataConfig,
+) -> dict[str, pd.DataFrame]:
+    """Replace the label with trailing-beta residual vs the benchmark forward return.
+
+    ``beta_t`` uses same-bar returns through ``t`` only. The benchmark's
+    *forward* return enters the label, never ``FEATURE_NAMES``.
+    """
+    bench = str(cfg.benchmark_symbol or "").upper()
+    if not cfg.residual_target or bench not in panels:
+        return panels
+    spy = panels[bench]
+    spy_key = pd.Index(_cross_section_key(spy, cfg).to_numpy())
+    spy_fwd = pd.Series(
+        spy["target_raw"].to_numpy(dtype=np.float64), index=spy_key
+    ).groupby(level=0).last()
+    spy_r = pd.Series(
+        spy["ret_raw"].to_numpy(dtype=np.float64), index=spy_key
+    ).groupby(level=0).last()
+    hl = max(2, int(cfg.beta_halflife))
+    out: dict[str, pd.DataFrame] = {}
+    for sym, panel in panels.items():
+        p = panel.copy()
+        if sym == bench:
+            out[sym] = p
+            continue
+        keys = _cross_section_key(p, cfg)
+        spy_r_al = keys.map(spy_r).to_numpy(dtype=np.float64)
+        spy_fwd_al = keys.map(spy_fwd).to_numpy(dtype=np.float64)
+        own_r = p["ret_raw"].to_numpy(dtype=np.float64)
+        frame = pd.DataFrame({"y": own_r, "x": spy_r_al})
+        cov = frame["y"].ewm(halflife=hl, min_periods=hl).cov(frame["x"])
+        var = frame["x"].ewm(halflife=hl, min_periods=hl).var()
+        beta = (cov / var.replace(0.0, np.nan)).fillna(0.0).clip(-5.0, 5.0).to_numpy()
+        own_fwd = p["target_raw"].to_numpy(dtype=np.float64)
+        spy_fwd_al = np.where(np.isfinite(spy_fwd_al), spy_fwd_al, 0.0)
+        resid = own_fwd - beta * spy_fwd_al
+        scale = p["scale"].to_numpy(dtype=np.float64)
+        p["target_raw"] = resid
+        p["target"] = np.divide(resid, scale, out=np.zeros_like(resid), where=scale > 0)
+        valid = p["valid"].to_numpy(dtype=bool).copy()
+        if cfg.max_abs_log_return > 0:
+            valid &= np.abs(resid) <= cfg.max_abs_log_return
+        if cfg.max_abs_target > 0:
+            valid &= np.abs(p["target"].to_numpy()) <= cfg.max_abs_target
+        p["valid"] = valid
+        out[sym] = p
     return out
 
 
@@ -436,6 +612,15 @@ class SymbolArrays:
     target: np.ndarray  # [T]    float32, volatility units
     scale: np.ndarray  # [T]    float32, target -> log-return multiplier
     valid: np.ndarray  # [T]    bool
+    dates: np.ndarray | None = None  # [T] int64 days since epoch
+
+
+def _date_keys(panel: pd.DataFrame) -> np.ndarray:
+    ts = pd.to_datetime(panel["datetime"])
+    if getattr(ts.dt, "tz", None) is not None:
+        ts = ts.dt.tz_convert("America/New_York").dt.tz_localize(None)
+    ts = ts.dt.normalize()
+    return ((ts - pd.Timestamp("1970-01-01")) // pd.Timedelta("1D")).astype(np.int64).to_numpy()
 
 
 def panel_to_arrays(panel: pd.DataFrame, symbol: str) -> SymbolArrays:
@@ -445,15 +630,17 @@ def panel_to_arrays(panel: pd.DataFrame, symbol: str) -> SymbolArrays:
         target=panel["target"].to_numpy(dtype=np.float32),
         scale=panel["scale"].to_numpy(dtype=np.float32),
         valid=panel["valid"].to_numpy(dtype=bool),
+        dates=_date_keys(panel) if "datetime" in panel.columns else None,
     )
 
 
 class SequenceDataset(Dataset):
     """Fixed-length windows over one or more symbols.
 
-    ``__getitem__`` returns ``(x, y, mask, scale)`` where ``x`` is ``[L, F]`` and
-    the rest are ``[L]``. Supervision is dense: the model predicts at every bar
-    and ``mask`` zeroes out the ones that are not trainable.
+    ``__getitem__`` returns ``(x, y, mask, scale, date_id, sym_idx)``.
+    Last-bar mode scores the trading object: only the final index is labelled.
+    Windows are built on the full series so val/test last bars can see
+    earlier-split history.
     """
 
     def __init__(
@@ -467,6 +654,7 @@ class SequenceDataset(Dataset):
         min_context: int = 0,
         require_valid: int = 1,
         supervise_last: int = 0,
+        last_bar_only: bool = False,
     ) -> None:
         if seq_len < 1:
             raise ValueError("seq_len must be positive")
@@ -480,12 +668,21 @@ class SequenceDataset(Dataset):
         self.seq_len = seq_len
         self.min_context = min_context
         self.supervise_last = min(int(supervise_last), seq_len)
+        self.last_bar_only = bool(last_bar_only)
         self.feature_mean = feature_mean
         self.feature_std = feature_std
 
         self.windows: list[tuple[int, int]] = []
         for i, sym in enumerate(self.symbols):
             length = len(sym.target)
+            if length < seq_len:
+                continue
+            if self.last_bar_only or self.supervise_last == 1:
+                for end in range(seq_len - 1, length, stride):
+                    start = end - seq_len + 1
+                    if bool(sym.valid[end]):
+                        self.windows.append((i, start))
+                continue
             for start in range(0, max(0, length - seq_len + 1), stride):
                 if self.supervise_last > 0:
                     scorable = sym.valid[start + seq_len - self.supervise_last : start + seq_len]
@@ -510,14 +707,114 @@ class SequenceDataset(Dataset):
             x = (x - self.feature_mean) / self.feature_std
         mask = sym.valid[start:stop].copy()
         mask[: self.min_context] = False
-        if self.supervise_last > 0:
+        if self.last_bar_only:
+            last = mask[-1]
+            mask[:] = False
+            mask[-1] = last
+        elif self.supervise_last > 0:
             mask[: -self.supervise_last] = False
+        date_id = 0
+        if sym.dates is not None and len(sym.dates) >= stop:
+            date_id = int(sym.dates[stop - 1])
         return (
             torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)),
             torch.from_numpy(sym.target[start:stop].copy()),
             torch.from_numpy(mask),
             torch.from_numpy(sym.scale[start:stop].copy()),
+            torch.tensor(date_id, dtype=torch.int64),
+            torch.tensor(sym_idx, dtype=torch.int64),
         )
+
+
+class CrossSectionDataset(Dataset):
+    """One item is every name that prints on a date, last-bar windows aligned."""
+
+    def __init__(
+        self,
+        symbols: Sequence[SymbolArrays],
+        seq_len: int,
+        *,
+        feature_mean: np.ndarray | None = None,
+        feature_std: np.ndarray | None = None,
+        min_names: int = 8,
+    ) -> None:
+        if seq_len < 1:
+            raise ValueError("seq_len must be positive")
+        self.symbols = list(symbols)
+        self.seq_len = seq_len
+        self.feature_mean = feature_mean
+        self.feature_std = feature_std
+        buckets: dict[int, list[tuple[int, int]]] = {}
+        for i, sym in enumerate(self.symbols):
+            length = len(sym.target)
+            if length < seq_len or sym.dates is None:
+                continue
+            for end in range(seq_len - 1, length):
+                if not bool(sym.valid[end]):
+                    continue
+                key = int(sym.dates[end])
+                buckets.setdefault(key, []).append((i, end))
+        self.items: list[tuple[int, list[tuple[int, int]]]] = [
+            (d, pairs)
+            for d, pairs in sorted(buckets.items())
+            if len(pairs) >= int(min_names)
+        ]
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    @property
+    def n_valid_bars(self) -> int:
+        return int(sum(len(pairs) for _d, pairs in self.items))
+
+    def __getitem__(self, index: int):
+        date_id, pairs = self.items[index]
+        xs: list[np.ndarray] = []
+        ys: list[np.ndarray] = []
+        masks: list[np.ndarray] = []
+        scales: list[np.ndarray] = []
+        dates: list[int] = []
+        syms: list[int] = []
+        for sym_idx, end in pairs:
+            sym = self.symbols[sym_idx]
+            start = end - self.seq_len + 1
+            x = sym.features[start : end + 1]
+            if self.feature_mean is not None and self.feature_std is not None:
+                x = (x - self.feature_mean) / self.feature_std
+            mask = np.zeros(self.seq_len, dtype=bool)
+            mask[-1] = bool(sym.valid[end])
+            y = sym.target[start : end + 1].copy()
+            sc = sym.scale[start : end + 1].copy()
+            xs.append(np.ascontiguousarray(x, dtype=np.float32))
+            ys.append(y)
+            masks.append(mask)
+            scales.append(sc)
+            dates.append(int(date_id))
+            syms.append(int(sym_idx))
+        return (
+            torch.from_numpy(np.stack(xs, axis=0)),
+            torch.from_numpy(np.stack(ys, axis=0)),
+            torch.from_numpy(np.stack(masks, axis=0)),
+            torch.from_numpy(np.stack(scales, axis=0)),
+            torch.tensor(dates, dtype=torch.int64),
+            torch.tensor(syms, dtype=torch.int64),
+        )
+
+
+def collate_forecast(batch: list[tuple]) -> tuple[torch.Tensor, ...]:
+    """Stack SequenceDataset items or concat CrossSectionDataset dates."""
+    x0 = batch[0][0]
+    if x0.dim() == 3:
+        xs, ys, masks, scales, dates, syms = zip(*batch)
+        return (
+            torch.cat(xs, dim=0),
+            torch.cat(ys, dim=0),
+            torch.cat(masks, dim=0),
+            torch.cat(scales, dim=0),
+            torch.cat(dates, dim=0),
+            torch.cat(syms, dim=0),
+        )
+    return torch.utils.data.default_collate(batch)
 
 
 def _source_mix(frame: pd.DataFrame) -> dict[str, float]:
@@ -559,6 +856,43 @@ def embargo_calendar_horizon(panel: pd.DataFrame, cfg: DataConfig) -> pd.DataFra
     return out
 
 
+def _mask_split_valid(
+    base_valid: np.ndarray,
+    in_split: np.ndarray,
+    cfg: DataConfig,
+) -> np.ndarray:
+    valid = np.asarray(base_valid, dtype=bool).copy() & np.asarray(in_split, dtype=bool)
+    if cfg.is_calendar() and int(cfg.horizon) >= 1:
+        idx = np.flatnonzero(in_split)
+        if idx.size:
+            valid[idx[-int(cfg.horizon) :]] = False
+    return valid
+
+
+def _arrays_with_valid(src: SymbolArrays, valid: np.ndarray) -> SymbolArrays:
+    return SymbolArrays(
+        symbol=src.symbol,
+        features=src.features,
+        target=src.target,
+        scale=src.scale,
+        valid=valid,
+        dates=src.dates,
+    )
+
+
+def global_session_cuts(
+    panels: dict[str, pd.DataFrame],
+    cfg: DataConfig,
+) -> tuple[Any, Any]:
+    """Union of session dates, then the usual 70/15/15 cuts."""
+    sessions = pd.concat(
+        [p["session"].drop_duplicates() for p in panels.values()],
+        ignore_index=True,
+    ).drop_duplicates().sort_values().to_numpy()
+    cut_train, cut_val = split_session_bounds(len(sessions), cfg)
+    return sessions[cut_train], sessions[cut_val]
+
+
 def build_datasets(
     cfg: DataConfig,
     *,
@@ -567,41 +901,88 @@ def build_datasets(
 ) -> dict[str, Any]:
     """Load every symbol, split chronologically, and standardize on train only.
 
-    Splits are cut at session boundaries. Because a target never reaches past
-    the end of its own session, no label can straddle a split boundary.
+    Calendar splits share one ``train_end`` / ``val_end``. Windows run over the
+    full series so a val last bar can use train history. The benchmark ticker
+    (default SPY) is a market feature / residual label, not a training name.
     """
+    from forecast.diagnostics import assert_calendar_price_quality
+
     paths = list(paths) if paths is not None else discover_symbol_files(
         cfg.data_dir, interval=cfg.interval
     )
+
+    raw_panels: dict[str, pd.DataFrame] = {}
+    path_by_symbol: dict[str, Path] = {}
+    for path in paths:
+        if cfg.is_calendar():
+            try:
+                assert_calendar_price_quality(path, cfg, log_fn=log_fn)
+            except ValueError:
+                raise
+        panel = build_panel(path, cfg)
+        symbol = str(panel["symbol"].iloc[0])
+        min_needed = int(cfg.seq_len) + max(int(cfg.horizon), 1)
+        n_sess = int(panel["session"].nunique())
+        if n_sess < min_needed:
+            if log_fn:
+                log_fn(
+                    f"skip {symbol}: {n_sess} sessions < seq_len+horizon={min_needed} "
+                    "(compact vendor slice, not usable)"
+                )
+            continue
+        raw_panels[symbol] = panel
+        path_by_symbol[symbol] = Path(path)
+    if not raw_panels:
+        raise FileNotFoundError("no symbol panels long enough to window")
+
+    raw_panels = attach_cross_section_features(raw_panels, cfg)
+    raw_panels = attach_residual_target(raw_panels, cfg)
+
+    bench = str(cfg.benchmark_symbol or "").upper()
+    trade_panels = {s: p for s, p in raw_panels.items() if s != bench}
+    if not trade_panels:
+        raise ValueError(
+            f"only benchmark {bench} was loaded; add trading-name parquets"
+        )
+
+    if cfg.global_calendar_split and cfg.is_calendar() and len(trade_panels) >= 1:
+        train_end, val_end = global_session_cuts(trade_panels, cfg)
+    else:
+        train_end, val_end = None, None
 
     train_syms: list[SymbolArrays] = []
     val_syms: list[SymbolArrays] = []
     test_syms: list[SymbolArrays] = []
     meta: list[dict[str, Any]] = []
 
-    for path in paths:
-        panel = build_panel(path, cfg)
-        symbol = str(panel["symbol"].iloc[0])
+    for symbol, panel in trade_panels.items():
+        path = path_by_symbol[symbol]
         sessions = panel["session"].drop_duplicates().sort_values().to_numpy()
-        cut_train, cut_val = split_session_bounds(len(sessions), cfg)
-        train_end, val_end = sessions[cut_train], sessions[cut_val]
+        if train_end is None:
+            cut_train, cut_val = split_session_bounds(len(sessions), cfg)
+            sym_train_end, sym_val_end = sessions[cut_train], sessions[cut_val]
+        else:
+            sym_train_end, sym_val_end = train_end, val_end
 
-        is_train = panel["session"] < train_end
-        is_val = (panel["session"] >= train_end) & (panel["session"] < val_end)
-        is_test = panel["session"] >= val_end
-
+        is_train = (panel["session"] < sym_train_end).to_numpy()
+        is_val = (
+            (panel["session"] >= sym_train_end) & (panel["session"] < sym_val_end)
+        ).to_numpy()
+        is_test = (panel["session"] >= sym_val_end).to_numpy()
+        base = panel_to_arrays(panel, symbol)
+        base_valid = panel["valid"].to_numpy(dtype=bool)
         train_syms.append(
-            panel_to_arrays(embargo_calendar_horizon(panel[is_train], cfg), symbol)
+            _arrays_with_valid(base, _mask_split_valid(base_valid, is_train, cfg))
         )
         val_syms.append(
-            panel_to_arrays(embargo_calendar_horizon(panel[is_val], cfg), symbol)
+            _arrays_with_valid(base, _mask_split_valid(base_valid, is_val, cfg))
         )
         test_syms.append(
-            panel_to_arrays(embargo_calendar_horizon(panel[is_test], cfg), symbol)
+            _arrays_with_valid(base, _mask_split_valid(base_valid, is_test, cfg))
         )
-        train_mix = _source_mix(panel[is_train])
-        val_mix = _source_mix(panel[is_val])
-        test_mix = _source_mix(panel[is_test])
+        train_mix = _source_mix(panel.loc[is_train])
+        val_mix = _source_mix(panel.loc[is_val])
+        test_mix = _source_mix(panel.loc[is_test])
         meta.append(
             {
                 "symbol": symbol,
@@ -612,11 +993,13 @@ def build_datasets(
                 "valid_bars": int(panel["valid"].sum()),
                 "first": str(panel["datetime"].iloc[0]),
                 "last": str(panel["datetime"].iloc[-1]),
-                "train_end": str(pd.Timestamp(train_end).date()),
-                "val_end": str(pd.Timestamp(val_end).date()),
+                "train_end": str(pd.Timestamp(sym_train_end).date()),
+                "val_end": str(pd.Timestamp(sym_val_end).date()),
                 "train_source_mix": train_mix,
                 "val_source_mix": val_mix,
                 "test_source_mix": test_mix,
+                "residual_target": bool(cfg.residual_target and bench in raw_panels),
+                "benchmark": bench if bench in raw_panels else "",
             }
         )
         if log_fn:
@@ -639,31 +1022,85 @@ def build_datasets(
                     )
 
     mean, std = feature_stats(train_syms)
-
-    # Evaluation windows overlap by exactly the warmup region, so the scored
-    # segments tile the split end to end and each bar is counted once.
-    eval_stride = max(1, cfg.seq_len - cfg.min_context)
-    common = {"feature_mean": mean, "feature_std": std, "min_context": cfg.min_context}
-    datasets = {
-        "train": SequenceDataset(
-            train_syms,
-            cfg.seq_len,
-            cfg.stride,
-            supervise_last=cfg.supervise_last,
-            **common,
-        ),
-        "val": SequenceDataset(val_syms, cfg.seq_len, eval_stride, **common),
-        "test": SequenceDataset(test_syms, cfg.seq_len, eval_stride, **common),
+    last_bar = bool(cfg.eval_last_bar) and cfg.is_calendar()
+    eval_stride = 1 if last_bar else max(1, cfg.seq_len - cfg.min_context)
+    common = {
+        "feature_mean": mean,
+        "feature_std": std,
+        "min_context": cfg.min_context,
+        "last_bar_only": last_bar,
     }
+    use_cs = (
+        last_bar
+        and cfg.is_calendar()
+        and len(train_syms) >= int(cfg.cross_section_min_names)
+    )
+    if use_cs:
+        datasets = {
+            "train": CrossSectionDataset(
+                train_syms,
+                cfg.seq_len,
+                feature_mean=mean,
+                feature_std=std,
+                min_names=cfg.cross_section_min_names,
+            ),
+            "val": CrossSectionDataset(
+                val_syms,
+                cfg.seq_len,
+                feature_mean=mean,
+                feature_std=std,
+                min_names=cfg.cross_section_min_names,
+            ),
+            "test": CrossSectionDataset(
+                test_syms,
+                cfg.seq_len,
+                feature_mean=mean,
+                feature_std=std,
+                min_names=cfg.cross_section_min_names,
+            ),
+        }
+        if log_fn:
+            log_fn(
+                f"cross-section dates: train={len(datasets['train'])} "
+                f"val={len(datasets['val'])} test={len(datasets['test'])} "
+                f"(min_names={cfg.cross_section_min_names})"
+            )
+        if any(len(datasets[k]) == 0 for k in ("train", "val", "test")):
+            if log_fn:
+                log_fn(
+                    "cross-section empty on a split; falling back to last-bar sequences"
+                )
+            use_cs = False
+            datasets = None
+    if not use_cs:
+        datasets = {
+            "train": SequenceDataset(
+                train_syms,
+                cfg.seq_len,
+                cfg.stride,
+                supervise_last=cfg.supervise_last,
+                **common,
+            ),
+            "val": SequenceDataset(
+                val_syms, cfg.seq_len, eval_stride, supervise_last=1, **common
+            ),
+            "test": SequenceDataset(
+                test_syms, cfg.seq_len, eval_stride, supervise_last=1, **common
+            ),
+        }
     if log_fn:
         for name, ds in datasets.items():
             log_fn(f"{name}: {len(ds)} windows, {ds.n_valid_bars} labelled bars")
     return {
         "datasets": datasets,
+        "train_symbols": train_syms,
+        "val_symbols": val_syms,
+        "test_symbols": test_syms,
         "feature_mean": mean,
         "feature_std": std,
         "feature_names": list(FEATURE_NAMES),
         "meta": meta,
+        "cross_section": use_cs,
     }
 
 
@@ -678,3 +1115,56 @@ def feature_stats(symbols: Sequence[SymbolArrays]) -> tuple[np.ndarray, np.ndarr
     # Constant features (e.g. a symbol that always trades) must not blow up.
     std = np.where(std < 1e-6, 1.0, std).astype(np.float32)
     return mean, std
+
+
+def fit_ridge_readout(
+    symbols: Sequence[SymbolArrays],
+    feature_mean: np.ndarray,
+    feature_std: np.ndarray,
+    *,
+    ridge: float = 1.0,
+) -> tuple[np.ndarray, float, float]:
+    """Train-only ridge of target on normalized features. Returns weight, bias, IC."""
+    n_features = int(np.asarray(feature_mean).shape[0])
+    chunks_x: list[np.ndarray] = []
+    chunks_y: list[np.ndarray] = []
+    mean = np.asarray(feature_mean, dtype=np.float64)
+    std = np.asarray(feature_std, dtype=np.float64)
+    for sym in symbols:
+        if not bool(sym.valid.any()):
+            continue
+        raw = sym.features[sym.valid].astype(np.float64, copy=False)
+        chunks_x.append((raw - mean) / std)
+        chunks_y.append(sym.target[sym.valid].astype(np.float64, copy=False))
+    if not chunks_x:
+        return np.zeros(n_features, dtype=np.float32), 0.0, float("nan")
+
+    x = np.concatenate(chunks_x, axis=0)
+    y = np.concatenate(chunks_y, axis=0)
+    design = np.concatenate([x, np.ones((x.shape[0], 1), dtype=np.float64)], axis=1)
+    lam = max(0.0, float(ridge))
+    xtx = design.T @ design
+    xtx.flat[:: xtx.shape[0] + 1] += lam
+    try:
+        coef = np.linalg.solve(xtx, design.T @ y)
+    except np.linalg.LinAlgError:
+        coef = np.linalg.lstsq(xtx, design.T @ y, rcond=None)[0]
+    weights = coef[:-1].astype(np.float32)
+    bias = float(coef[-1])
+    pred = x @ coef[:-1] + coef[-1]
+    ic = float("nan")
+    if pred.size >= 2:
+        pc = pred - pred.mean()
+        yc = y - y.mean()
+        denom = float(np.sqrt((pc * pc).sum() * (yc * yc).sum()))
+        if denom > 1e-12:
+            ic = float((pc * yc).sum() / denom)
+    # OLS can match correlation with huge |w|. Scale to the MSE-optimal
+    # amplitude rho * sigma_y so the skip does not start 2x too volatile.
+    pred_std = float(pred.std())
+    y_std = float(y.std())
+    if pred_std > 1e-8 and y_std > 1e-8 and np.isfinite(ic):
+        amp = abs(ic) * y_std / pred_std
+        weights = (weights * amp).astype(np.float32)
+        bias = float(bias * amp)
+    return weights, bias, ic

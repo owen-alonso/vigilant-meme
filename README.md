@@ -138,48 +138,46 @@ Training logs periodic Dynamic A scale stats (`mean/std/min/max`) so you can see
 
 ## Next-hour return forecasting
 
-`forecast/` reuses the Mamba backbone for a regression task: given 1-minute
-OHLCV bars for an equity, predict its **log return over the next 60 minutes**.
+`forecast/` reuses the Mamba backbone for a regression task: given daily
+OHLCV bars for an equity, predict its **log return over the next trading day**.
 
 ```
 forecast/
-  config.py     # DataConfig / ForecastModelConfig / ForecastTrainConfig
-  data.py       # session grid, causal features, next-hour target, windowing
-  model.py      # ReturnForecaster: continuous features -> scalar per bar
-  training.py   # masked loss, IC / directional metrics, checkpoints
-  generate.py   # forecasts for any symbol's parquet
+  alphavantage.py  # Alpha Vantage client + parquet cache
+  download.py      # python -m forecast.download --symbols AAPL
+  config.py        # DataConfig / ForecastModelConfig / ForecastTrainConfig
+  data.py          # daily (or 1-min) grid, causal features, target, windowing
+  model.py         # ReturnForecaster: continuous features -> scalar per bar
+  training.py      # masked loss, IC / directional metrics, checkpoints
+  generate.py      # forecasts for any symbol's parquet
 ```
 
 ```bash
+python -m forecast.download --symbols AAPL
 python -m forecast.training --epochs 3
 python -m forecast.generate --checkpoint checkpoints/forecast/best.pt --last 10
-python scripts/split_report.py          # bar density + vendor mix per split
+python scripts/split_report.py
 ```
 
 ### Data contract
 
-One parquet per symbol in `data/`, named `<SYMBOL>_*.parquet`, with columns
-`datetime, Open, High, Low, Close, Volume`. Bars are snapped onto a regular
-390-slot session grid (09:30–15:59); untraded slots are forward-filled and
-flagged, since vendor files for illiquid names skip minutes entirely.
+Pull daily bars with `python -m forecast.download --symbols AAPL`. Each
+symbol is cached as `data/<SYMBOL>_daily.parquet` with columns
+`datetime, open, high, low, close, volume, source, interval`. Daily bars are
+unadjusted by default (free `TIME_SERIES_DAILY`). Split-adjusted daily and
+1-minute history are premium Alpha Vantage endpoints. Set
+`ALPHA_VANTAGE_API_KEY` in `.env` (see `.env.example`).
 
 ### Target
 
 \[
-y_t = \frac{\log C_{t+60} - \log C_t}{\sigma_t \sqrt{60}}
+y_t = \frac{\log C_{t+h} - \log C_t}{\sigma_t \sqrt{h}}
 \]
 
-\(\sigma_t\) is an EWM realized-volatility estimate using only bars up to
-\(t-1\). Predicting a volatility-normalized return keeps the objective
-stationary across calm and stressed regimes; `generate.py` multiplies by
-\(\sigma_t\sqrt{60}\) to report basis points. A bar is labelled only when it is
-a real print, \(t+60\) falls inside the same session, **and** the horizon bar
-itself is a real print (not a forward-filled hole).
-
-Intraday missing minutes are forward-filled **within the session**. Prices do
-not carry across dropped days; returns that would cross a gap of more than
-four calendar days are treated as missing. Tz-aware timestamps are converted
-to US/Eastern before the 09:30–15:59 filter.
+Default \(h = 1\) (next trading day). \(\sigma_t\) is an EWM realized-volatility
+estimate using only bars up to \(t-1\). `generate.py` multiplies by
+\(\sigma_t\sqrt{h}\) to report basis points. A bar is labelled only when the
+horizon bar exists in the file.
 
 Default training uses Huber on the mean only. Pass `--loss gaussian
 --heteroscedastic` if you want a trained residual-uncertainty head;

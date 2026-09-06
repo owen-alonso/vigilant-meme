@@ -1,4 +1,4 @@
-# Using the next-hour return forecaster
+# Using the equity return forecaster
 
 This file is the operating manual for the **equity forecast** model in `forecast/`. It is not the language-model path (`main.py`, Shakespeare, Dynamic A LM). Those share a Mamba backbone; they do not share data, targets, or `generate.py`.
 
@@ -13,14 +13,14 @@ python -m forecast.generate -h
 
 ## What the model actually does
 
-Given 1-minute OHLCV for one equity, it predicts the **expected log return over the next 60 minutes of the same US cash session** (09:30–15:59 Eastern).
+Given daily OHLCV for one equity (Alpha Vantage), it predicts the **expected log return over the next trading day**.
 
 It does **not**:
 
-- Pull the live tape. `generate.py` reads a **local parquet**. `LATEST as of …` is the last timestamp **in that file**, not wall-clock now.
-- Forecast overnight, 24h, or the next calendar hour after 15:59. The horizon must land in the **same session**.
+- Pull the live tape unless you ran `forecast.download` first. `generate.py` reads a **local parquet**. `LATEST as of …` is the last timestamp **in that file**, not wall-clock now.
+- Forecast overnight gaps as a special case: the target is the next **session close**, so weekends are just a longer calendar span between two bars.
 - Output a trade, size, or “buy/sell”. It outputs a number in **basis points** and an implied price.
-- See the future hour it is predicting. Features are causal (bars `<= t` only). **Realized** is scored afterwards when that future already exists in the file.
+- See the future day it is predicting. Features are causal (bars `<= t` only). **Realized** is scored afterwards when that future already exists in the file.
 
 The network does not predict dollars. It predicts a **volatility-normalized** return. `generate.py` multiplies by the vol known at bar `t` and reports basis points.
 
@@ -36,7 +36,11 @@ The same weights apply to any ticker: features are scale-free (no per-symbol emb
 
 ## Quick start
 
-1. Put one parquet per symbol in `data/`, named `<SYMBOL>_*.parquet` (example: `AAPL_clean_1min.parquet`).
+1. Pull daily bars from Alpha Vantage into `data/<SYMBOL>_daily.parquet`:
+
+```bash
+python -m forecast.download --symbols AAPL,MSFT
+```
 2. Train (use `best.pt`, not `last.pt`):
 
 ```bash
@@ -48,7 +52,7 @@ python -m forecast.training
 ```bash
 python -m forecast.generate --checkpoint checkpoints/forecast/best.pt
 python -m forecast.generate --checkpoint checkpoints/forecast/best.pt --symbols AAPL,MSFT
-python -m forecast.generate --checkpoint checkpoints/forecast/best.pt --data data/AAPL_clean_1min.parquet
+python -m forecast.generate --checkpoint checkpoints/forecast/best.pt --data data/AAPL_1min.parquet
 ```
 
 4. Before trusting a test IC, check whether train and test used the same vendor:
@@ -63,9 +67,11 @@ python scripts/split_report.py
 
 | Requirement | Detail |
 |---|---|
-| File | `data/<SYMBOL>_*.parquet` |
-| Columns | `datetime`, `Open`, `High`, `Low`, `Close`, `Volume` (case is normalized) |
-| Optional | `source` (vendor name; used for mix warnings) |
+| File | `data/<SYMBOL>_daily.parquet` from `python -m forecast.download` |
+| Columns | `datetime` (US/Eastern), `open`, `high`, `low`, `close`, `volume`, `source=alphavantage`, `interval=daily` |
+| Session | One bar per US trading day |
+| Timezone | Tz-aware stamps are converted to America/New_York, then made naive |
+| `Close <= 0` | Rejected (log price undefined) |
 | Session | 09:30–15:59 Eastern, **390** minute slots |
 | Timezone | Tz-aware stamps are converted to America/New_York, then made naive |
 | `Close <= 0` | Rejected (log price undefined) |
@@ -207,7 +213,7 @@ Early stop: no new best val IC for `--early-stop-evals` evals.
 ```bash
 python -m forecast.generate --checkpoint checkpoints/forecast/best.pt
 python -m forecast.generate --checkpoint checkpoints/forecast/best.pt --symbols AAPL,MSFT --last 10
-python -m forecast.generate --checkpoint checkpoints/forecast/best.pt --data data/AAPL_clean_1min.parquet
+python -m forecast.generate --checkpoint checkpoints/forecast/best.pt --data data/AAPL_1min.parquet
 ```
 
 | Flag | Default | Meaning |

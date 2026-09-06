@@ -44,7 +44,7 @@ from forecast.config import (
     interval_model_kwargs,
     validate_loss_head,
 )
-from forecast.data import FEATURE_NAMES, build_datasets
+from forecast.data import FEATURE_NAMES, build_datasets, collate_forecast, fit_ridge_readout
 from forecast.model import ReturnForecaster
 from mamba_lm.model import format_dynamic_diagnostics
 from mamba_lm.paths import anchor_to_repo
@@ -53,6 +53,7 @@ from mamba_lm.training_utils import (
     autocast_context,
     build_optimizer,
     cycle_loader,
+    dataloader_kwargs,
     grads_finite,
     keep_awake,
     lr_warmup_cosine,
@@ -73,6 +74,7 @@ def masked_loss(
     target: torch.Tensor,
     mask: torch.Tensor,
     cfg: ForecastTrainConfig,
+    date_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Loss over labelled bars only. Returns a zero-grad-safe scalar."""
     weights = mask.to(mean.dtype)
@@ -100,14 +102,50 @@ def masked_loss(
         aux = 0.5 * (inv_var * resid_sq) + log_sigma
         per_bar = per_bar + cfg.sigma_aux_weight * aux
     location = (per_bar * weights).sum() / denom
-    if cfg.ic_loss_weight <= 0:
-        return location
-    ic_term = masked_correlation_loss(
-        mean, target, mask, winsor=cfg.ic_winsor
-    )
-    if not torch.isfinite(ic_term):
-        return location
-    return location + cfg.ic_loss_weight * ic_term
+    total = cfg.location_loss_weight * location
+    if cfg.ic_loss_weight > 0:
+        ic_term = masked_correlation_loss(
+            mean, target, mask, winsor=cfg.ic_winsor, date_ids=date_ids
+        )
+        if torch.isfinite(ic_term):
+            total = total + cfg.ic_loss_weight * ic_term
+    if cfg.sign_loss_weight > 0:
+        sign_term = masked_sign_loss(
+            mean, target, mask, min_abs=cfg.sign_min_abs
+        )
+        if torch.isfinite(sign_term):
+            total = total + cfg.sign_loss_weight * sign_term
+    if cfg.rank_loss_weight > 0:
+        rank_term = masked_pairwise_rank_loss(mean, target, mask, date_ids=date_ids)
+        if torch.isfinite(rank_term):
+            total = total + cfg.rank_loss_weight * rank_term
+    if cfg.pred_std_weight > 0:
+        scale_term = masked_pred_std_loss(mean, target, mask)
+        if torch.isfinite(scale_term):
+            total = total + cfg.pred_std_weight * scale_term
+    return total
+
+
+def _expand_date_ids(
+    date_ids: torch.Tensor | None, mask: torch.Tensor
+) -> torch.Tensor | None:
+    if date_ids is None:
+        return None
+    if date_ids.shape == mask.shape:
+        return date_ids
+    if date_ids.dim() == 1 and date_ids.size(0) == mask.size(0):
+        return date_ids.unsqueeze(-1).expand_as(mask)
+    return date_ids.reshape(mask.shape)
+
+
+def _pearson_1d(pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    pc = pred - pred.mean()
+    yc = y - y.mean()
+    var_p = (pc * pc).sum()
+    var_y = (yc * yc).sum()
+    if float(var_p.detach()) <= 1e-8 or float(var_y.detach()) <= 1e-8:
+        return pred.new_zeros(())
+    return (pc * yc).sum() / torch.sqrt(var_p * var_y).clamp(min=1e-8)
 
 
 def masked_correlation_loss(
@@ -116,30 +154,130 @@ def masked_correlation_loss(
     mask: torch.Tensor,
     *,
     winsor: float = 3.0,
+    date_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``1 - Pearson`` on labelled bars, averaged over sequences in the batch.
-
-    Pred and target are winsorized so a split-sized jump cannot dominate.
-    Huber still owns prediction scale; this term is scale-free.
-    """
-    weights = mask.to(dtype=mean.dtype)
+    """``1 - Pearson`` on labelled bars; within-date when ``date_ids`` has breadth."""
     cap = float(winsor)
     pred = mean.clamp(-cap, cap)
     y = target.clamp(-cap, cap)
-    n = weights.sum(dim=-1)
-    denom_n = n.clamp(min=1.0)
-    mu_p = (pred * weights).sum(dim=-1) / denom_n
-    mu_y = (y * weights).sum(dim=-1) / denom_n
-    pc = (pred - mu_p.unsqueeze(-1)) * weights
-    yc = (y - mu_y.unsqueeze(-1)) * weights
-    cov = (pc * yc).sum(dim=-1)
-    var_p = (pc * pc).sum(dim=-1)
-    var_y = (yc * yc).sum(dim=-1)
-    valid = (n >= 2) & (var_p > 1e-8) & (var_y > 1e-8)
-    if not bool(valid.any()):
+    dates = _expand_date_ids(date_ids, mask)
+    if dates is not None:
+        sel = mask.bool()
+        p = pred[sel]
+        yy = y[sel]
+        keys = dates[sel]
+        rhos: list[torch.Tensor] = []
+        for key in keys.unique():
+            m = keys == key
+            if int(m.sum()) < 3:
+                continue
+            rho = _pearson_1d(p[m], yy[m])
+            if torch.isfinite(rho):
+                rhos.append(rho)
+        if rhos:
+            return 1.0 - torch.stack(rhos).mean()
+    weights = mask.to(dtype=mean.dtype).reshape(-1)
+    pred_f = pred.reshape(-1)
+    y_f = y.reshape(-1)
+    wsum = weights.sum()
+    if float(wsum.detach()) < 2:
         return mean.new_zeros(())
-    rho = cov[valid] / torch.sqrt(var_p[valid] * var_y[valid]).clamp(min=1e-8)
-    return 1.0 - rho.mean()
+    mu_p = (pred_f * weights).sum() / wsum
+    mu_y = (y_f * weights).sum() / wsum
+    pc = (pred_f - mu_p) * weights
+    yc = (y_f - mu_y) * weights
+    cov = (pc * yc).sum()
+    var_p = (pc * pc).sum()
+    var_y = (yc * yc).sum()
+    if float(var_p.detach()) <= 1e-8 or float(var_y.detach()) <= 1e-8:
+        return mean.new_zeros(())
+    rho = cov / torch.sqrt(var_p * var_y).clamp(min=1e-8)
+    return 1.0 - rho
+
+
+def masked_sign_loss(
+    mean: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    min_abs: float = 0.25,
+) -> torch.Tensor:
+    """BCE on the sign of labelled moves larger than ``min_abs`` vol units."""
+    weights = mask.to(dtype=mean.dtype) * (target.abs() >= float(min_abs)).to(
+        dtype=mean.dtype
+    )
+    denom = weights.sum()
+    if float(denom.detach()) <= 0:
+        return mean.new_zeros(())
+    labels = (target > 0).to(dtype=mean.dtype)
+    # Sign BCE on raw logits wants |mean| -> inf. Divide by batch std so
+    # this term only rotates predictions, matching Pearson.
+    labelled = mask.bool()
+    scale = mean.detach()[labelled].std(unbiased=False).clamp(min=1.0)
+    per_bar = F.binary_cross_entropy_with_logits(
+        mean / scale, labels, reduction="none"
+    )
+    return (per_bar * weights).sum() / denom
+
+
+def _ranknet(pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    if pred.numel() < 2:
+        return pred.new_zeros(())
+    scale = pred.detach().std(unbiased=False).clamp(min=1.0)
+    unit = pred / scale
+    diff_p = unit.unsqueeze(0) - unit.unsqueeze(1)
+    diff_y = y.unsqueeze(0) - y.unsqueeze(1)
+    valid = diff_y.abs() > 1e-6
+    if not bool(valid.any()):
+        return pred.new_zeros(())
+    return F.softplus(-diff_p * diff_y.sign())[valid].mean()
+
+
+def masked_pairwise_rank_loss(
+    mean: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    max_points: int = 256,
+    date_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """RankNet: labelled pairs should keep the target order (within date if possible)."""
+    dates = _expand_date_ids(date_ids, mask)
+    sel = mask.bool()
+    pred = mean[sel]
+    y = target[sel]
+    if dates is not None:
+        keys = dates[sel]
+        parts: list[torch.Tensor] = []
+        for key in keys.unique():
+            m = keys == key
+            if int(m.sum()) < 2:
+                continue
+            parts.append(_ranknet(pred[m], y[m]))
+        if parts:
+            return torch.stack(parts).mean()
+    n = int(pred.numel())
+    if n < 2:
+        return mean.new_zeros(())
+    if n > max_points:
+        idx = torch.randperm(n, device=pred.device)[:max_points]
+        pred = pred[idx]
+        y = y[idx]
+    return _ranknet(pred, y)
+
+
+def masked_pred_std_loss(
+    mean: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Keep predicted vol close to labelled target vol."""
+    sel = mask.bool()
+    if int(sel.sum()) < 2:
+        return mean.new_zeros(())
+    pred = mean[sel]
+    y = target[sel]
+    return (pred.std(unbiased=False) - y.std(unbiased=False).detach()).pow(2)
 
 
 def _pearson(a: np.ndarray, b: np.ndarray) -> float:
@@ -193,10 +331,8 @@ def compute_metrics(
     ic_raw = _pearson(pred, target)
     ic_winsor = _pearson(np.clip(pred, -cap, cap), np.clip(target, -cap, cap))
     ic_spearman = _spearman(pred, target)
-    select_parts = [v for v in (ic_winsor, ic_spearman) if np.isfinite(v)]
-    ic_select = float(np.mean(select_parts)) if select_parts else float("nan")
     return {
-        "ic": ic_select,
+        "ic": ic_raw,
         "ic_raw": ic_raw,
         "ic_winsor": ic_winsor,
         "ic_spearman": ic_spearman,
@@ -209,6 +345,29 @@ def compute_metrics(
         "target_std_bps": float(np.std(target_bps)),
         "n": float(pred.size),
     }
+
+
+def mean_cs_ic(
+    pred: np.ndarray,
+    target: np.ndarray,
+    dates: np.ndarray,
+    *,
+    min_names: int = 3,
+) -> float:
+    """Mean Pearson IC across names on each date (the industry CS IC)."""
+    if pred.size == 0 or dates.size != pred.size:
+        return float("nan")
+    ics: list[float] = []
+    for key in np.unique(dates):
+        sel = dates == key
+        if int(sel.sum()) < min_names:
+            continue
+        rho = _pearson(pred[sel], target[sel])
+        if np.isfinite(rho):
+            ics.append(rho)
+    if not ics:
+        return float("nan")
+    return float(np.mean(ics))
 
 
 # --------------------------------------------------------------------------
@@ -246,16 +405,21 @@ def decide_val_plateau(
         return n, lr_scale, True, False, (
             f"early stop: no val IC gain in {n} evals"
         )
-    if plateau_evals > 0 and n >= plateau_evals:
+    plateau_now = (
+        plateau_evals > 0
+        and n >= plateau_evals
+        and n % plateau_evals == 0
+    )
+    if plateau_now:
         factor = min(1.0, max(1e-6, float(plateau_factor)))
         floor = max(0.0, float(min_scale))
         new_scale = max(floor, lr_scale * factor)
         if new_scale < lr_scale:
-            return 0, new_scale, False, True, (
+            return n, new_scale, False, True, (
                 f"val IC plateau for {n} evals: lr scale "
                 f"{lr_scale:.3g} -> {new_scale:.3g} (restoring best.pt, continuing)"
             )
-        return 0, lr_scale, False, False, (
+        return n, lr_scale, False, False, (
             f"val IC plateau for {n} evals: lr scale already at floor "
             f"({lr_scale:.3g}), continuing"
         )
@@ -274,17 +438,26 @@ def evaluate(
     preds: list[np.ndarray] = []
     targets: list[np.ndarray] = []
     scales: list[np.ndarray] = []
+    date_list: list[np.ndarray] = []
     weighted_loss = 0.0
     total_weight = 0.0
 
-    for i, (x, y, mask, scale) in enumerate(loader):
+    for i, batch in enumerate(loader):
         if max_batches is not None and i >= max_batches:
             break
-        x, y, mask, scale = (t.to(device) for t in (x, y, mask, scale))
+        x, y, mask, scale = batch[0], batch[1], batch[2], batch[3]
+        date_ids = batch[4] if len(batch) > 4 else None
+        x, y, mask, scale = (
+            t.to(device, non_blocking=True) for t in (x, y, mask, scale)
+        )
+        if date_ids is not None:
+            date_ids = date_ids.to(device, non_blocking=True)
         with autocast_context(device, train_cfg.precision):
             mean, log_sigma = model(x)
         mean = mean.float()
-        loss = masked_loss(mean, log_sigma.float(), y, mask, train_cfg)
+        loss = masked_loss(
+            mean, log_sigma.float(), y, mask, train_cfg, date_ids=date_ids
+        )
         weight = float(mask.to(mean.dtype).sum())
         if weight > 0 and math.isfinite(float(loss)):
             weighted_loss += float(loss) * weight
@@ -293,16 +466,69 @@ def evaluate(
         preds.append(mean[sel].cpu().numpy())
         targets.append(y[sel].cpu().numpy())
         scales.append(scale[sel].cpu().numpy())
+        if date_ids is not None:
+            d = date_ids
+            if d.dim() == 1 and d.size(0) == mask.size(0):
+                d = d.unsqueeze(-1).expand_as(mask)
+            date_list.append(d[sel].cpu().numpy())
 
     model.train()
-    metrics = compute_metrics(
-        np.concatenate(preds) if preds else np.empty(0),
-        np.concatenate(targets) if targets else np.empty(0),
-        np.concatenate(scales) if scales else np.empty(0),
-        winsor=train_cfg.ic_winsor,
-    )
+    pred_np = np.concatenate(preds) if preds else np.empty(0)
+    tgt_np = np.concatenate(targets) if targets else np.empty(0)
+    scale_np = np.concatenate(scales) if scales else np.empty(0)
+    metrics = compute_metrics(pred_np, tgt_np, scale_np, winsor=train_cfg.ic_winsor)
+    if date_list:
+        dates_np = np.concatenate(date_list)
+        metrics["cs_ic"] = mean_cs_ic(pred_np, tgt_np, dates_np)
     metrics["loss"] = weighted_loss / total_weight if total_weight > 0 else float("nan")
     return metrics
+
+
+def _tag_skip_lr_mult(
+    optimizer: torch.optim.Optimizer,
+    model: ReturnForecaster,
+    mult: float,
+) -> None:
+    """Split param groups so the linear skip can use a lower LR after ridge."""
+    skip_ids = {id(p) for p in model.skip.parameters()}
+    new_groups: list[dict[str, Any]] = []
+    for group in optimizer.param_groups:
+        base = {k: v for k, v in group.items() if k != "params"}
+        rest = [p for p in group["params"] if id(p) not in skip_ids]
+        skip = [p for p in group["params"] if id(p) in skip_ids]
+        if rest:
+            new_groups.append({**base, "params": rest, "lr_mult": 1.0})
+        if skip:
+            new_groups.append({**base, "params": skip, "lr_mult": float(mult)})
+    optimizer.param_groups = new_groups
+
+
+def apply_ridge_skip(
+    model: ReturnForecaster,
+    bundle: dict[str, Any],
+    train_cfg: ForecastTrainConfig,
+    device: torch.device,
+) -> float:
+    """Copy a train-only ridge readout into ``model.skip``. Returns in-sample IC."""
+    if (not model.config.linear_skip) or float(train_cfg.ridge_skip) <= 0:
+        return float("nan")
+    weights, bias, ic = fit_ridge_readout(
+        bundle["train_symbols"],
+        bundle["feature_mean"],
+        bundle["feature_std"],
+        ridge=float(train_cfg.ridge_skip),
+    )
+    with torch.no_grad():
+        model.skip.weight.copy_(
+            torch.from_numpy(weights).to(device=device, dtype=model.skip.weight.dtype).unsqueeze(0)
+        )
+        model.skip.bias.copy_(
+            torch.tensor([bias], device=device, dtype=model.skip.bias.dtype)
+        )
+    if train_cfg.freeze_skip:
+        model.skip.weight.requires_grad_(False)
+        model.skip.bias.requires_grad_(False)
+    return ic
 
 
 def _fmt(metrics: dict[str, float]) -> str:
@@ -311,6 +537,7 @@ def _fmt(metrics: dict[str, float]) -> str:
     return (
         f"loss={metrics['loss']:.5f} ic={metrics['ic']:+.4f} "
         f"spearman={spearman:+.4f} raw={raw:+.4f} "
+        f"cs_ic={metrics.get('cs_ic', float('nan')):+.4f} "
         f"r2={metrics['r2']:+.5f} dir={metrics['direction']:.4f} "
         f"pred_std={metrics['pred_std_bps']:.2f}bps n={int(metrics['n'])}"
     )
@@ -364,43 +591,54 @@ def _train(
             f"linear_skip={model_cfg.linear_skip} "
             f"dynamic_weights={model_cfg.dynamic_weights} "
             f"loss={train_cfg.loss} ic_loss_weight={train_cfg.ic_loss_weight} "
+            f"ridge_skip={train_cfg.ridge_skip} "
             f"heteroscedastic={model_cfg.heteroscedastic}"
         )
         autocast_context(device, train_cfg.precision, log_fn=log_fn)
 
+    skip_ic = apply_ridge_skip(model, bundle, train_cfg, device)
+    if log_fn and np.isfinite(skip_ic):
+        log_fn(f"ridge skip in-sample IC={skip_ic:+.4f} (train labelled bars)")
+
+    loader_kwargs = {
+        **dataloader_kwargs(device, train_cfg.num_workers),
+        "collate_fn": collate_forecast,
+    }
+    drop_last = (
+        (not train_cfg.skip_only)
+        and len(datasets["train"]) >= 2 * max(1, train_cfg.batch_size)
+    )
     train_loader = DataLoader(
         datasets["train"],
         batch_size=train_cfg.batch_size,
-        shuffle=True,
-        drop_last=True,
-        num_workers=train_cfg.num_workers,
+        shuffle=not train_cfg.skip_only,
+        drop_last=drop_last,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         datasets["val"],
         batch_size=train_cfg.batch_size,
         shuffle=False,
-        num_workers=train_cfg.num_workers,
+        **loader_kwargs,
     )
     test_loader = DataLoader(
         datasets["test"],
         batch_size=train_cfg.batch_size,
         shuffle=False,
-        num_workers=train_cfg.num_workers,
+        **loader_kwargs,
+    )
+    train_eval_loader = DataLoader(
+        datasets["train"],
+        batch_size=train_cfg.batch_size,
+        shuffle=False,
+        **loader_kwargs,
     )
 
-    steps_per_epoch = len(train_loader)
-    require_nonempty_loader(train_loader, "train")
+    steps_per_epoch = max(1, len(train_loader))
     if train_cfg.max_steps is None:
         total_steps = steps_per_epoch * train_cfg.epochs
     else:
-        total_steps = train_cfg.max_steps
-    if total_steps < 1:
-        raise RuntimeError("total_steps is 0; check epochs, max_steps, and dataset size")
-    optimizer = build_optimizer(
-        model, lr=train_cfg.lr, weight_decay=train_cfg.weight_decay
-    )
-    use_scaler = train_cfg.precision == "fp16" and device.type == "cuda"
-    scaler = torch.amp.GradScaler(device.type, enabled=use_scaler)
+        total_steps = int(train_cfg.max_steps)
 
     ckpt_dir = anchor_to_repo(train_cfg.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -422,6 +660,53 @@ def _train(
             metrics=metrics,
         )
 
+    t0 = time.perf_counter()
+    if log_fn:
+        log_fn(f"steps/epoch={steps_per_epoch} total_steps={total_steps}")
+    skip_only_train = evaluate(model, train_eval_loader, device, train_cfg)
+    skip_only_val = evaluate(model, val_loader, device, train_cfg)
+    skip_only_test = evaluate(model, test_loader, device, train_cfg)
+    if log_fn:
+        log_fn(f"  skip-only train: {_fmt(skip_only_train)}")
+        log_fn(f"  skip-only val: {_fmt(skip_only_val)}")
+        log_fn(f"  skip-only test: {_fmt(skip_only_test)}")
+
+    if train_cfg.skip_only:
+        save(ckpt_dir / "best.pt", 0, skip_only_val)
+        save(ckpt_dir / "last.pt", 0, skip_only_val)
+        summary = {
+            "best_val_ic": skip_only_val.get("ic", float("nan")),
+            "best_step": 0,
+            "history": [],
+            "test": skip_only_test,
+            "skip_only_train": skip_only_train,
+            "skip_only_val": skip_only_val,
+            "skip_only_test": skip_only_test,
+            "interrupted": False,
+            "last_step": 0,
+            "n_params": n_params,
+            "device": str(device),
+            "elapsed_sec": time.perf_counter() - t0,
+            "symbols": bundle["meta"],
+            "cross_section": bundle.get("cross_section", False),
+            "skip_only": True,
+        }
+        (ckpt_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
+        if log_fn:
+            log_fn(f"skip-only run wrote {ckpt_dir / 'best.pt'}")
+        return summary
+
+    if not train_cfg.skip_only:
+        require_nonempty_loader(train_loader, "train")
+    if total_steps < 1:
+        raise RuntimeError("total_steps is 0; check epochs, max_steps, and dataset size")
+    optimizer = build_optimizer(
+        model, lr=train_cfg.lr, weight_decay=train_cfg.weight_decay
+    )
+    _tag_skip_lr_mult(optimizer, model, train_cfg.skip_lr_mult)
+    use_scaler = train_cfg.precision == "fp16" and device.type == "cuda"
+    scaler = torch.amp.GradScaler(device.type, enabled=use_scaler)
+
     history: list[dict[str, Any]] = []
     best_ic = -float("inf")
     best_step = -1
@@ -429,11 +714,7 @@ def _train(
     lr_scale = 1.0
     data_iter = cycle_loader(train_loader)
     running: list[float] = []
-    t0 = time.perf_counter()
     model.train()
-
-    if log_fn:
-        log_fn(f"steps/epoch={steps_per_epoch} total_steps={total_steps}")
 
     last_completed = 0
     interrupted = False
@@ -441,15 +722,25 @@ def _train(
         for step in range(total_steps):
             lr = lr_at(step, total_steps, train_cfg) * lr_scale
             for group in optimizer.param_groups:
-                group["lr"] = lr
+                group["lr"] = lr * float(group.get("lr_mult", 1.0))
 
-            x, y, mask, _scale = next(data_iter)
-            x, y, mask = x.to(device), y.to(device), mask.to(device)
+            batch = next(data_iter)
+            x, y, mask = batch[0], batch[1], batch[2]
+            date_ids = batch[4] if len(batch) > 4 else None
+            # non_blocking pairs with pin_memory: the H2D copy overlaps the
+            # optimizer bookkeeping instead of stalling the step.
+            x, y, mask = (
+                t.to(device, non_blocking=True) for t in (x, y, mask)
+            )
+            if date_ids is not None:
+                date_ids = date_ids.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, train_cfg.precision):
                 mean, log_sigma = model(x)
-            loss = masked_loss(mean.float(), log_sigma.float(), y, mask, train_cfg)
+            loss = masked_loss(
+                mean.float(), log_sigma.float(), y, mask, train_cfg, date_ids=date_ids
+            )
             if not torch.isfinite(loss):
                 raise RuntimeError(f"non-finite loss at step {step}")
 
@@ -487,6 +778,14 @@ def _train(
                 history.append(val)
                 if log_fn:
                     log_fn(f"  eval step {step + 1}: {_fmt(val)}")
+                    train_snap = evaluate(
+                        model,
+                        train_loader,
+                        device,
+                        train_cfg,
+                        max_batches=8,
+                    )
+                    log_fn(f"  train sample: {_fmt(train_snap)}")
                 save(ckpt_dir / "last.pt", step + 1, val)
 
                 ic = val["ic"]
@@ -568,18 +867,24 @@ def _train(
                 log_fn(f"TEST (last checkpoint; no best.pt was saved): {_fmt(test)}")
             else:
                 log_fn(f"TEST (in-memory weights; no checkpoint saved): {_fmt(test)}")
+            log_fn(f"TEST skip-only (ridge, frozen): {_fmt(skip_only_test)}")
 
     summary = {
         "best_val_ic": best_ic,
         "best_step": best_step,
         "history": history,
         "test": test,
+        "skip_only_train": skip_only_train,
+        "skip_only_val": skip_only_val,
+        "skip_only_test": skip_only_test,
         "interrupted": interrupted,
         "last_step": last_completed,
         "n_params": n_params,
         "device": str(device),
         "elapsed_sec": time.perf_counter() - t0,
         "symbols": bundle["meta"],
+        "cross_section": bundle.get("cross_section", False),
+        "skip_only": False,
     }
     (ckpt_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
     return summary
@@ -629,11 +934,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="label bars whose t+horizon slot was not a real print (not recommended)",
     )
+    g.add_argument(
+        "--allow-mixed-prices",
+        action="store_true",
+        help="do not fail when weekly lag-1 autocorr looks like mixed adjusted/raw closes",
+    )
+    g.add_argument(
+        "--no-residual-target",
+        action="store_true",
+        help="predict raw next-bar return instead of trailing-beta residual vs SPY",
+    )
+    g.add_argument(
+        "--no-eval-last-bar",
+        action="store_true",
+        help="score every labelled bar instead of unique last-bar dates",
+    )
+    g.add_argument(
+        "--no-global-split",
+        action="store_true",
+        help="split each symbol on its own session count (legacy)",
+    )
 
     g = p.add_argument_group("model")
-    g.add_argument("--d-model", type=int, default=m.d_model)
-    g.add_argument("--n-layer", type=int, default=m.n_layer)
-    g.add_argument("--d-state", type=int, default=m.d_state)
+    g.add_argument("--d-model", type=int, default=None)
+    g.add_argument("--n-layer", type=int, default=None)
+    g.add_argument("--d-state", type=int, default=None)
     g.add_argument("--expand", type=int, default=m.expand)
     g.add_argument("--dropout", type=float, default=m.dropout)
     g.add_argument("--dynamic-weights", action="store_true")
@@ -667,6 +992,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=t.ic_loss_weight,
         help="weight on 1-Pearson mixed into the mean loss (0 disables)",
     )
+    g.add_argument(
+        "--location-loss-weight",
+        type=float,
+        default=t.location_loss_weight,
+        help="weight on Huber/MSE (scale). Keep below --ic-loss-weight",
+    )
+    g.add_argument(
+        "--sign-loss-weight",
+        type=float,
+        default=t.sign_loss_weight,
+        help="weight on sign BCE for moves larger than sign_min_abs",
+    )
+    g.add_argument(
+        "--rank-loss-weight",
+        type=float,
+        default=t.rank_loss_weight,
+        help="weight on pairwise RankNet over labelled bars in the batch",
+    )
+    g.add_argument(
+        "--ridge-skip",
+        type=float,
+        default=t.ridge_skip,
+        help="ridge lambda for the linear skip init (0 = Xavier, no closed-form fit)",
+    )
+    g.add_argument(
+        "--no-freeze-skip",
+        action="store_true",
+        help="let AdamW keep updating the ridge skip (default: freeze after init)",
+    )
+    g.add_argument(
+        "--skip-only",
+        action="store_true",
+        help="fit the ridge skip, log last-bar train/val/test IC, write best.pt, exit",
+    )
     g.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default=t.precision)
     g.add_argument("--seed", type=int, default=t.seed)
     g.add_argument("--eval-interval", type=int, default=t.eval_interval)
@@ -677,7 +1036,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--early-stop-evals",
         type=int,
         default=t.early_stop_evals,
-        help="stop after N evals with no val-IC gain (0 = never; default)",
+        help="stop after N evals with no val-IC gain (0 = never; default 24)",
     )
     g.add_argument(
         "--lr-plateau-evals",
@@ -708,6 +1067,7 @@ def configs_from_cli(
 
     preset = interval_data_kwargs(args.interval)
     ssm = interval_model_kwargs(args.interval)
+    m = ForecastModelConfig()
     data_cfg = DataConfig(
         data_dir=args.data_dir,
         interval=args.interval,
@@ -727,12 +1087,16 @@ def configs_from_cli(
         warmup_bars=preset["warmup_bars"],
         max_abs_log_return=preset["max_abs_log_return"],
         supervise_last=preset["supervise_last"],
+        eval_last_bar=not args.no_eval_last_bar,
+        global_calendar_split=not args.no_global_split,
+        residual_target=not args.no_residual_target,
+        allow_mixed_prices=args.allow_mixed_prices,
     )
     model_cfg = ForecastModelConfig(
         n_features=len(FEATURE_NAMES),
-        d_model=args.d_model,
-        n_layer=args.n_layer,
-        d_state=args.d_state,
+        d_model=ssm.get("d_model", m.d_model) if args.d_model is None else args.d_model,
+        n_layer=ssm.get("n_layer", m.n_layer) if args.n_layer is None else args.n_layer,
+        d_state=ssm.get("d_state", m.d_state) if args.d_state is None else args.d_state,
         expand=args.expand,
         dropout=args.dropout,
         heteroscedastic=heteroscedastic,
@@ -750,6 +1114,12 @@ def configs_from_cli(
         weight_decay=args.weight_decay,
         loss=args.loss,
         ic_loss_weight=args.ic_loss_weight,
+        location_loss_weight=args.location_loss_weight,
+        sign_loss_weight=args.sign_loss_weight,
+        rank_loss_weight=args.rank_loss_weight,
+        ridge_skip=args.ridge_skip,
+        freeze_skip=not args.no_freeze_skip,
+        skip_only=args.skip_only,
         sigma_aux_weight=(
             0.0
             if (not heteroscedastic or args.loss == "gaussian")

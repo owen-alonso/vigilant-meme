@@ -26,6 +26,7 @@ from mamba_lm.training_utils import (
     autocast_context,
     build_optimizer,
     cycle_loader,
+    dataloader_kwargs,
     grads_finite,
     keep_awake,
     lr_linear_warmup,
@@ -122,19 +123,20 @@ def _train(
         log_fn(f"device={device} precision={train_cfg.precision} vocab={tokenizer.vocab_size}")
         autocast_context(device, train_cfg.precision, log_fn=log_fn)
 
+    loader_kwargs = dataloader_kwargs(device, train_cfg.num_workers)
     train_loader = DataLoader(
         train_ds,
         batch_size=train_cfg.batch_size,
         shuffle=True,
         drop_last=True,
-        num_workers=train_cfg.num_workers,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=train_cfg.batch_size,
         shuffle=False,
         drop_last=False,
-        num_workers=train_cfg.num_workers,
+        **loader_kwargs,
     )
     require_nonempty_loader(train_loader, "train")
     optimizer = build_optimizer(
@@ -185,8 +187,8 @@ def _train(
                 group["lr"] = lr
 
             x, y = next(data_iter)
-            x = x.to(device)
-            y = y.to(device)
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, train_cfg.precision):

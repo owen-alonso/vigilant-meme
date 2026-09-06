@@ -10,10 +10,17 @@ import pytest
 
 from forecast.config import DataConfig, ForecastModelConfig, ForecastTrainConfig, validate_loss_head
 from forecast.data import (
+    FEATURE_NAMES,
+    SequenceDataset,
+    SymbolArrays,
     _session_naive_datetime,
+    attach_cross_section_features,
+    attach_residual_target,
+    build_datasets,
     build_session_grid,
     compute_features,
     embargo_calendar_horizon,
+    fit_ridge_readout,
     load_bars,
 )
 from forecast.model import ReturnForecaster
@@ -239,7 +246,7 @@ def test_val_plateau_cuts_lr_instead_of_stopping():
     )
     assert stop is False
     assert restore is True
-    assert n == 0
+    assert n == 2
     assert scale == pytest.approx(0.5)
     assert msg is not None and "continuing" in msg
 
@@ -348,6 +355,111 @@ def test_correlation_loss_rewards_alignment():
     assert float(aligned) == pytest.approx(0.0, abs=1e-5)
 
 
+def test_correlation_loss_is_pooled_across_sequences():
+    import torch
+
+    mean = torch.tensor([[1.0, 2.0, 3.0, 4.0], [-1.0, -2.0, 0.0, 0.0]])
+    target = torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 0.0, 0.0]])
+    mask = torch.tensor([[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 0.0, 0.0]])
+    pooled = float(masked_correlation_loss(mean, target, mask))
+    # Four aligned bars outweigh two flipped ones; per-sequence mean of
+    # (0 + 2) / 2 would stay at 1.0.
+    assert pooled < 0.5
+
+
+def test_feature_count_matches_model_default():
+    assert len(FEATURE_NAMES) == ForecastModelConfig().n_features
+
+
+def test_cross_section_peer_is_the_other_name_same_bar():
+    cfg = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+    )
+    a = compute_features(_daily_grid(40), cfg)
+    b_grid = _daily_grid(40)
+    b_grid["close"] = b_grid["close"] * 1.5 + np.linspace(0, 2.0, 40)
+    b = compute_features(b_grid, cfg)
+    a["symbol"] = "AAA"
+    b["symbol"] = "BBB"
+    out = attach_cross_section_features({"AAA": a, "BBB": b}, cfg)
+    mid = 20
+    assert out["AAA"]["peer_ret_1"].iloc[mid] == pytest.approx(
+        float(out["BBB"]["ret_1"].iloc[mid]), abs=1e-5
+    )
+    assert out["BBB"]["peer_ret_1"].iloc[mid] == pytest.approx(
+        float(out["AAA"]["ret_1"].iloc[mid]), abs=1e-5
+    )
+    expected_mkt = 0.5 * (
+        float(out["AAA"]["ret_1"].iloc[mid]) + float(out["BBB"]["ret_1"].iloc[mid])
+    )
+    assert out["AAA"]["mkt_ret_1"].iloc[mid] == pytest.approx(expected_mkt, abs=1e-5)
+
+
+def test_cross_section_does_not_see_future_peer_return():
+    cfg = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+    )
+    a = compute_features(_daily_grid(40), cfg)
+    b = compute_features(_daily_grid(40), cfg)
+    a["symbol"] = "AAA"
+    b["symbol"] = "BBB"
+    base = attach_cross_section_features({"AAA": a.copy(), "BBB": b.copy()}, cfg)
+    spiked = b.copy()
+    spiked.loc[spiked.index[-1], "ret_1"] = 9.0
+    alt = attach_cross_section_features({"AAA": a.copy(), "BBB": spiked}, cfg)
+    assert base["AAA"]["peer_ret_1"].iloc[10] == pytest.approx(
+        float(alt["AAA"]["peer_ret_1"].iloc[10]), abs=1e-8
+    )
+
+
+def test_ridge_readout_recovers_linear_target():
+    n, f = 80, 4
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(n, f)).astype(np.float32)
+    true_w = np.array([0.4, -0.2, 0.1, 0.0], dtype=np.float32)
+    y = x @ true_w + 0.05
+    sym = SymbolArrays(
+        symbol="T",
+        features=x,
+        target=y.astype(np.float32),
+        scale=np.ones(n, dtype=np.float32),
+        valid=np.ones(n, dtype=bool),
+    )
+    mean = np.zeros(f, dtype=np.float32)
+    std = np.ones(f, dtype=np.float32)
+    w, b, ic = fit_ridge_readout([sym], mean, std, ridge=1e-4)
+    assert ic > 0.99
+    assert np.allclose(w, true_w, atol=0.08)
+    pred = x @ w + b
+    assert float(pred.std()) == pytest.approx(abs(ic) * float(y.std()), rel=0.05)
+
+
+def test_val_plateau_keeps_counter_so_early_stop_can_fire():
+    n, scale, stop, restore, msg = decide_val_plateau(
+        improved=False,
+        evals_without_gain=3,
+        lr_scale=0.5,
+        plateau_evals=2,
+        plateau_factor=0.5,
+        min_scale=0.01,
+        early_stop_evals=4,
+    )
+    assert stop is True
+    assert restore is False
+    assert n == 4
+    assert msg is not None and "early stop" in msg
+
+
 def test_winsorized_ic_downweights_split_outlier():
     pred = np.array([0.3, 0.2, 0.1, 0.05, 0.0], dtype=np.float64)
     target = np.array([0.3, 0.2, 0.1, 0.05, -40.0], dtype=np.float64)
@@ -355,9 +467,11 @@ def test_winsorized_ic_downweights_split_outlier():
     metrics = compute_metrics(pred, target, scale, winsor=3.0)
     inlier = compute_metrics(pred[:-1], target[:-1], scale[:-1], winsor=3.0)
     assert inlier["ic_raw"] == pytest.approx(1.0, abs=1e-6)
-    # Spearman treats the jump as one rank, not 40 vol units.
     assert metrics["ic_spearman"] > metrics["ic_raw"]
-    assert abs(metrics["ic"] - inlier["ic"]) < abs(metrics["ic_raw"] - inlier["ic_raw"])
+    assert metrics["ic"] == pytest.approx(metrics["ic_raw"])
+    assert abs(metrics["ic_winsor"] - inlier["ic_raw"]) < abs(
+        metrics["ic_raw"] - inlier["ic_raw"]
+    )
 
 
 def test_weekly_cli_uses_week_scale_context():
@@ -366,7 +480,236 @@ def test_weekly_cli_uses_week_scale_context():
     assert data_cfg.seq_len == 52
     assert data_cfg.vol_halflife == 12
     assert data_cfg.z_window == 52
-    assert data_cfg.supervise_last == 8
+    assert data_cfg.supervise_last == 1
+    assert model_cfg.d_model == 32
+    assert model_cfg.n_layer == 1
+    assert model_cfg.d_state == 8
     assert model_cfg.linear_skip is True
     assert model_cfg.dt_min == pytest.approx(0.05)
-    assert train_cfg.ic_loss_weight == pytest.approx(0.5)
+    assert train_cfg.ic_loss_weight == pytest.approx(2.0)
+    assert train_cfg.early_stop_evals == 24
+    assert train_cfg.ridge_skip == pytest.approx(1.0)
+    assert train_cfg.freeze_skip is True
+    assert train_cfg.skip_only is False
+    assert data_cfg.eval_last_bar is True
+    assert data_cfg.global_calendar_split is True
+    assert data_cfg.residual_target is True
+
+
+def test_sequence_dataset_last_bar_is_six_tuple():
+    n, f = 20, 4
+    dates = np.arange(n, dtype=np.int64)
+    sym = SymbolArrays(
+        symbol="AAA",
+        features=np.ones((n, f), dtype=np.float32),
+        target=np.linspace(-1, 1, n, dtype=np.float32),
+        scale=np.ones(n, dtype=np.float32),
+        valid=np.ones(n, dtype=bool),
+        dates=dates,
+    )
+    ds = SequenceDataset([sym], seq_len=8, stride=1, last_bar_only=True, min_context=2)
+    x, y, mask, scale, date_id, sym_idx = ds[0]
+    assert x.shape == (8, f)
+    assert int(mask.sum()) == 1
+    assert bool(mask[-1])
+    assert int(date_id) == int(dates[7])
+    assert int(sym_idx) == 0
+
+
+def test_spy_is_mkt_feature_not_equal_weight():
+    cfg = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+        benchmark_symbol="SPY",
+    )
+    a = compute_features(_daily_grid(40), cfg)
+    b_grid = _daily_grid(40)
+    b_grid["close"] = b_grid["close"] * 1.2 + np.linspace(0, 1.0, 40)
+    b = compute_features(b_grid, cfg)
+    spy_grid = _daily_grid(40)
+    spy_grid["close"] = spy_grid["close"] * 0.9 + np.linspace(0, 3.0, 40)
+    spy = compute_features(spy_grid, cfg)
+    a["symbol"], b["symbol"], spy["symbol"] = "AAPL", "MSFT", "SPY"
+    out = attach_cross_section_features({"AAPL": a, "MSFT": b, "SPY": spy}, cfg)
+    mid = 20
+    assert out["AAPL"]["mkt_ret_1"].iloc[mid] == pytest.approx(
+        float(out["SPY"]["ret_1"].iloc[mid]), abs=1e-5
+    )
+    ew = 0.5 * (
+        float(out["AAPL"]["ret_1"].iloc[mid]) + float(out["MSFT"]["ret_1"].iloc[mid])
+    )
+    assert out["AAPL"]["mkt_ret_1"].iloc[mid] != pytest.approx(ew, abs=1e-4)
+    assert out["AAPL"]["peer_ret_1"].iloc[mid] == pytest.approx(
+        float(out["MSFT"]["ret_1"].iloc[mid]), abs=1e-5
+    )
+
+
+def test_residual_target_uses_future_spy_in_label_not_features():
+    cfg = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+        residual_target=True,
+        beta_halflife=5,
+        benchmark_symbol="SPY",
+    )
+    a = compute_features(_daily_grid(50), cfg)
+    spy = compute_features(_daily_grid(50), cfg)
+    a["symbol"] = "AAPL"
+    spy["symbol"] = "SPY"
+    base = attach_residual_target({"AAPL": a.copy(), "SPY": spy.copy()}, cfg)
+    spiked_grid = _daily_grid(50)
+    spiked_grid.loc[spiked_grid.index[-1], "close"] = float(spiked_grid["close"].iloc[-1]) * 1.08
+    spiked = compute_features(spiked_grid, cfg)
+    spiked["symbol"] = "SPY"
+    alt = attach_residual_target({"AAPL": a.copy(), "SPY": spiked}, cfg)
+    t = 48
+    assert base["AAPL"]["ret_1"].iloc[t] == pytest.approx(float(alt["AAPL"]["ret_1"].iloc[t]))
+    assert base["AAPL"]["mkt_ret_1"].iloc[t] == pytest.approx(
+        float(alt["AAPL"]["mkt_ret_1"].iloc[t])
+    )
+    assert base["AAPL"]["target"].iloc[t] != pytest.approx(float(alt["AAPL"]["target"].iloc[t]))
+
+
+def test_mean_cs_ic_averages_per_date_pearson():
+    from forecast.training import mean_cs_ic
+
+    pred = np.array([1.0, 2.0, 3.0, 1.0, 2.0, 3.0], dtype=np.float64)
+    target = np.array([1.0, 2.0, 3.0, 3.0, 2.0, 1.0], dtype=np.float64)
+    dates = np.array([1, 1, 1, 2, 2, 2], dtype=np.int64)
+    # date 1: +1; date 2: -1
+    assert mean_cs_ic(pred, target, dates) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_ranknet_is_within_date_when_dates_have_breadth():
+    import torch
+
+    from forecast.training import masked_pairwise_rank_loss
+
+    mean = torch.tensor([[1.0, 2.0], [3.0, 0.0]])
+    target = torch.tensor([[1.0, 2.0], [0.0, 3.0]])
+    mask = torch.ones_like(mean)
+    dates = torch.tensor([[10, 10], [11, 11]])
+    # Within each date the order is flipped on date 11, aligned on date 10.
+    loss = float(masked_pairwise_rank_loss(mean, target, mask, date_ids=dates))
+    pooled = float(masked_pairwise_rank_loss(mean, target, mask, date_ids=None))
+    assert loss > 0
+    assert loss != pytest.approx(pooled, abs=1e-6)
+
+
+def test_freeze_skip_disables_ridge_gradients():
+    import torch
+
+    from forecast.training import apply_ridge_skip
+    n, f = 40, len(FEATURE_NAMES)
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(n, f)).astype(np.float32)
+    y = (x[:, 0] * 0.4).astype(np.float32)
+    sym = SymbolArrays(
+        symbol="AAA",
+        features=x,
+        target=y,
+        scale=np.ones(n, dtype=np.float32),
+        valid=np.ones(n, dtype=bool),
+    )
+    model = ReturnForecaster(
+        ForecastModelConfig(n_features=f, d_model=16, n_layer=1, d_state=8, linear_skip=True)
+    )
+    bundle = {
+        "train_symbols": [sym],
+        "feature_mean": np.zeros(f, dtype=np.float32),
+        "feature_std": np.ones(f, dtype=np.float32),
+    }
+    apply_ridge_skip(
+        model, bundle, ForecastTrainConfig(ridge_skip=1.0, freeze_skip=True), torch.device("cpu")
+    )
+    assert model.skip.weight.requires_grad is False
+    assert model.skip.bias.requires_grad is False
+
+
+def _write_daily_parquet(path: Path, symbol: str, n: int, start: str, drift: float = 0.01) -> None:
+    dates = pd.bdate_range(start, periods=n)
+    close = 100.0 + drift * np.arange(n)
+    pd.DataFrame(
+        {
+            "datetime": dates,
+            "open": close,
+            "high": close + 0.1,
+            "low": close - 0.1,
+            "close": close,
+            "volume": np.full(n, 1000.0),
+        }
+    ).to_parquet(path)
+
+
+def test_global_calendar_split_shares_one_train_end(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_daily_parquet(data_dir / "AAA_daily.parquet", "AAA", 200, "2018-01-02", 0.02)
+    _write_daily_parquet(data_dir / "BBB_daily.parquet", "BBB", 120, "2019-01-02", 0.03)
+    cfg = DataConfig(
+        data_dir=str(data_dir),
+        interval="daily",
+        horizon=1,
+        seq_len=16,
+        stride=1,
+        min_context=4,
+        warmup_bars=8,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=5,
+        global_calendar_split=True,
+        residual_target=False,
+        eval_last_bar=True,
+        cross_section_min_names=99,
+        allow_mixed_prices=True,
+    )
+    bundle = build_datasets(cfg, log_fn=None)
+    ends = {m["train_end"] for m in bundle["meta"]}
+    assert len(ends) == 1
+    assert bundle["cross_section"] is False
+
+
+def test_cross_section_dataset_when_enough_names(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    for i in range(8):
+        _write_daily_parquet(
+            data_dir / f"S{i}_daily.parquet",
+            f"S{i}",
+            90,
+            "2018-01-02",
+            0.01 + 0.002 * i,
+        )
+    cfg = DataConfig(
+        data_dir=str(data_dir),
+        interval="daily",
+        horizon=1,
+        seq_len=16,
+        stride=1,
+        min_context=4,
+        warmup_bars=8,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=5,
+        global_calendar_split=True,
+        residual_target=False,
+        eval_last_bar=True,
+        cross_section_min_names=8,
+        allow_mixed_prices=True,
+    )
+    bundle = build_datasets(cfg, log_fn=None)
+    assert bundle["cross_section"] is True
+    x, y, mask, scale, dates, syms = bundle["datasets"]["train"][0]
+    assert x.dim() == 3
+    assert int(x.size(0)) >= 8
+    assert int(mask[0].sum()) == 1
+    assert bool(mask[0, -1])
+    assert int(dates.unique().numel()) == 1

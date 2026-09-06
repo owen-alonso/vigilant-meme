@@ -71,6 +71,7 @@ def test_keep_awake_clears_after_error(monkeypatch):
 def test_keep_awake_is_noop_off_windows(monkeypatch):
     calls: list[int] = []
     monkeypatch.setattr("mamba_lm.training_utils.sys.platform", "linux")
+    monkeypatch.setattr("mamba_lm.training_utils._is_wsl", lambda: False)
     monkeypatch.setattr(
         "mamba_lm.training_utils._set_windows_execution_state",
         lambda flags: calls.append(flags) or True,
@@ -78,6 +79,59 @@ def test_keep_awake_is_noop_off_windows(monkeypatch):
     with keep_awake():
         pass
     assert calls == []
+
+
+class _FakePopen:
+    def __init__(self) -> None:
+        self.terminated = False
+
+    def poll(self):
+        return None if not self.terminated else 0
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.terminated = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.terminated = True
+        return 0
+
+
+def test_keep_awake_wsl_starts_and_stops_helper(monkeypatch):
+    helper = _FakePopen()
+    monkeypatch.setattr("mamba_lm.training_utils.sys.platform", "linux")
+    monkeypatch.setattr("mamba_lm.training_utils._is_wsl", lambda: True)
+    monkeypatch.setattr(
+        "mamba_lm.training_utils._start_wsl_keep_awake", lambda interval_sec: helper
+    )
+    logs: list[str] = []
+    with keep_awake(log_fn=logs.append, interval_sec=60.0):
+        assert helper.poll() is None
+        assert any("WSL bridged to Windows" in line for line in logs)
+    assert helper.terminated
+    assert any("sleep and display restored" in line for line in logs)
+
+
+def test_is_wsl_reads_distro_env(monkeypatch):
+    from mamba_lm.training_utils import _is_wsl
+
+    monkeypatch.setattr("mamba_lm.training_utils.sys.platform", "linux")
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+    assert _is_wsl() is True
+    monkeypatch.delenv("WSL_DISTRO_NAME")
+    monkeypatch.setattr("mamba_lm.training_utils.sys.platform", "win32")
+    assert _is_wsl() is False
+
+
+def test_wsl_keep_awake_script_pulses_execution_state():
+    from mamba_lm.training_utils import _KEEP_AWAKE_FLAGS, _wsl_keep_awake_script
+
+    script = _wsl_keep_awake_script(30)
+    assert "SetThreadExecutionState" in script
+    assert str(_KEEP_AWAKE_FLAGS) in script
+    assert "Start-Sleep -Seconds 30" in script
 
 
 def test_grads_finite_detects_nan():

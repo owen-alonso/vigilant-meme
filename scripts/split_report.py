@@ -28,7 +28,7 @@ def main(path: str) -> None:
     if not resolved.exists():
         raise SystemExit(
             f"data file not found: {resolved}\n"
-            "Pass a parquet path, e.g. scripts/split_report.py data/YOUR_SYMBOL_clean_1min.parquet"
+            "Pass a parquet path, e.g. scripts/split_report.py data/AAPL_1min.parquet"
         )
     raw = load_bars(resolved)
     grid = build_session_grid(raw, cfg)
@@ -78,8 +78,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "path",
         nargs="?",
-        default="data/SPAB_clean_1min.parquet",
-        help="parquet file to inspect (default: data/SPAB_clean_1min.parquet)",
+        default="data/AAPL_1min.parquet",
+        help="parquet file to inspect (default: data/AAPL_1min.parquet)",
     )
     return p
 

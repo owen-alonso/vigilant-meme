@@ -185,6 +185,16 @@ def ssm_forward(
     *,
     algorithm: ScanAlgorithm = "parallel",
 ) -> torch.Tensor:
-    """Discretize then scan. A may be static [D, N] or dynamic [B, L, D, N]."""
+    """Discretize then scan. A may be static [D, N] or dynamic [B, L, D, N].
+
+    On CUDA the default path is a fused Triton kernel (one launch for
+    discretize + scan + output; see mamba_lm/scan_fused.py). Set
+    MAMBA_FUSED_SCAN=0 or algorithm="sequential" to force the PyTorch path.
+    """
+    if algorithm == "parallel" and u.is_cuda:
+        from mamba_lm.scan_fused import fused_scan_available, fused_ssm_forward
+
+        if fused_scan_available(u.device):
+            return fused_ssm_forward(u, dt, A, B, C, D)
     A_bar, deltaB_u = discretize(u, dt, A, B)
     return selective_scan(u, A_bar, deltaB_u, C, D, algorithm=algorithm)

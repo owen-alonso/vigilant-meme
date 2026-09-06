@@ -51,7 +51,7 @@ def test_forecast_training_script_help_from_file():
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
-    assert "next-hour" in proc.stdout.lower() or "usage:" in proc.stdout.lower()
+    assert "next-hour" in proc.stdout.lower() or "equity return" in proc.stdout.lower() or "usage:" in proc.stdout.lower()
 
 
 def test_mamba_lm_console_script_runs_report():

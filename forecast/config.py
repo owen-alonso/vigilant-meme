@@ -71,8 +71,21 @@ class DataConfig:
     # as feature ``clip``). Pearson IC is otherwise dominated by one jump.
     max_abs_target: float = 8.0
     # Train only the last K bars of each window (0 = every bar after min_context).
-    # Eval still scores the full scorable span so val IC covers the split.
-    supervise_last: int = 0
+    # Calendar defaults use 1 so train/eval match generate.py (last bar only).
+    supervise_last: int = 1
+    # Score unique last bars (the trading object), not every labelled position.
+    eval_last_bar: bool = True
+    # One train_end / val_end for every symbol (union of session dates).
+    global_calendar_split: bool = True
+    # Same-bar market feature + residual label vs this ticker when its parquet exists.
+    benchmark_symbol: str = "SPY"
+    # y = (r_{t+h} - beta_t * r_mkt_{t+h}) / sigma. beta uses data through t only.
+    residual_target: bool = True
+    beta_halflife: int = 63
+    # Cross-section batches when at least this many names print on a date.
+    cross_section_min_names: int = 8
+    # Weekly mixed adjusted/raw files have lag-1 autocorr << 0. Set True to skip.
+    allow_mixed_prices: bool = False
 
     def is_daily(self) -> bool:
         return self.interval == "daily"
@@ -106,26 +119,26 @@ def interval_data_kwargs(interval: str) -> dict[str, Any]:
     if interval == "weekly":
         return {
             "seq_len": 52,
-            "stride": 4,
+            "stride": 1,
             "min_context": 13,
             "vol_halflife": 12,
             "z_window": 52,
             "z_min_periods": 8,
             "warmup_bars": 26,
             "max_abs_log_return": 0.40,
-            "supervise_last": 8,
+            "supervise_last": 1,
         }
     if interval == "monthly":
         return {
             "seq_len": 36,
-            "stride": 2,
+            "stride": 1,
             "min_context": 8,
             "vol_halflife": 6,
             "z_window": 24,
             "z_min_periods": 6,
             "warmup_bars": 12,
             "max_abs_log_return": 0.50,
-            "supervise_last": 6,
+            "supervise_last": 1,
         }
     if str(interval).endswith("min"):
         bars = {
@@ -149,21 +162,35 @@ def interval_data_kwargs(interval: str) -> dict[str, Any]:
         }
     return {
         "seq_len": 128,
-        "stride": 16,
+        "stride": 1,
         "min_context": 32,
         "vol_halflife": 21,
         "z_window": 252,
         "z_min_periods": 21,
         "warmup_bars": 21,
         "max_abs_log_return": 0.40,
-        "supervise_last": 0,
+        "supervise_last": 1,
     }
 
 
 def interval_model_kwargs(interval: str) -> dict[str, Any]:
-    """SSM step-size prior. Weekly/monthly bars are not language tokens."""
+    """SSM step-size prior and a tiny residual for calendar bars."""
     if interval in ("weekly", "monthly"):
-        return {"dt_min": 0.05, "dt_max": 1.0}
+        return {
+            "dt_min": 0.05,
+            "dt_max": 1.0,
+            "d_model": 32,
+            "n_layer": 1,
+            "d_state": 8,
+        }
+    if interval == "daily":
+        return {
+            "dt_min": 1e-3,
+            "dt_max": 0.1,
+            "d_model": 32,
+            "n_layer": 1,
+            "d_state": 8,
+        }
     return {"dt_min": 1e-3, "dt_max": 0.1}
 
 
@@ -171,7 +198,7 @@ def interval_model_kwargs(interval: str) -> dict[str, Any]:
 class ForecastModelConfig:
     """Mamba backbone sized for continuous financial features."""
 
-    n_features: int = 18
+    n_features: int = 25
     d_model: int = 96
     n_layer: int = 4
     d_state: int = 16
@@ -229,10 +256,28 @@ class ForecastTrainConfig:
     grad_clip: float = 1.0
     loss: LossName = "huber"
     huber_delta: float = 1.0
-    # Mix Huber (scale) with 1 - Pearson (rank/direction). 0 disables.
-    ic_loss_weight: float = 0.5
+    # Huber owns prediction scale. Keep it smaller than the IC term so the
+    # optimizer does not trade rank agreement for MSE.
+    location_loss_weight: float = 0.4
+    # Mix 1 - Pearson over the pooled labelled batch (same IC val reports).
+    ic_loss_weight: float = 2.0
     # Clip pred/target to +/- this many vol units before Pearson / IC loss.
     ic_winsor: float = 3.0
+    # Direction on moves larger than sign_min_abs (volatility units).
+    sign_loss_weight: float = 0.4
+    sign_min_abs: float = 0.25
+    # Pairwise RankNet on labelled bars in the batch (Spearman-like).
+    rank_loss_weight: float = 0.4
+    # Match pred std to target std so Pearson cannot explode |pred|.
+    pred_std_weight: float = 0.5
+    # Closed-form ridge readout copied into the linear skip at step 0.
+    # 0 keeps Xavier init.
+    ridge_skip: float = 1.0
+    # After ridge, freeze the skip so AdamW cannot decay the linear baseline.
+    skip_lr_mult: float = 0.0
+    freeze_skip: bool = True
+    # Apply ridge, log last-bar train/val/test IC, write best.pt, exit (no AdamW).
+    skip_only: bool = False
     # Residual-std head. Trained by gaussian NLL, or by sigma_aux_weight when
     # the mean loss is Huber/MSE. Default 0 matches heteroscedastic=False.
     sigma_aux_weight: float = 0.0
@@ -242,8 +287,9 @@ class ForecastTrainConfig:
     eval_interval: int = 250
     num_workers: int = 0
     checkpoint_dir: str = "checkpoints/forecast"
-    # 0 = never stop. A positive N still aborts after N evals with no val-IC gain.
-    early_stop_evals: int = 0
+    # 0 = never stop. Default stops after N evals with no new best val IC.
+    # Plateau must not reset this counter or a 1e6-step run never ends.
+    early_stop_evals: int = 24
     # After this many evals with no new best val IC, multiply the scheduled LR
     # (warmup/cosine) by lr_plateau_factor and restore best.pt. 0 disables.
     lr_plateau_evals: int = 8
@@ -262,10 +308,21 @@ def validate_loss_head(model_cfg: ForecastModelConfig, train_cfg: ForecastTrainC
     """Gaussian NLL needs a sigma head; Huber/MSE need aux weight if that head exists."""
     if train_cfg.loss == "gaussian" and not model_cfg.heteroscedastic:
         raise ValueError("loss='gaussian' requires ForecastModelConfig.heteroscedastic=True")
-    if train_cfg.ic_loss_weight < 0:
-        raise ValueError("ic_loss_weight must be >= 0")
+    for name in (
+        "location_loss_weight",
+        "ic_loss_weight",
+        "sign_loss_weight",
+        "rank_loss_weight",
+        "pred_std_weight",
+        "ridge_skip",
+        "skip_lr_mult",
+    ):
+        if getattr(train_cfg, name) < 0:
+            raise ValueError(f"{name} must be >= 0")
     if train_cfg.ic_winsor <= 0:
         raise ValueError("ic_winsor must be > 0")
+    if train_cfg.sign_min_abs < 0:
+        raise ValueError("sign_min_abs must be >= 0")
     if model_cfg.heteroscedastic and train_cfg.loss != "gaussian" and train_cfg.sigma_aux_weight <= 0:
         raise ValueError(
             "heteroscedastic=True with Huber/MSE needs sigma_aux_weight > 0 "

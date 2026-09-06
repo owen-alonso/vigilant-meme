@@ -1,4 +1,4 @@
-"""Generate next-hour return forecasts from a trained checkpoint.
+"""Generate forward-return forecasts from a trained checkpoint.
 
 Usage:
     python -m forecast.generate --checkpoint checkpoints/forecast/best.pt
@@ -7,7 +7,8 @@ Usage:
         --symbols AAPL,MSFT --csv pred_moves.csv
 
 By default every parquet in the checkpoint's data_dir is scored. The printed
-table has one column per ticker; cells are predicted next-hour moves in bp.
+table has one column per ticker; cells are predicted forward moves in bp.
+Refresh the cache first with ``python -m forecast.download --symbols AAPL``.
 
 The checkpoint carries its own DataConfig and feature normalization, so the
 features built here are identical to the ones the model was trained on.
@@ -37,6 +38,8 @@ from forecast.checkpoint import load_forecaster, uncertainty_is_trained
 from forecast.config import DataConfig
 from forecast.data import (
     FEATURE_NAMES,
+    attach_cross_section_features,
+    attach_residual_target,
     build_panel,
     discover_symbol_files,
     symbol_from_path,
@@ -142,16 +145,17 @@ def resolve_data_files(
     data_arg: str | None,
     data_dir: str | Path,
     symbols: list[str] | None,
+    interval: str | None = None,
 ) -> list[Path]:
     """Parquet files to score: one file, a directory, or the checkpoint data_dir."""
     if data_arg:
         path = resolve_path(data_arg)
         if path.is_dir():
-            files = discover_symbol_files(path)
+            files = discover_symbol_files(path, interval=interval)
         else:
             files = [path]
     else:
-        files = discover_symbol_files(data_dir)
+        files = discover_symbol_files(data_dir, interval=interval)
 
     missing = [f for f in files if not f.exists()]
     if missing:
@@ -159,16 +163,52 @@ def resolve_data_files(
 
     if symbols is not None:
         wanted = set(symbols)
+        available = sorted({symbol_from_path(f) for f in files})
         files = [f for f in files if symbol_from_path(f) in wanted]
         have = {symbol_from_path(f) for f in files}
         unknown = sorted(wanted - have)
         if unknown:
             raise FileNotFoundError(
-                "no parquet for symbol(s): " + ", ".join(unknown)
+                "no parquet for symbol(s): "
+                + ", ".join(unknown)
+                + f"\nAvailable in {data_dir}: "
+                + (", ".join(available) if available else "(none)")
+                + "\n--symbols filters files named SYMBOL_*.parquet; "
+                "it does not download tickers. Run "
+                "python -m forecast.download --symbols AAPL "
+                "or pass --symbols "
+                + (available[0] if available else "a ticker that has a parquet")
+                + "."
             )
     if not files:
         raise FileNotFoundError("no symbol parquet files to forecast")
     return files
+
+
+def load_forecast_panels(
+    files: list[Path],
+    data_cfg: DataConfig,
+    *,
+    universe_dir: str | Path | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Build per-symbol panels and attach the same cross-section features as train.
+
+    ``files`` are the symbols to score. Peer/market features use every parquet
+    in ``universe_dir`` (default: the checkpoint data_dir) so scoring AAPL
+    still sees MSFT's contemporaneous ``ret_1``.
+    """
+    by_path: dict[str, Path] = {symbol_from_path(p): p for p in files}
+    if universe_dir is not None:
+        try:
+            for extra in discover_symbol_files(universe_dir, interval=data_cfg.interval):
+                by_path.setdefault(symbol_from_path(extra), extra)
+        except FileNotFoundError:
+            pass
+    panels = {
+        symbol: build_panel(path, data_cfg) for symbol, path in by_path.items()
+    }
+    panels = attach_cross_section_features(panels, data_cfg)
+    return attach_residual_target(panels, data_cfg)
 
 
 def predicted_move_wide(by_symbol: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -196,7 +236,7 @@ def latest_snapshot(by_symbol: dict[str, pd.DataFrame]) -> pd.DataFrame:
             "print": "yes" if bool(row["traded"]) else "no",
             "last $": _fmt_px(float(row["close"])),
             "pred (bp)": f"{float(row['pred_return_bps']):+.1f}",
-            "pred $ in 1h": _fmt_px(float(row["pred_price_1h"])),
+            "pred $ ahead": _fmt_px(float(row["pred_price_1h"])),
         }
         if "realized_bps" in by_symbol[sym].columns:
             realized = row["realized_bps"]
@@ -236,20 +276,49 @@ def format_stock_column_report(
     notes: list[str],
 ) -> str:
     """Header plus a table whose columns are tickers (predicted move in bp)."""
-    lines: list[str] = []
     names = ", ".join(sorted(by_symbol))
+    interval = data_cfg.interval
+    if interval == "daily" and data_cfg.horizon == 1:
+        title = "NEXT-DAY RETURN FORECAST"
+        unit = "trading day"
+        horizon_line = f"  Horizon     {data_cfg.horizon} {unit} ahead"
+        context_line = f"  Context     last {context} daily bars"
+        expect = f"  expects the price about 0.10% higher in {data_cfg.horizon} {unit}."
+    elif interval == "weekly":
+        title = "NEXT-WEEK RETURN FORECAST"
+        unit = "week" if data_cfg.horizon == 1 else "weeks"
+        horizon_line = f"  Horizon     {data_cfg.horizon} {unit} ahead"
+        context_line = f"  Context     last {context} weekly bars"
+        expect = f"  expects the price about 0.10% higher in {data_cfg.horizon} {unit}."
+    elif interval == "monthly":
+        title = "NEXT-MONTH RETURN FORECAST"
+        unit = "month" if data_cfg.horizon == 1 else "months"
+        horizon_line = f"  Horizon     {data_cfg.horizon} {unit} ahead"
+        context_line = f"  Context     last {context} monthly bars"
+        expect = f"  expects the price about 0.10% higher in {data_cfg.horizon} {unit}."
+    elif data_cfg.is_intraday():
+        title = "NEXT-HOUR RETURN FORECAST"
+        horizon_line = f"  Horizon     {data_cfg.horizon} minutes ahead  (same session)"
+        context_line = f"  Context     last {context} minute bars"
+        expect = "  expects the price about 0.10% higher in one hour."
+    else:
+        title = "FORWARD RETURN FORECAST"
+        horizon_line = f"  Horizon     {data_cfg.horizon} bars ahead"
+        context_line = f"  Context     last {context} bars"
+        expect = "  expects the price about 0.10% higher over the horizon."
+    lines: list[str] = []
     lines.append("=" * 72)
-    lines.append("  NEXT-HOUR RETURN FORECAST")
+    lines.append(f"  {title}")
     lines.append("=" * 72)
-    lines.append(f"  Horizon     {data_cfg.horizon} minutes ahead  (same session)")
-    lines.append(f"  Context     last {context} minute bars")
+    lines.append(horizon_line)
+    lines.append(context_line)
     lines.append(f"  Stocks      {names}")
     lines.append(f"  Checkpoint  {checkpoint}")
     lines.append(f"  Trained on  {trained_on or 'unknown'}")
     lines.append(f"  Device      {device}")
     lines.append("")
     lines.append("  Units: bp = basis points = 0.01%.  +10 bp means the model")
-    lines.append("  expects the price about 0.10% higher in one hour.")
+    lines.append(expect)
     lines.append("  Each ticker is its own column. pred (bp) is the predicted move.")
     if notes:
         lines.append("")
@@ -326,7 +395,7 @@ def _collect_shared_notes(
 
 
 def main(argv: list[str] | None = None) -> None:
-    p = argparse.ArgumentParser(description="Forecast next-hour equity returns.")
+    p = argparse.ArgumentParser(description="Forecast next-bar equity returns.")
     p.add_argument("--checkpoint", default="checkpoints/forecast/best.pt")
     p.add_argument(
         "--data",
@@ -368,10 +437,29 @@ def main(argv: list[str] | None = None) -> None:
 
     try:
         files = resolve_data_files(
-            args.data, data_cfg.data_dir, parse_symbols(args.symbols)
+            args.data,
+            data_cfg.data_dir,
+            parse_symbols(args.symbols),
+            interval=data_cfg.interval,
         )
     except FileNotFoundError as exc:
         raise SystemExit(str(exc)) from exc
+
+    bench = str(data_cfg.benchmark_symbol or "").upper()
+    if parse_symbols(args.symbols) is None and bench:
+        files = [f for f in files if symbol_from_path(f) != bench]
+    if not files:
+        raise SystemExit(
+            "no trading-name parquets to forecast "
+            f"(benchmark {bench} is a label ingredient, not a name)"
+        )
+
+    if args.data:
+        data_path = resolve_path(args.data)
+        universe_dir = data_path if data_path.is_dir() else data_path.parent
+    else:
+        universe_dir = data_cfg.data_dir
+    panels = load_forecast_panels(files, data_cfg, universe_dir=universe_dir)
 
     by_symbol: dict[str, pd.DataFrame] = {}
     skip_notes: list[str] = []
@@ -379,7 +467,7 @@ def main(argv: list[str] | None = None) -> None:
         symbol = symbol_from_path(path)
         print(f"forecasting {symbol} ...", file=sys.stderr)
         try:
-            panel = build_panel(path, data_cfg)
+            panel = panels[symbol]
             positions = choose_positions(
                 panel, context=context, last=args.last, asof=args.asof
             )
@@ -393,7 +481,7 @@ def main(argv: list[str] | None = None) -> None:
                 batch_size=args.batch_size,
                 include_uncertainty=include_unc,
             )
-        except (ValueError, SystemExit) as exc:
+        except (ValueError, SystemExit, KeyError) as exc:
             skip_notes.append(f"skipped {symbol}: {exc}")
             continue
         by_symbol[symbol] = result
