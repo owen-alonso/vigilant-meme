@@ -370,6 +370,14 @@ def mean_cs_ic(
     return float(np.mean(ics))
 
 
+def selection_score(metrics: dict[str, float]) -> float:
+    """Checkpoint / early-stop score: mean CS IC when it exists, else last-bar Pearson."""
+    cs = metrics.get("cs_ic", float("nan"))
+    if np.isfinite(cs):
+        return float(cs)
+    return float(metrics.get("ic", float("nan")))
+
+
 # --------------------------------------------------------------------------
 # Training utilities (forecast-specific)
 # --------------------------------------------------------------------------
@@ -480,6 +488,7 @@ def evaluate(
     if date_list:
         dates_np = np.concatenate(date_list)
         metrics["cs_ic"] = mean_cs_ic(pred_np, tgt_np, dates_np)
+    metrics["select"] = selection_score(metrics)
     metrics["loss"] = weighted_loss / total_weight if total_weight > 0 else float("nan")
     return metrics
 
@@ -788,13 +797,14 @@ def _train(
                     log_fn(f"  train sample: {_fmt(train_snap)}")
                 save(ckpt_dir / "last.pt", step + 1, val)
 
-                ic = val["ic"]
+                ic = selection_score(val)
                 improved = bool(np.isfinite(ic) and ic > best_ic)
                 if improved:
                     best_ic, best_step = ic, step + 1
                     save(ckpt_dir / "best.pt", step + 1, val)
                     if log_fn:
-                        log_fn(f"  new best val_ic={ic:+.4f} -> {ckpt_dir / 'best.pt'}")
+                        label = "val_cs_ic" if np.isfinite(val.get("cs_ic", float("nan"))) else "val_ic"
+                        log_fn(f"  new best {label}={ic:+.4f} -> {ckpt_dir / 'best.pt'}")
                 evals_without_gain, lr_scale, stop, restore_best, plateau_msg = (
                     decide_val_plateau(
                         improved=improved,

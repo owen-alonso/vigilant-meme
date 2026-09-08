@@ -588,6 +588,14 @@ def test_mean_cs_ic_averages_per_date_pearson():
     assert mean_cs_ic(pred, target, dates) == pytest.approx(0.0, abs=1e-6)
 
 
+def test_selection_score_prefers_cs_ic_when_finite():
+    from forecast.training import selection_score
+
+    assert selection_score({"ic": 0.02, "cs_ic": 0.05}) == pytest.approx(0.05)
+    assert selection_score({"ic": 0.02, "cs_ic": float("nan")}) == pytest.approx(0.02)
+    assert selection_score({"ic": 0.02}) == pytest.approx(0.02)
+
+
 def test_ranknet_is_within_date_when_dates_have_breadth():
     import torch
 
