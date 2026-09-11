@@ -67,6 +67,15 @@ Overnight live book (val-gate; do not retarget from test). Paper 10 bp flatten i
 python -m forecast.training --universe liquid --interval daily --skip-only \
   --label-return overnight --checkpoint-dir checkpoints/forecast_ridge_overnight
 
+# locked TEST direction % + next-open MAE (PR #8 baseline + train-only readouts)
+# fit on TRAIN, promote on locked VAL, report locked TEST. Not live P&L.
+python scripts/overnight_accuracy.py --data-dir data --universe liquid \
+    --json checkpoints/forecast_ridge_overnight/accuracy.json \
+    --calibrate-json checkpoints/forecast_ridge_overnight/overnight_calibrate.json
+# optional: apply VAL-gated affine to generate.py prices
+python -m forecast.generate --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+    --calibrate-json checkpoints/forecast_ridge_overnight/overnight_calibrate.json
+
 # year series + live auction/locate/long-only stress (locked test)
 python scripts/cs_overnight.py --data-dir data --universe liquid \
   --out checkpoints/forecast_ridge_overnight/overnight.json

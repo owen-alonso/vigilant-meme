@@ -162,6 +162,7 @@ python scripts/cs_regime_ablate.py --data-dir data --universe liquid
 python scripts/cs_shrink_ablate.py --data-dir data --universe liquid --also-labels
 python -m forecast.training --universe liquid --skip-only --label-return overnight
 python scripts/cs_overnight.py --data-dir data --universe liquid
+python scripts/overnight_accuracy.py --data-dir data --universe liquid
 python scripts/ablate_cs.py
 python scripts/split_report.py data/AAPL_daily.parquet
 ```

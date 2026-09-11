@@ -84,6 +84,15 @@ def forecast_panel(
     scale = rows["scale"].to_numpy(dtype=np.float64)
     pred_norm = np.asarray(preds, dtype=np.float64)
     pred_log_return = pred_norm * scale
+    cal = state.get("overnight_calibrate") or {}
+    if cal.get("a") is not None or cal.get("b") is not None:
+        from forecast.accuracy import apply_affine
+
+        pred_log_return = apply_affine(
+            pred_log_return,
+            1.0 if cal.get("a") is None else float(cal["a"]),
+            0.0 if cal.get("b") is None else float(cal["b"]),
+        )
     close = rows["close"].to_numpy(dtype=np.float64)
 
     out = pd.DataFrame(
@@ -419,6 +428,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--csv", default=None, help="write the predicted-move table (stocks as columns)")
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--cpu", action="store_true")
+    p.add_argument(
+        "--calibrate-json",
+        default="",
+        help="optional overnight affine {a,b} from scripts/overnight_accuracy.py "
+        "(r_on_hat = a * pred*sigma + b). Empty keeps residual*sigma.",
+    )
     args = p.parse_args(argv)
 
     device = torch.device(
@@ -432,6 +447,13 @@ def main(argv: list[str] | None = None) -> None:
 
     model, state = load_forecaster(ckpt_path, device)
     data_cfg = DataConfig.from_dict(state["data_config"])
+    if args.calibrate_json:
+        import json as _json
+
+        overlay = _json.loads(Path(args.calibrate_json).read_text())
+        merged = dict(state.get("overnight_calibrate") or {})
+        merged.update(overlay)
+        state["overnight_calibrate"] = merged
     context = args.context or data_cfg.seq_len
     include_unc = uncertainty_is_trained(model, state)
 

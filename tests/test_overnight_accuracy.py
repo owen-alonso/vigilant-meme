@@ -1,0 +1,279 @@
+"""Locked-TEST overnight TRUE/FALSE accuracy helpers and synthetic protocol."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+
+from forecast.accuracy import (
+    abs_error_block,
+    adv_sleeve_mask,
+    apply_affine,
+    apply_readout,
+    direction_hits,
+    evaluate_overnight_accuracy,
+    evaluate_overnight_skip,
+    fit_affine_l1,
+    fit_affine_ols,
+    hit_rate_inference,
+    score_eval_frame,
+    slim_accuracy,
+    two_sided_normal_p,
+)
+from forecast.data import FEATURE_NAMES
+from forecast.synthetic import write_cs_overnight_universe
+
+
+def test_two_sided_normal_p_symmetric():
+    assert two_sided_normal_p(0.0) == 1.0
+    assert 0.04 < two_sided_normal_p(2.0) < 0.05
+    assert two_sided_normal_p(10.0) < 1e-20
+
+
+def test_hit_rate_inference_coin_flip_is_not_significant():
+    rng = np.random.default_rng(0)
+    hits = rng.integers(0, 2, size=40).astype(np.float64)
+    stats = hit_rate_inference(hits)
+    assert stats["n"] == 40
+    assert 0.2 < stats["hit_rate"] < 0.8
+    assert stats["p_vs_half"] > 0.05
+
+
+def test_hit_rate_inference_detects_edge():
+    hits = np.ones(400, dtype=np.float64)
+    hits[:80] = 0.0
+    stats = hit_rate_inference(hits)
+    assert stats["hit_rate_pct"] == 80.0
+    assert stats["p_vs_half"] < 1e-10
+    assert stats["z_vs_half"] > 0
+
+
+def test_direction_hits_drops_flat_realized():
+    pred = np.array([1.0, -1.0, 1.0])
+    realized = np.array([0.2, -0.1, 0.0])
+    hits = direction_hits(pred, realized)
+    assert hits.tolist() == [1.0, 1.0]
+
+
+def test_abs_error_block_mae_median_rmse():
+    err = np.array([1.0, 2.0, 3.0])
+    block = abs_error_block(err)
+    assert block["n"] == 3
+    assert block["mae"] == 2.0
+    assert block["median_ae"] == 2.0
+    assert abs(block["rmse"] - np.sqrt(14.0 / 3.0)) < 1e-12
+
+
+def test_score_eval_frame_perfect_overnight_prices():
+    import pandas as pd
+
+    close = np.array([100.0, 50.0, 25.0, 10.0])
+    r_on = np.array([0.01, -0.02, 0.03, -0.01])
+    nxt = close * np.exp(r_on)
+    df = pd.DataFrame(
+        {
+            "symbol": ["A", "B", "A", "B"],
+            "date": [1, 1, 2, 2],
+            "pred": r_on / 0.01,
+            "y": r_on / 0.01,
+            "scale": np.full(4, 0.01),
+            "close": close,
+            "next_open": nxt,
+            "r_on": r_on,
+            "pred_r": r_on,
+            "implied_open": nxt,
+            "implied_open_given_hedge": nxt,
+        }
+    )
+    out = score_eval_frame(df, min_names=2)
+    assert out["n_samples"] == 4
+    assert out["n_dates"] == 2
+    assert out["direction"]["overall"]["hit_rate"] == 1.0
+    assert out["direction"]["realized_overnight_up_pct"] == 50.0
+    assert out["price_error"]["dollars"]["mae"] < 1e-9
+
+
+def test_synthetic_overnight_skip_beats_coin_flip_on_residual(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    write_cs_overnight_universe(data_dir, n_names=12, n_days=220, seed=1, rho=0.65)
+    payload = evaluate_overnight_skip(str(data_dir), "synthetic", log_fn=None)
+    assert payload["n_samples"] >= 20
+    assert payload["n_names"] >= 8
+    resid = payload["direction"]["residual_vs_residual"]["hit_rate"]
+    # Planted CS overnight residual should not be a coin flip on y.
+    assert resid > 0.55
+    assert payload["cs_ic"]["cs_ic"] > 0.05
+    mae = payload["price_error"]["dollars"]["mae"]
+    assert np.isfinite(mae) and mae > 0
+    pct = payload["price_error"]["pct_of_prior_close"]["mae"]
+    assert np.isfinite(pct) and pct > 0
+
+
+def test_next_open_is_not_a_feature_name():
+    lowered = {n.lower() for n in FEATURE_NAMES}
+    assert "open" not in lowered
+    assert "next_open" not in lowered
+    assert "target_raw" not in lowered
+
+
+def test_affine_l1_a0_is_train_median():
+    pred = np.array([0.01, -0.02, 0.03, -0.01, 0.0, 0.02])
+    # Unrelated to pred: MAE-optimal affine should shrink a toward 0.
+    r_on = np.array([0.004, 0.005, 0.003, 0.006, 0.004, 0.005])
+    a, b = fit_affine_l1(pred, r_on)
+    assert abs(a) < 0.15
+    assert abs(b - float(np.median(r_on))) < 0.002
+
+
+def test_affine_ols_is_determined_by_train_rows_only():
+    """Causality: coefficients come from train rows; later labels do not refit."""
+    rng = np.random.default_rng(2)
+    train_p = rng.normal(size=80)
+    train_y = 0.4 * train_p + 0.002 + rng.normal(scale=0.01, size=80)
+    later_p = rng.normal(size=40)
+    later_y = -0.9 * later_p + 0.05 + rng.normal(scale=0.01, size=40)
+    a0, b0 = fit_affine_ols(train_p, train_y)
+    later_hat = apply_affine(later_p, a0, b0)
+    assert later_hat.shape == later_p.shape
+    a_later, _b_later = fit_affine_ols(later_p, later_y)
+    assert abs(a0 - 0.4) < 0.15
+    assert abs(a_later - a0) > 0.5
+    leaked_a, _ = fit_affine_ols(
+        np.concatenate([train_p, later_p]),
+        np.concatenate([train_y, later_y]),
+    )
+    assert abs(leaked_a - a0) > 0.05
+
+
+def test_apply_readout_keeps_residual_scores():
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "pred": [1.0, -1.0],
+            "y": [0.5, -0.5],
+            "scale": [0.01, 0.01],
+            "close": [100.0, 50.0],
+            "next_open": [101.0, 49.5],
+            "r_on": [np.log(101 / 100), np.log(49.5 / 50)],
+            "pred_r": [0.01, -0.01],
+            "implied_open": [100.0 * np.exp(0.01), 50.0 * np.exp(-0.01)],
+            "implied_open_given_hedge": [101.0, 49.5],
+        }
+    )
+    out = apply_readout(df, np.array([0.0, 0.0]))
+    assert out["pred"].tolist() == [1.0, -1.0]
+    assert out["y"].tolist() == [0.5, -0.5]
+    assert out["pred_r"].tolist() == [0.0, 0.0]
+    assert abs(out["implied_open"].iloc[0] - 100.0) < 1e-12
+
+
+def test_adv_sleeve_is_within_date_turnover_feature():
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "date": [1, 1, 1, 2, 2, 2],
+            "turnover_z": [0.0, 1.0, 2.0, 5.0, 4.0, 0.0],
+        }
+    )
+    mask = adv_sleeve_mask(df, pctile=0.67)
+    # Top tercile of 3 names: the max on each date.
+    assert mask.tolist() == [False, False, True, True, False, False]
+
+
+def test_val_gate_does_not_read_test_metrics():
+    from forecast.accuracy import _pick_promoted
+
+    rows = [
+        {
+            "name": "affine_l1",
+            "promote_dir": True,
+            "promote_mae": True,
+            "promote": False,
+            "val": {"dir_pct": 55.0, "mae_pct": 0.005},
+            "test": {"dir_pct": 40.0, "mae_pct": 0.02},  # worse on test; must not matter
+        },
+        {
+            "name": "ts_ridge_all",
+            "promote_dir": False,
+            "promote_mae": False,
+            "promote": False,
+            "val": {"dir_pct": 51.0, "mae_pct": 0.007},
+            "test": {"dir_pct": 60.0, "mae_pct": 0.003},  # better on test; must not win
+        },
+    ]
+    promo = _pick_promoted(rows)
+    assert promo["accuracy_default"] == "affine_l1"
+    assert promo["price"] == "affine_l1"
+
+
+def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    write_cs_overnight_universe(data_dir, n_names=12, n_days=240, seed=1, rho=0.65)
+    payload = evaluate_overnight_accuracy(
+        str(data_dir), "synthetic", log_fn=None, ablate=True
+    )
+    assert payload["n_samples"] >= 20
+    names = [r["name"] for r in payload["ablation"]["rows"]]
+    assert "residual_sigma" in names
+    assert "affine_l1" in names
+    assert "train_median_gap" in names
+    assert "ts_ridge_all" in names
+    assert "sign_ridge_calibrated" in names
+    promo = payload["promotion"]
+    assert promo["cs_skip_unchanged"] is True
+    # Promotion is VAL-only; test keys exist for the report but are not the gate.
+    assert "accuracy_default" in promo
+    cal = payload["calibrate"]
+    assert cal["name"] == promo["accuracy_default"]
+    # Affine coefficients come from train; a/b may be null for non-residual readouts.
+    if cal.get("a") is not None:
+        assert np.isfinite(float(cal["a"]))
+        assert np.isfinite(float(cal["b"]))
+    # Confidence thresholds are train quantiles.
+    conf = payload["confidence"]
+    assert "median" in conf
+    # L1 affine on train cannot have higher train-implied MAE intent than a huge scale.
+    a_l1 = payload["ablation"]["calibrators"]["affine_l1"]["a"]
+    assert np.isfinite(a_l1)
+    # Planted CS residual: skip CS IC stays positive on test.
+    assert payload["cs_ic"]["cs_ic"] > 0.05
+    # MAE of some calibrated readout should be finite.
+    by_name = {r["name"]: r for r in payload["ablation"]["rows"]}
+    l1_test = by_name["affine_l1"]["test"]["mae_pct"]
+    base_test = by_name["residual_sigma"]["test"]["mae_pct"]
+    med_test = by_name["train_median_gap"]["test"]["mae_pct"]
+    assert np.isfinite(l1_test) and np.isfinite(base_test) and np.isfinite(med_test)
+    # Honest price object: L1 affine should not be worse than residual*sigma on
+    # the planted tape by a large margin (it can match the median gap).
+    assert l1_test <= base_test * 1.05 or l1_test <= med_test * 1.05
+
+
+def test_zero_move_direction_is_zero_not_nan():
+    import pandas as pd
+
+    close = np.array([100.0, 50.0, 25.0, 10.0])
+    r_on = np.array([0.01, -0.02, 0.03, -0.01])
+    nxt = close * np.exp(r_on)
+    df = pd.DataFrame(
+        {
+            "symbol": ["A", "B", "A", "B"],
+            "date": [1, 1, 2, 2],
+            "pred": np.zeros(4),
+            "y": r_on / 0.01,
+            "scale": np.full(4, 0.01),
+            "close": close,
+            "next_open": nxt,
+            "r_on": r_on,
+            "pred_r": np.zeros(4),
+            "implied_open": close,
+            "implied_open_given_hedge": nxt,
+        }
+    )
+    out = slim_accuracy(score_eval_frame(df, min_names=2))
+    assert out["dir_pct"] == 0.0
+    expect = float(np.mean(np.abs(nxt - close) / close))
+    assert abs(out["mae_pct"] - expect) < 1e-12
+
