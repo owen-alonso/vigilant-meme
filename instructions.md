@@ -129,6 +129,9 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight_sp
 # causal CS-dispersion stress gate (TRAIN-fit kind/W/τ; default off)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --live-costs --long-only --disp-gate-kind cc --disp-gate-window 1 --disp-gate-tau 0.02
+# overnight ⊕ close-to-close rank ensemble is VAL-gated in overnight_shorting.py (w=1 default)
+python -m forecast.training --universe liquid --interval daily --skip-only \
+  --label-return close --checkpoint-dir checkpoints/forecast_ridge
 # harsh auction stress
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --cost-bundle harsh

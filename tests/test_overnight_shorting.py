@@ -18,6 +18,8 @@ from forecast.shorting import (
     decide_weekday_promote,
     decide_sector_promote,
     decide_disp_gate_promote,
+    decide_ensemble_promote,
+    blend_cs_scores,
     decide_lo_refine,
     decide_ls_promote,
     evaluate_overnight_shorting,
@@ -382,6 +384,58 @@ def test_decide_disp_gate_promote_is_val_only_and_needs_coverage():
     assert thin["spec"]["kind"] == ""
 
 
+def test_blend_cs_scores_w1_is_z_a_and_w0_is_z_b():
+    dates = pd.bdate_range("2022-01-03", periods=4)
+    names = ["A", "B", "C", "D"]
+    pred_a = pd.DataFrame(
+        [[1.0, 2.0, 3.0, 4.0]] * 4, index=dates, columns=names
+    )
+    pred_b = pd.DataFrame(
+        [[4.0, 3.0, 2.0, 1.0]] * 4, index=dates, columns=names
+    )
+    z1 = blend_cs_scores(pred_a, pred_b, 1.0)
+    z0 = blend_cs_scores(pred_a, pred_b, 0.0)
+    mid = blend_cs_scores(pred_a, pred_b, 0.5)
+    assert z1.loc[dates[0], "D"] > z1.loc[dates[0], "A"]
+    assert z0.loc[dates[0], "A"] > z0.loc[dates[0], "D"]
+    assert mid.loc[dates[0]].abs().max() < 1e-9
+    # Mutating B must not change w=1.
+    pred_b2 = pred_b * -1.0
+    assert blend_cs_scores(pred_a, pred_b2, 1.0).equals(z1)
+
+
+def test_decide_ensemble_promote_is_val_only():
+    grid = {
+        "baseline": {
+            "name": "ens_w1.00",
+            "weight": 1.0,
+            "unlevered_net_ir": 1.0,
+            "unlevered_max_dd": -0.20,
+        },
+        "best": {
+            "name": "ens_w0.50",
+            "weight": 0.5,
+            "unlevered_net_ir": 1.20,
+            "unlevered_max_dd": -0.18,
+        },
+    }
+    juicy_test = {"unlevered_net_ir": 9.9}
+    yes = decide_ensemble_promote(grid)
+    assert yes["promote_ensemble"] is True
+    assert yes["gated_on"] == "val"
+    assert yes["spec"]["weight"] == 0.5
+    assert juicy_test["unlevered_net_ir"] > yes["ir_ensemble"]
+
+    no = decide_ensemble_promote(
+        {
+            "baseline": grid["baseline"],
+            "best": {**grid["baseline"]},
+        }
+    )
+    assert no["promote_ensemble"] is False
+    assert no["spec"]["weight"] == 1.0
+
+
 def test_synthetic_names_map_to_sector_etfs_and_etfs_are_not_book_names():
     assert hedge_symbol_for("S00", sector_residual=True) == "XLK"
     assert hedge_symbol_for("S05", sector_residual=True) == "XLK"
@@ -491,6 +545,8 @@ def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
     assert "PROMOTE WEEKDAY MASK" in text
     assert "PROMOTE SECTOR-OVERNIGHT" in text
     assert "PROMOTE DISP-GATE" in text
+    assert payload["ensemble_promotion"]["gated_on"] == "val"
+    assert "PROMOTE OVERNIGHT" in text and "ENSEMBLE" in text
     assert "VAL LONG-ONLY GRID" in text
     assert "VAL LONG-ONLY REFINE" in text
     assert "LS HAIRCUT EXPERIMENT" in text
