@@ -16,6 +16,9 @@ excess vs the unconditional overnight-up rate (~54.3% on liquid TEST), not
 vs a coin flip. Book-aligned sleeve up-rate is the primary accuracy object
 vs that floor; pooled TS direction stays report-only. IDEA F gates that
 sleeve as an optional live_long_only path on VAL unlev net IR / max DD.
+IDEA G fits residual→overnight MAE maps on the sector-overnight skip
+(affine_l1 / piecewise_l1 / huber_affine / bin_calibrate) and promotes a
+new MAE default only on a clear locked-VAL % MAE margin.
 """
 
 from __future__ import annotations

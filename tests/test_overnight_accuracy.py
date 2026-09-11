@@ -21,7 +21,9 @@ from forecast.accuracy import (
     cond_abs_mask,
     cs_top_abs_mask,
     decide_book_aligned_promote,
+    decide_sector_mae_promote,
     fit_book_aligned_on_train,
+    fit_residual_mae_maps,
     fit_cond_dir_blend,
     fit_confidence_blend,
     fit_cs_left_veto,
@@ -324,6 +326,11 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert payload["conviction_live_promotion"]["gated_on"] == "val"
     assert payload["conviction_live_promotion"]["default_book_unchanged"] is True
     assert "PROMOTE CONVICTION LIVE" in report
+    assert payload["sector_mae_fit"]["fit_split"] == "train"
+    assert payload["sector_mae_fit"]["hedge"] == "sector_overnight"
+    assert payload["sector_mae_promotion"]["gated_on"] == "val"
+    assert payload["sector_mae_promotion"]["live_book_unchanged"] is True
+    assert "PROMOTE SECTOR-MAE" in report
 
 
 def test_zero_move_direction_is_zero_not_nan():
@@ -546,6 +553,69 @@ def test_apply_calibrate_spec_affine_and_veto():
     # Empty spec is residual*sigma passthrough (generate.py with no overlay).
     raw = apply_calibrate_spec(p, {})
     assert np.allclose(raw, p)
+
+
+def test_fit_residual_mae_maps_is_train_only():
+    rng = np.random.default_rng(2)
+    p = rng.normal(scale=0.01, size=80)
+    y = 0.6 * p + 0.002 + rng.normal(scale=0.004, size=80)
+    later_y = -0.6 * p - 0.002 + rng.normal(scale=0.004, size=80)
+    spec = fit_residual_mae_maps(p, y)
+    leaked = fit_residual_mae_maps(p, later_y)
+    assert spec["fit_split"] == "train"
+    assert spec["hedge"] == "sector_overnight"
+    assert set(spec["maps"]) >= {"affine_l1", "piecewise_l1", "huber_affine", "bin_calibrate"}
+    a0 = float(spec["maps"]["affine_l1"]["a"])
+    a1 = float(leaked["maps"]["affine_l1"]["a"])
+    assert abs(a0 - a1) > 0.05
+
+
+def test_decide_sector_mae_promote_is_val_only():
+    resid = {"mae_pct": 0.00600, "dir_pct": 51.0, "excess_pp": -3.0}
+    zero = {"mae_pct": 0.00700, "dir_pct": 0.0, "excess_pp": -50.0}
+    median = {"mae_pct": 0.00680, "dir_pct": 54.0, "excess_pp": 0.0}
+    maps = {
+        "affine_l1": {"kind": "affine_l1", "a": 0.8, "b": 0.001},
+        "piecewise_l1": {"kind": "piecewise_l1"},
+        "huber_affine": {"kind": "huber_affine", "a": 0.7, "b": 0.001},
+        "bin_calibrate": {"kind": "bin_calibrate"},
+    }
+    # Clears floors by 1.0 bp but loses to current ts_ridge default.
+    almost = {
+        "affine_l1": {"mae_pct": 0.00590, "dir_pct": 52.0, "excess_pp": -2.0, "mae_usd": 1.1},
+        "piecewise_l1": {"mae_pct": 0.00595, "dir_pct": 52.0, "excess_pp": -2.0},
+        "huber_affine": {"mae_pct": 0.00592, "dir_pct": 52.0, "excess_pp": -2.0},
+        "bin_calibrate": {"mae_pct": 0.00610, "dir_pct": 51.0, "excess_pp": -3.0},
+    }
+    no = decide_sector_mae_promote(
+        val_maps=almost,
+        val_residual=resid,
+        val_zero=zero,
+        val_median=median,
+        val_current={"mae_pct": 0.00550, "dir_pct": 64.0},
+        current_name="ts_ridge_no_long_ts",
+        maps=maps,
+    )
+    assert no["promote_sector_mae"] is False
+    assert no["gated_on"] == "val"
+    assert no["live_book_unchanged"] is True
+    yes_maps = {
+        **almost,
+        "huber_affine": {"mae_pct": 0.00540, "dir_pct": 52.0, "excess_pp": -2.0, "mae_usd": 1.0},
+    }
+    yes = decide_sector_mae_promote(
+        val_maps=yes_maps,
+        val_residual=resid,
+        val_zero=zero,
+        val_median=median,
+        val_current={"mae_pct": 0.00550, "dir_pct": 64.0},
+        current_name="ts_ridge_no_long_ts",
+        maps=maps,
+    )
+    assert yes["promote_sector_mae"] is True
+    assert yes["best_name"] == "huber_affine"
+    juicy = {"mae_pct": 0.001, "dir_pct": 80.0}
+    assert juicy["mae_pct"] < yes["val_mae_pct"]
 
 
 def test_cs_top_abs_mask_selects_top_and_abs_floor():

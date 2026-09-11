@@ -58,6 +58,9 @@ BOOK_ALIGN_ABS_QS = (0.0, 0.50, 0.70)  # 0 = no |pred| floor
 BOOK_UP_FLOOR_PP = 0.50
 BOOK_UP_BASE_PP = 0.20
 BOOK_ALIGN_COVER = 0.05
+# IDEA G: clear VAL % MAE margin vs residual×σ / zero-move / train-median (0.5 bp).
+MAE_LIFT = 5e-5
+SECTOR_MAE_MAPS = ("affine_l1", "piecewise_l1", "huber_affine", "bin_calibrate")
 TURNOVER_COL = FEATURE_NAMES.index("turnover_z") if "turnover_z" in FEATURE_NAMES else None
 VOL_LEVEL_COL = FEATURE_NAMES.index("vol_level") if "vol_level" in FEATURE_NAMES else None
 # PR #8 locked-TEST residual*sigma print (do not retarget; compare on the same window).
@@ -1171,6 +1174,9 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         live_txt = format_conviction_live_block(payload)
         if live_txt:
             lines.extend(["", live_txt])
+        mae_txt = format_sector_mae_block(payload)
+        if mae_txt:
+            lines.extend(["", mae_txt])
     conf = payload.get("confidence")
     if conf:
         lines.extend(["", format_confidence_block(conf)])
@@ -1412,6 +1418,174 @@ def apply_bin_constants(
     out = out.astype(np.float64, copy=True)
     out[~np.isfinite(xv)] = np.nan
     return out
+
+
+def fit_residual_mae_maps(
+    pred_r: np.ndarray,
+    r_on: np.ndarray,
+) -> dict[str, Any]:
+    """TRAIN-only residual→overnight maps on sector-overnight skip pred*sigma."""
+    a_l1, b_l1 = fit_affine_l1(pred_r, r_on)
+    a_h, b_h = fit_affine_huber(pred_r, r_on)
+    a_pos, b_pos, a_neg, b_neg = fit_piecewise_l1(pred_r, r_on)
+    edges, values = fit_bin_constants(pred_r, r_on, n_bins=7)
+    return {
+        "fit_split": "train",
+        "hedge": "sector_overnight",
+        "maps": {
+            "affine_l1": {"kind": "affine_l1", "a": float(a_l1), "b": float(b_l1)},
+            "huber_affine": {"kind": "huber_affine", "a": float(a_h), "b": float(b_h)},
+            "piecewise_l1": {
+                "kind": "piecewise_l1",
+                "a_pos": float(a_pos),
+                "b_pos": float(b_pos),
+                "a_neg": float(a_neg),
+                "b_neg": float(b_neg),
+            },
+            "bin_calibrate": {
+                "kind": "bin_calibrate",
+                "edges": np.asarray(edges, dtype=np.float64).tolist(),
+                "values": np.asarray(values, dtype=np.float64).tolist(),
+            },
+        },
+        "note": (
+            "Maps residual*sigma → raw overnight gap. Fit on sector-overnight "
+            "skip preds (IDEA 3), not SPY-only residual. Next open is never a feature."
+        ),
+    }
+
+
+def score_residual_mae_map(
+    df: pd.DataFrame,
+    spec: Mapping[str, Any],
+    *,
+    min_names: int,
+) -> dict[str, float]:
+    if df.empty:
+        return slim_accuracy({"empty": True})
+    hat = apply_calibrate_spec(
+        df["pred_r"].to_numpy(dtype=np.float64),
+        spec,
+    )
+    return slim_accuracy(_score_pred_r(df, hat, min_names))
+
+
+def decide_sector_mae_promote(
+    *,
+    val_maps: dict[str, dict[str, Any]],
+    val_residual: dict[str, Any],
+    val_zero: dict[str, Any],
+    val_median: dict[str, Any],
+    val_current: dict[str, Any] | None,
+    current_name: str,
+    maps: dict[str, Any],
+) -> dict[str, Any]:
+    """VAL-only. Promote a sector-overnight MAE map by a clear % MAE margin."""
+    scored: list[tuple[str, dict[str, Any]]] = []
+    for name in SECTOR_MAE_MAPS:
+        row = dict(val_maps.get(name) or {})
+        mae = _as_float(row.get("mae_pct"))
+        if np.isfinite(mae):
+            scored.append((name, row))
+    resid = _as_float((val_residual or {}).get("mae_pct"))
+    zero = _as_float((val_zero or {}).get("mae_pct"))
+    median = _as_float((val_median or {}).get("mae_pct"))
+    floor = min(
+        [x for x in (resid, zero, median) if np.isfinite(x)],
+        default=float("nan"),
+    )
+    best_name = ""
+    best_row: dict[str, Any] = {}
+    best_mae = float("nan")
+    for name, row in scored:
+        mae = _as_float(row.get("mae_pct"))
+        if not np.isfinite(best_mae) or mae < best_mae:
+            best_mae = mae
+            best_name = name
+            best_row = row
+    margin = (
+        float(floor - best_mae)
+        if np.isfinite(floor) and np.isfinite(best_mae)
+        else float("nan")
+    )
+    floors_ok = bool(np.isfinite(margin) and margin >= MAE_LIFT)
+    cur_name = str(current_name or "residual_sigma")
+    cur_mae = _as_float((val_current or {}).get("mae_pct"))
+    if not np.isfinite(cur_mae):
+        cur_mae = resid
+    vs_current = (
+        float(cur_mae - best_mae)
+        if np.isfinite(cur_mae) and np.isfinite(best_mae)
+        else float("nan")
+    )
+    current_is_family = cur_name in SECTOR_MAE_MAPS
+    if current_is_family:
+        current_ok = True
+    else:
+        current_ok = bool(np.isfinite(vs_current) and vs_current >= MAE_LIFT)
+    same = bool(best_name and best_name == cur_name)
+    promote = bool(best_name and floors_ok and current_ok and not same)
+    dir_pct = _as_float(best_row.get("dir_pct"))
+    resid_dir = _as_float((val_residual or {}).get("dir_pct"))
+    med_dir = _as_float((val_median or {}).get("dir_pct"))
+    dir_ok = bool(
+        np.isfinite(dir_pct)
+        and np.isfinite(resid_dir)
+        and np.isfinite(med_dir)
+        and dir_pct >= resid_dir + 100.0 * DIR_LIFT
+        and dir_pct >= med_dir + 100.0 * DIR_LIFT
+    )
+    if not best_name:
+        reason = "NO PROMOTE: no finite VAL MAE among sector-overnight maps."
+    elif same and floors_ok:
+        reason = (
+            f"NO NEW MAE DEFAULT: {best_name} is already the accuracy default "
+            f"(VAL MAE% {100.0 * best_mae:.4f}, margin vs floors {1e4 * margin:+.2f} bp)."
+        )
+    elif not floors_ok:
+        reason = (
+            f"NO PROMOTE: best {best_name} VAL MAE% {100.0 * best_mae:.4f} vs "
+            f"residual {100.0 * resid:.4f} / zero {100.0 * zero:.4f} / "
+            f"median {100.0 * median:.4f} (margin {1e4 * margin:+.2f} bp "
+            f"< +{1e4 * MAE_LIFT:.1f} bp). Keep {cur_name}."
+        )
+    elif not current_ok:
+        reason = (
+            f"NO PROMOTE: {best_name} VAL MAE% {100.0 * best_mae:.4f} does not beat "
+            f"current default {cur_name} {100.0 * cur_mae:.4f} by "
+            f"+{1e4 * MAE_LIFT:.1f} bp (delta {1e4 * vs_current:+.2f} bp). "
+            f"Keep {cur_name}."
+        )
+    else:
+        reason = (
+            f"PROMOTE sector-overnight MAE default {best_name}: VAL MAE% "
+            f"{100.0 * best_mae:.4f} beats residual/zero/median by "
+            f"{1e4 * margin:+.2f} bp and current {cur_name} by "
+            f"{1e4 * vs_current:+.2f} bp. Live q20 book unchanged."
+        )
+    return {
+        "promote_sector_mae": promote,
+        "gated_on": "val",
+        "reason": reason,
+        "name": best_name if promote else cur_name,
+        "best_name": best_name,
+        "spec": dict((maps or {}).get(best_name) or {}) if promote else {},
+        "val_best": best_row,
+        "val_residual": dict(val_residual or {}),
+        "val_zero": dict(val_zero or {}),
+        "val_median": dict(val_median or {}),
+        "val_current": dict(val_current or {}),
+        "current_name": cur_name,
+        "val_mae_pct": best_mae,
+        "val_floor_mae_pct": floor,
+        "val_margin_bp": 1e4 * margin if np.isfinite(margin) else float("nan"),
+        "val_vs_current_bp": 1e4 * vs_current if np.isfinite(vs_current) else float("nan"),
+        "mae_lift": MAE_LIFT,
+        "dir_report_only": (not dir_ok),
+        "dir_clears_gates": dir_ok,
+        "hedge": "sector_overnight",
+        "live_book_unchanged": True,
+    }
 
 
 def _bin_index(x: np.ndarray, edges: np.ndarray, n_bins: int) -> np.ndarray:
@@ -2877,6 +3051,69 @@ def format_conviction_live_block(payload: dict[str, Any]) -> str:
     return _conviction_live_block(payload)
 
 
+def _fmt_mae_row(label: str, row: Mapping[str, Any] | None) -> str:
+    r = dict(row or {})
+    return (
+        f"  {label:<16}  "
+        f"MAE% {100.0 * _as_float(r.get('mae_pct')):.4f}  "
+        f"MAE$ {_as_float(r.get('mae_usd')):.4f}  "
+        f"dir {_as_float(r.get('dir_pct')):.2f}%  "
+        f"xs {_as_float(r.get('excess_pp')):+.2f}pp"
+    )
+
+
+def format_sector_mae_block(payload: dict[str, Any]) -> str:
+    promo = payload.get("sector_mae_promotion") or {}
+    cmp = payload.get("sector_mae_compare") or {}
+    fit = payload.get("sector_mae_fit") or {}
+    if not promo and not cmp:
+        return ""
+    yes = bool(promo.get("promote_sector_mae"))
+    val_maps = cmp.get("val") or {}
+    test_maps = cmp.get("test") or {}
+    lines = [
+        f"PROMOTE SECTOR-MAE? {'YES' if yes else 'NO'}",
+        "  TRAIN residual→overnight maps on sector-overnight skip pred*sigma "
+        "(affine_l1 / piecewise_l1 / huber_affine / bin_calibrate). "
+        "VAL % MAE must beat residual×σ AND zero-move AND train-median by "
+        f"≥{1e4 * MAE_LIFT:.1f} bp, and must not lose to the current MAE default. "
+        "Dir excess is report-only unless it also clears dir gates. "
+        "Live q20 book unchanged.",
+        f"  hedge={fit.get('hedge') or promo.get('hedge')!r}  "
+        f"fit_split={fit.get('fit_split')!r}  "
+        f"current_default={promo.get('current_name')!r}",
+        "  VAL (gate):",
+        _fmt_mae_row("residual×σ", cmp.get("val_residual") or {}),
+        _fmt_mae_row("zero-move", cmp.get("val_zero") or {}),
+        _fmt_mae_row("train-median", cmp.get("val_median") or {}),
+    ]
+    for name in SECTOR_MAE_MAPS:
+        mark = " *" if name == promo.get("best_name") else ""
+        lines.append(_fmt_mae_row(name + mark, val_maps.get(name) or {}))
+    if cmp.get("val_current") and str(promo.get("current_name") or "") not in SECTOR_MAE_MAPS:
+        lines.append(
+            _fmt_mae_row(
+                f"current {promo.get('current_name')}",
+                cmp.get("val_current") or {},
+            )
+        )
+    lines.extend(
+        [
+            f"  VAL best={promo.get('best_name')!r}  "
+            f"margin vs floors {_as_float(promo.get('val_margin_bp')):+.2f} bp  "
+            f"vs current {_as_float(promo.get('val_vs_current_bp')):+.2f} bp  "
+            f"(need ≥+{1e4 * MAE_LIFT:.1f} bp)  "
+            f"dir_clears_gates={bool(promo.get('dir_clears_gates'))}",
+            "  TEST (report-only):",
+            _fmt_mae_row("residual×σ", cmp.get("test_residual") or {}),
+        ]
+    )
+    for name in SECTOR_MAE_MAPS:
+        lines.append(_fmt_mae_row(name, test_maps.get(name) or {}))
+    lines.append(f"  {promo.get('reason') or 'no decision'}")
+    return "\n".join(lines)
+
+
 def format_confidence_block(conf: dict[str, Any]) -> str:
     lines = [
         "CONFIDENCE ( |pred_r| vs TRAIN quantiles; scored on locked TEST )",
@@ -3547,6 +3784,31 @@ def evaluate_overnight_accuracy(
     default_pr_test = pred_r_by_name.get(default_name, {}).get("test")
     if default_pr_test is None:
         default_pr_test = te["pred_r"].to_numpy(dtype=np.float64)
+    by_ablate = {str(r.get("name")): r for r in rows}
+    sector_mae_fit = fit_residual_mae_maps(train_pred_r, train_r)
+    sector_mae_val = {
+        n: dict((by_ablate.get(n) or {}).get("val") or {}) for n in SECTOR_MAE_MAPS
+    }
+    sector_mae_test = {
+        n: dict((by_ablate.get(n) or {}).get("test") or {}) for n in SECTOR_MAE_MAPS
+    }
+    sector_mae_promotion = decide_sector_mae_promote(
+        val_maps=sector_mae_val,
+        val_residual=dict((by_ablate.get("residual_sigma") or {}).get("val") or {}),
+        val_zero=dict((by_ablate.get("zero_move") or {}).get("val") or {}),
+        val_median=dict((by_ablate.get("train_median_gap") or {}).get("val") or {}),
+        val_current=dict((by_ablate.get(default_name) or {}).get("val") or {}),
+        current_name=default_name,
+        maps=sector_mae_fit.get("maps") or {},
+    )
+    if sector_mae_promotion.get("promote_sector_mae"):
+        winner = str(sector_mae_promotion.get("best_name") or default_name)
+        promotion["price"] = winner
+        promotion["accuracy_default"] = winner
+        default_name = winner
+        default_pr_test = pred_r_by_name.get(winner, {}).get("test")
+        if default_pr_test is None:
+            default_pr_test = te["pred_r"].to_numpy(dtype=np.float64)
 
     payload["ablation"] = {
         "rows": rows,
@@ -3567,6 +3829,11 @@ def evaluate_overnight_accuracy(
             "decile_reliability": decile_rel,
             "cs_left_veto": cs_veto,
             "logistic_up": logit_up,
+            "sector_mae": {
+                "hedge": "sector_overnight",
+                "fit_split": "train",
+                "maps": list(SECTOR_MAE_MAPS),
+            },
             "book_aligned": {
                 "q": float((book_aligned_fit.get("chosen") or {}).get("q") or 0.80),
                 "abs_tau": float(
@@ -3727,6 +3994,27 @@ def evaluate_overnight_accuracy(
         ),
     }
     payload["book_aligned_promotion"] = book_aligned_promotion
+    payload["sector_mae_fit"] = sector_mae_fit
+    payload["sector_mae_compare"] = {
+        "hedge": "sector_overnight",
+        "val": sector_mae_val,
+        "test": sector_mae_test,
+        "val_residual": dict((by_ablate.get("residual_sigma") or {}).get("val") or {}),
+        "val_zero": dict((by_ablate.get("zero_move") or {}).get("val") or {}),
+        "val_median": dict((by_ablate.get("train_median_gap") or {}).get("val") or {}),
+        "val_current": dict((by_ablate.get(str(promotion.get("accuracy_default") or default_name)) or {}).get("val") or {}),
+        "test_residual": dict((by_ablate.get("residual_sigma") or {}).get("test") or {}),
+        "test_zero": dict((by_ablate.get("zero_move") or {}).get("test") or {}),
+        "test_median": dict((by_ablate.get("train_median_gap") or {}).get("test") or {}),
+        "current_name": str(promotion.get("accuracy_default") or default_name),
+        "note": (
+            "VAL % MAE vs residual×σ / zero-move / train-median. "
+            "Promote new MAE default only with a clear margin. "
+            "Dir excess is report-only unless it also clears dir gates. "
+            "Live q20 book unchanged."
+        ),
+    }
+    payload["sector_mae_promotion"] = sector_mae_promotion
     from forecast.shorting import (
         compare_conviction_live,
         decide_conviction_live_promote,
@@ -3753,6 +4041,8 @@ def evaluate_overnight_accuracy(
             f"promote_book_aligned="
             f"{bool(book_aligned_promotion.get('promote_book_aligned'))}  "
             f"promote_conviction_live="
-            f"{bool(conviction_live_promotion.get('promote_conviction_live'))}"
+            f"{bool(conviction_live_promotion.get('promote_conviction_live'))}  "
+            f"promote_sector_mae="
+            f"{bool(sector_mae_promotion.get('promote_sector_mae'))}"
         )
     return payload

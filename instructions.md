@@ -75,6 +75,7 @@ python -m forecast.training --universe liquid --interval daily --skip-only \
 # logistic_up = TRAIN logistic P(up|pred_r) with TRAIN-chosen τ
 # book_aligned = overnight up-rate of TRAIN-chosen top-q residual names vs uncond floor
 # conviction_live = optional --live-costs --long-only IR gate on that sleeve vs q20
+# sector_mae = TRAIN residual→overnight maps on sector-overnight skip; VAL % MAE gate
 python scripts/overnight_accuracy.py --data-dir data --universe liquid \
     --json checkpoints/forecast_ridge_overnight/accuracy.json \
     --calibrate-json checkpoints/forecast_ridge_overnight/overnight_calibrate.json
