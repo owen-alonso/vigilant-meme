@@ -83,9 +83,38 @@ class DataConfig:
     residual_target: bool = True
     beta_halflife: int = 63
     # Cross-section batches when at least this many names print on a date.
-    cross_section_min_names: int = 8
+    # 30 keeps the ridge off sparse 1970s panels; 8 is the absolute floor in tests.
+    cross_section_min_names: int = 30
     # Weekly mixed adjusted/raw files have lag-1 autocorr << 0. Set True to skip.
     allow_mixed_prices: bool = False
+    # Restrict loaded parquets to a train-era-locked list or all.
+    universe: str = ""
+    # Same-day cross-sectional z-scores of momentum / volume (known at close).
+    cs_zscore: bool = True
+    # y = r_{t+h} - beta_t * r_sector_{t+h} when the sector ETF parquet exists.
+    # beta still uses data through t only; missing sector ETFs fall back to SPY.
+    sector_residual: bool = True
+    # Train / score single-name equities only. SPY and sector/macro ETFs still
+    # load for features and hedges, but they are not book names.
+    equities_only: bool = True
+    # Drop *train* labels before this date. Empty = keep every train session.
+    # Val/test calendar cuts are unchanged (locked test window).
+    train_from: str = "1999-01-01"
+    # y = r - b_mkt * SPY_fwd - b_sec * sector_fwd (two-factor, causal betas).
+    double_residual: bool = False
+    # Also residualize ret_* features vs same-bar hedges (not labels).
+    residualize_features: bool = False
+    # Optional third factor vs a mapped industry ETF when that parquet exists.
+    industry_residual: bool = False
+    # Which forward log-return the residual label uses. ``close`` is close_t →
+    # close_{t+h} (the locked close-to-close book). ``overnight`` is
+    # close_t → open_{t+h} (gap residual; next open is a *label*, never a
+    # feature). ``session`` is open_{t+h} → close_{t+h}. ``open_fill`` is
+    # overnight plus (fill_minutes/390) of next-session return — a sensitivity,
+    # not the default overnight book. Features stay at close t.
+    label_return: str = "close"
+    # Minutes after the next open for ``open_fill``. 0 = unused. 15 ≈ 15/390.
+    fill_minutes: int = 0
 
     def is_daily(self) -> bool:
         return self.interval == "daily"
@@ -106,6 +135,31 @@ class DataConfig:
         # Older checkpoints were 1-minute / next-hour and had no interval field.
         if "interval" not in payload and int(payload.get("horizon", 1)) >= 60:
             payload["interval"] = "1min"
+        # New protocol flags: absent on old checkpoints means the old behavior.
+        if "sector_residual" not in payload:
+            payload["sector_residual"] = False
+        if "equities_only" not in payload:
+            payload["equities_only"] = False
+        if "train_from" not in payload:
+            payload["train_from"] = ""
+        if "double_residual" not in payload:
+            payload["double_residual"] = False
+        if "residualize_features" not in payload:
+            payload["residualize_features"] = False
+        if "industry_residual" not in payload:
+            payload["industry_residual"] = False
+        if "label_return" not in payload:
+            payload["label_return"] = "close"
+        if "fill_minutes" not in payload:
+            payload["fill_minutes"] = 0
+        from forecast.overnight import fill_minutes_for, normalize_label_return
+
+        payload["label_return"] = normalize_label_return(payload.get("label_return"))
+        payload["fill_minutes"] = int(
+            fill_minutes_for(payload["label_return"], int(payload.get("fill_minutes") or 0))
+            if payload["label_return"] == "open_fill"
+            else 0
+        )
         return cls(**filter_dataclass_fields(cls, payload))
 
 
@@ -198,7 +252,7 @@ def interval_model_kwargs(interval: str) -> dict[str, Any]:
 class ForecastModelConfig:
     """Mamba backbone sized for continuous financial features."""
 
-    n_features: int = 25
+    n_features: int = 44
     d_model: int = 96
     n_layer: int = 4
     d_state: int = 16
@@ -267,17 +321,56 @@ class ForecastTrainConfig:
     sign_loss_weight: float = 0.4
     sign_min_abs: float = 0.25
     # Pairwise RankNet on labelled bars in the batch (Spearman-like).
-    rank_loss_weight: float = 0.4
+    # Default matches the CS ranking objective; do not raise ic_loss_weight.
+    rank_loss_weight: float = 1.0
     # Match pred std to target std so Pearson cannot explode |pred|.
     pred_std_weight: float = 0.5
     # Closed-form ridge readout copied into the linear skip at step 0.
     # 0 keeps Xavier init.
-    ridge_skip: float = 1.0
+    ridge_skip: float = 10.0
+    # Date-demean features/targets before ridge (the CS linear baseline).
+    ridge_cs_demean: bool = True
+    # Huber/MSE/NLL on within-date demeaned pred/target when a date has breadth.
+    cs_center_loss: bool = True
     # After ridge, freeze the skip so AdamW cannot decay the linear baseline.
     skip_lr_mult: float = 0.0
     freeze_skip: bool = True
     # Apply ridge, log last-bar train/val/test IC, write best.pt, exit (no AdamW).
     skip_only: bool = False
+    # Skip-only / encoder baseline eval on the train split (slow on CS dates).
+    eval_train_split: bool = True
+    # Frozen skip vs causal expanding/rolling refit (walk-forward uses labels < t).
+    ridge_window: str = "frozen"
+    # Trailing calendar days for rolling ridge. Ignored when window=frozen.
+    ridge_lookback_days: int = 1260
+    # Fit ridge on within-date ranks of y (the CS trading object).
+    ridge_rank_target: bool = True
+    # Within-date z-score features in the ridge design (kills calendar constants).
+    ridge_cs_zscore: bool = False
+    # Drop long TS + calendar from the skip (val-selected with CS products).
+    ridge_features: str = "no_long_ts"
+    # Exponential recency weights on train dates (0 = uniform).
+    ridge_date_halflife: float = 0.0
+    # Winsorize raw y within date before the ridge (ignored when rank_target).
+    ridge_y_winsor: float = 0.0
+    # Winsorize features within date (in residual-std units). Val-selected 3.
+    ridge_feat_winsor: float = 3.0
+    # Drop the top this fraction of train dates by residual dispersion.
+    ridge_drop_disp_q: float = 0.0
+    # Huber IRLS delta in MAD units (0 = closed-form ridge only).
+    ridge_huber: float = 0.0
+    # Zero weights that flip the train univariate CS IC sign.
+    ridge_sign_constrain: bool = False
+    # Drop dot-com + GFC dates from the frozen skip fit.
+    ridge_drop_crashes: bool = False
+    # ``ridge`` / ``listnet`` / ``ranknet`` skip objective.
+    ridge_objective: str = "ridge"
+    # Equalize per-year total weight in the frozen skip (train only).
+    ridge_year_balance: bool = False
+    # Year-sign stability mask: ``train`` or ``train_val`` (empty = off).
+    ridge_year_stable: str = ""
+    # ListNet (softmax CE) within date. 0 keeps RankNet-only ranking.
+    listnet_loss_weight: float = 0.0
     # Residual-std head. Trained by gaussian NLL, or by sigma_aux_weight when
     # the mean loss is Huber/MSE. Default 0 matches heteroscedastic=False.
     sigma_aux_weight: float = 0.0
@@ -313,6 +406,7 @@ def validate_loss_head(model_cfg: ForecastModelConfig, train_cfg: ForecastTrainC
         "ic_loss_weight",
         "sign_loss_weight",
         "rank_loss_weight",
+        "listnet_loss_weight",
         "pred_std_weight",
         "ridge_skip",
         "skip_lr_mult",

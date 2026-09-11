@@ -2,63 +2,165 @@
 
 This file is the operating manual for the **equity forecast** model in `forecast/`. It is not the language-model path (`main.py`, Shakespeare, Dynamic A LM). Those share a Mamba backbone; they do not share data, targets, or `generate.py`.
 
+The **estimand** is last-bar **cross-sectional** Pearson/Spearman on **next-day residual** returns (sector ETF when the parquet exists, otherwise SPY), over a train-era-locked liquid **equity** book (50–200 names). Index/sector/macro ETFs load as hedges, not as names you rank. Train labels start in 1999 by default; val/test calendar cuts stay locked.
+
+Success band (honest, locked test window): mean CS IC **0.04–0.08** with t-stat **> 3**, and long-short **net IR ~1** after costs **without** a ruinous path (report unlevered IR + causal-vol max DD; `vol_target=1.0` is a 100% vol book). A single-date CS IC print near 0.14 can happen; report the **mean and the CS IC time series**. Do not retarget after seeing test. Dynamic A / bigger Mamba / more IC-loss weight are **not** the path.
+
 Run commands from the **repo root**.
 
 ```bash
 python -m forecast.training -h
 python -m forecast.generate -h
+python -m forecast.backtest -h
 ```
 
 ---
 
 ## What the model actually does
 
-Given daily OHLCV for one equity (Alpha Vantage), it predicts the **expected log return over the next trading day**.
+Given **daily** OHLCV for a liquid universe (Yahoo/Stooq split-adjusted, plus SPY and sector ETFs), it predicts each **equity's** next-session residual log return vs a trailing-beta **sector or SPY** hedge, in vol units.
 
 It does **not**:
 
 - Pull the live tape unless you ran `forecast.download` first. `generate.py` reads a **local parquet**. `LATEST as of …` is the last timestamp **in that file**, not wall-clock now.
-- Forecast overnight gaps as a special case: the target is the next **session close**, so weekends are just a longer calendar span between two bars.
-- Output a trade, size, or “buy/sell”. It outputs a number in **basis points** and an implied price.
+- Mix overnight gap IC into the close-to-close headline. Default `--label-return close` predicts the next **session close**. `--label-return overnight` is a **different** book: `log(open_{t+1}) - log(close_t)` residual (next open is a label, never a feature).
+- Output a trade, size, or “buy/sell”. It outputs a number in **basis points** (and a residual score used by the backtest).
 - See the future day it is predicting. Features are causal (bars `<= t` only). **Realized** is scored afterwards when that future already exists in the file.
+- Use next-bar **open** as a feature. Do not disable the calendar embargo. Same-bar `open_t` is a candle feature known at the close.
 
-The network does not predict dollars. It predicts a **volatility-normalized** return. `generate.py` multiplies by the vol known at bar `t` and reports basis points.
+The network predicts a **volatility-normalized residual**. `generate.py` multiplies by the vol known at bar `t` and reports basis points.
 
 \[
-y_t = \frac{\log C_{t+60} - \log C_t}{\sigma_t \sqrt{60}}
+y_t = \frac{r_{t+1} - \beta_t r^{\mathrm{hedge}}_{t+1}}{\sigma_t}
 \]
 
-\(\sigma_t\) is EWM realized vol using only bars **up to \(t-1\)**. **1 bp = 0.01%**. **+10 bp** means the model expects the price about **0.10% higher** in one hour.
+Default \(r_{t+1}\) is close-to-close. Overnight is \(r^{on}_t = \log(\mathrm{open}_{t+1}) - \log(\mathrm{close}_t)\). \(\beta_t\) uses same-bar returns **through \(t\) only**. The hedge is the mapped sector ETF when `--sector-residual` (default) and that parquet exists, otherwise SPY. `--double-residual` fits causal betas vs SPY **and** sector; `--industry-residual` adds a mapped industry ETF when that parquet exists. `--residualize-features` subtracts the same betas times same-bar hedge `ret_*` (not a label leak). \(\sigma_t\) is EWM realized vol using only bars **up to \(t-1\)**. **1 bp = 0.01%**. Hedge *forward* return is a **label** term, never a feature.
 
-The same weights apply to any ticker: features are scale-free (no per-symbol embedding). That does **not** mean every name is in-sample; see [Out of sample](#out-of-sample-and-vendors).
+The same weights apply to any ticker: features are scale-free (no per-symbol embedding). Trading names are equities on the train-era-locked list in `forecast/universe.py`; SPY and sector/macro ETFs are **hedges**, not book names.
 
 ---
 
-## Quick start
+## Quick start (CS residual protocol)
 
-1. Pull daily bars from Alpha Vantage into `data/<SYMBOL>_daily.parquet`:
-
-```bash
-python -m forecast.download --symbols AAPL,MSFT
-```
-2. Train (use `best.pt`, not `last.pt`):
+1. Wipe mixed weekly caches if you still have them, then pull **adjusted daily** history for the locked universe:
 
 ```bash
-python -m forecast.training
+python -m forecast.diagnostics --data-dir data --interval weekly --delete-mixed
+python -m forecast.download --universe liquid --source yahoo --replace --interval daily
 ```
 
-3. Forecast every symbol parquet (one **column per ticker**, cells = predicted move in bp):
+2. Ridge-only baseline first (`best.pt` is selected by **mean CS IC**, not pooled Pearson):
 
 ```bash
-python -m forecast.generate --checkpoint checkpoints/forecast/best.pt
-python -m forecast.generate --checkpoint checkpoints/forecast/best.pt --symbols AAPL,MSFT
-python -m forecast.generate --checkpoint checkpoints/forecast/best.pt --data data/AAPL_1min.parquet
+python -m forecast.training --universe liquid --interval daily --skip-only --checkpoint-dir checkpoints/forecast_ridge
+# optional: --no-sector-residual --no-equities-only --no-train-from --no-ridge-rank-target
 ```
 
-4. Before trusting a test IC, check whether train and test used the same vendor:
+The skip defaults to **within-date rank-target ridge** with ``ridge=10``, feature winsor 3, and ``--ridge-features no_long_ts``, plus same-bar CS product features (val-selected). Do **not** enable walk-forward / later ``train_from`` / ListNet-skip / crash-date drop / year-balance / year-stable mask / double residual / feature residualization / industry residual / ``liquid_wide`` / regime heads / ``no_vol_products`` / trailing readout windows / trailing skip-IC shrink as the default from test: those lost or were a dead heat on locked **close-to-close** val.
+
+``--label-return overnight`` is a **different estimand** (close_t → open_{t+1} residual). Features stay at close t; next open is a label. Yahoo/Stooq adjclose rescales OHLC together. The overnight **trade** is MOC t → MOO t+1 (flat in the next session). Do **not** mix overnight IC into the close-to-close headline. Close-to-close 0.04–0.08 was not reached; that book stays levered net IR ~1.
+
+Overnight live book (val-gate; do not retarget from test). Paper 10 bp flatten is **not** live P&L.
 
 ```bash
-python scripts/split_report.py
+# skip-only overnight residual (promoted skip recipe, different y)
+python -m forecast.training --universe liquid --interval daily --skip-only \
+  --label-return overnight --checkpoint-dir checkpoints/forecast_ridge_overnight
+
+# year series + live auction/locate/long-only stress (locked test)
+python scripts/cs_overnight.py --data-dir data --universe liquid \
+  --out checkpoints/forecast_ridge_overnight/overnight.json
+# optional: val-gate open+15m fill as a separate estimand (does not replace overnight y)
+python scripts/cs_overnight.py --data-dir data --universe liquid --try-fill 15 --no-lastbar-residual
+# optional weekly residual fallback if harsh MOO kills overnight
+python scripts/cs_overnight.py --data-dir data --universe liquid --try-weekly --no-lastbar-residual
+
+# live cost bundle (name-level MOC/MOO + thin/vol impact + borrow + hedge)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --compare-long-only
+# locate-gated shorts (bottom 30% CS turnover_z cannot be shorted)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --locate-adv-pctile 0.3
+# long-only, no locate
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --long-only
+# optional liquid sleeve (top CS turnover tercile; same skip w; use a lower min-names)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --adv-floor-pctile 0.67 --min-names 8
+# harsh auction stress
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --cost-bundle harsh
+# old flat overlay (20bp RT + 10bp exit-half auction + 5 borrow + 10 hedge)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --cost-bundle live_flat
+
+# open+15m fill is a different label; only train it after it wins locked val
+python -m forecast.training --universe liquid --interval daily --skip-only \
+  --label-return open15 --checkpoint-dir checkpoints/forecast_ridge_fill15
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_fill15/best.pt \
+  --holding open_fill --cost-bundle fill_live
+```
+
+Overnight **live vs paper** (same flatten book, 15% causal vol):
+
+| bundle | meaning |
+|---|---|
+| `paper` / `--cost-bps 10` | enter+exit 10 bp. Understates auction/locate. |
+| `live_flat` | 20 bp RT + 10 bp on the *exit half-notional* + 5 borrow + 10 hedge. First live-ish overlay. |
+| `live` (`--live-costs`) | 20 bp RT + **5 bp MOC + 10 bp MOO on full \|w\|**, ×2 on the bottom 30% CS `turnover_z`, + `8 * max(vol_level,0)` bp impact, + 5 borrow + 10 hedge. |
+| `live_locate` | `live` plus no shorts in the bottom 30% turnover (HTB proxy). Report IR with and without this gate. |
+| `live_long_only` | `live` with no shorts, borrow=0. Residual still assumes a liquid ETF hedge overlay. Long sleeve ADV participation is ~2× the 50/50 long sleeve. |
+| `harsh` | ugly MOO (30 bp), HTB, higher impact. If net IR dies, stop; next estimand is open+N fill or weekly residual — not bigger Mamba. |
+| `ex_post_gap` | sensitivity: extra `0.25 * \|overnight move\| * \|w\|`. Uses realized. Not the default. |
+| `fill_live` | MOC + continuous open+N exit (no MOO). Only with `--label-return open15`. |
+
+`--open-auction-bps` is the *legacy* extra on the exit half-notional. Prefer `--moc-bps` / `--moo-bps`. Open+N (`open15`) mixes `15/390` of next-session return into the **label**; do not silently train it as overnight `y`.
+
+```bash
+# regime heads / surgical vol+CS-product drop / trailing readout window (all lost on val)
+python scripts/cs_regime_ablate.py --data-dir data --universe liquid
+# causal trailing skip-IC shrink (lost on close-to-close val)
+python scripts/cs_shrink_ablate.py --data-dir data --universe liquid --also-labels
+# ~170-equity 2018-era book (Yahoo extras; --skip-existing reuses the 85-name cache)
+python -m forecast.download --universe liquid_wide --source yahoo --interval daily --skip-existing
+python -m forecast.training --universe liquid_wide --interval daily --skip-only
+# year-balance / year-stable mask / expanding WF diagnostic
+python scripts/cs_year_ablate.py --data-dir data --universe liquid
+# two-factor market+sector residual (labels); optional feature residualization
+python -m forecast.training --universe liquid --skip-only --double-residual
+python -m forecast.training --universe liquid --skip-only --residualize-features
+python -m forecast.training --universe liquid --skip-only --industry-residual
+```
+
+```bash
+python scripts/cs_collapse_ablate.py --data-dir data --universe liquid
+```
+
+3. Optional tiny frozen-skip encoder (do **not** scale Mamba / Dynamic A / IC-loss weight to chase 0.14):
+
+```bash
+python -m forecast.training --universe liquid --interval daily --checkpoint-dir checkpoints/forecast --d-model 32 --n-layer 1
+```
+
+4. Locked-window book with costs. Default is **quantile tails**, 1-day hold smoothing, **causal** expanding vol at 15% annual (not a 100% vol toy). A 5-day hold kills the 1-day CS signal.
+
+```bash
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge/best.pt --cost-bps 10 --json checkpoints/forecast_ridge/backtest.json --cs-csv checkpoints/forecast_ridge/cs_ic.csv
+# Owen-comparable tails + 100% vol (will print huge max DD):
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge/best.pt --weighting quantile --hold-halflife 0 --vol-target 1 --full-sample-vol --cost-bps 10
+```
+
+5. Ablations (synthetic CS universe on CPU, or your `data/` on GPU):
+
+```bash
+python scripts/ablate_cs.py
+python scripts/ablate_cs.py --data-dir data --universe liquid --skip-only-only
+```
+
+6. Vendor / split sanity:
+
+```bash
+python scripts/split_report.py data/AAPL_daily.parquet
 ```
 
 ---
@@ -104,7 +206,7 @@ Default loss is **Huber on the mean only**. Read **`val_ic`**, not `val_loss`. O
 | Flag | Default | Meaning |
 |---|---|---|
 | `--data-dir` | `data` | Folder of symbol parquets. |
-| `--horizon` | `60` | Label lookahead in **1-minute bars** (`60` = one hour, same session). Changing this changes what the model *is*. |
+| `--horizon` | `1` | Label lookahead in **bars** (`1` = next session on daily data). Scoring horizon>1 on every overlapping bar fakes Pearson — leave this at 1 for the CS protocol. |
 | `--seq-len` | `256` | Minutes of history in each training window. |
 | `--stride` | `64` | How far the window slides. Smaller → more overlapping samples, more compute. |
 | `--min-context` | `64` | First this many bars of every window are **unsupervised**. The SSM is still warming up. |
@@ -198,7 +300,10 @@ TEST (best step 250): loss=... ic=... r2=... dir=... pred_std=...bps n=...
 | Field | How to read it |
 |---|---|
 | `loss` | Same objective as train, on val/test labelled bars. **Not** the selection metric. |
-| `ic` | **Information coefficient**: Pearson correlation of prediction vs realized return (in vol units). **This is the number that matters.** `+1` lockstep, `0` no linear relationship, `-1` backwards. On noisy 1h returns, even a real edge is often a few hundredths. |
+| `ic` / `ic_raw` | **Pooled** last-bar Pearson. Useful as a diagnostic. **Not** the Phase-3 estimand and **not** “test IC 0.14”. |
+| `cs_ic` | **Mean cross-sectional Pearson** over dates with enough names. **This is the selection metric** when it is finite (`best.pt`). Target band 0.04–0.08 with `cs_t` > 3. |
+| `cs_sp` | Mean CS Spearman. Report it; do **not** blend it with Pearson and call the blend test IC. |
+| `cs_t` / `cs_dates` | t-stat of daily CS ICs, and how many dates went into the mean. |
 | `r2` | Skill vs the honest baseline **predict zero**. Negative r2 = worse than predicting no move. Tiny positive r2 can still pair with useful IC. |
 | `dir` | Fraction of **non-zero** outcomes where `sign(pred) == sign(realized)`. 0.50 = coin flip. |
 | `pred_std` | Std of predicted moves in **bp**. If this collapses toward 0 while IC is ~0, the model is shrinking to the mean, not forecasting. |

@@ -11,7 +11,9 @@ Then:
 - Build scale-free, strictly causal features. Nothing here uses information
   from bar ``t + 1`` onwards, so the same code runs at inference time.
 - Attach the target: the horizon-bar-ahead log return, divided by a volatility
-  estimate known at ``t``.
+  estimate known at ``t``.     ``label_return='overnight'`` is
+    ``log(open_{t+h}) - log(close_t)`` — next open is a label, never a feature.
+    ``open_fill`` adds ``(fill_minutes/390)`` of the next session.
 """
 
 from __future__ import annotations
@@ -27,6 +29,20 @@ import torch
 from torch.utils.data import Dataset
 
 from forecast.config import BARS_PER_SESSION, SESSION_START_MINUTE, DataConfig
+from forecast.overnight import (
+    forward_log_return,
+    formula_log_line,
+    next_open_valid,
+    normalize_label_return,
+    same_bar_open_for_features,
+    uses_next_open,
+)
+from forecast.universe import (
+    allowed_symbols,
+    hedge_symbol_for,
+    industry_symbol_for,
+    is_equity_name,
+)
 from mamba_lm.paths import REPO_ROOT, resolve_path
 
 
@@ -49,6 +65,25 @@ FEATURE_NAMES: tuple[str, ...] = (
     "peer_ret_1",
     "mkt_ret_1",
     "idio_ret_1",
+    "sector_ret_1",
+    "idio_sector",
+    "cs_rank_1",
+    "cs_ret_1",
+    "cs_ret_5",
+    "cs_ret_15",
+    "cs_ret_60",
+    "cs_volume",
+    "cs_vol",
+    "cs_ret1_x_vol",
+    "cs_rank_x_vol",
+    "idio_x_csvol",
+    "cs_ret1_x_idio",
+    "cs_rank_x_idio",
+    "cs_ret1_x_rank",
+    "cs_vol_sq",
+    "idio_sq",
+    "cs_ret1_sq",
+    "cs_rank_sq",
     "traded",
     "staleness",
     "new_session",
@@ -58,7 +93,62 @@ FEATURE_NAMES: tuple[str, ...] = (
     "dow_frac",
 )
 
-CROSS_SECTION_FEATURES: tuple[str, ...] = ("peer_ret_1", "mkt_ret_1", "idio_ret_1")
+CROSS_SECTION_FEATURES: tuple[str, ...] = (
+    "peer_ret_1",
+    "mkt_ret_1",
+    "idio_ret_1",
+    "sector_ret_1",
+    "idio_sector",
+    "cs_rank_1",
+    "cs_ret_1",
+    "cs_ret_5",
+    "cs_ret_15",
+    "cs_ret_60",
+    "cs_volume",
+    "cs_vol",
+    "cs_ret1_x_vol",
+    "cs_rank_x_vol",
+    "idio_x_csvol",
+    "cs_ret1_x_idio",
+    "cs_rank_x_idio",
+    "cs_ret1_x_rank",
+    "cs_vol_sq",
+    "idio_sq",
+    "cs_ret1_sq",
+    "cs_rank_sq",
+)
+
+# Pairwise products of CS columns (known at close; not labels).
+CS_PRODUCTS: tuple[tuple[str, str, str], ...] = (
+    ("cs_ret_1", "cs_vol", "cs_ret1_x_vol"),
+    ("cs_rank_1", "cs_vol", "cs_rank_x_vol"),
+    ("idio_sector", "cs_vol", "idio_x_csvol"),
+    ("cs_ret_1", "idio_sector", "cs_ret1_x_idio"),
+    ("cs_rank_1", "idio_sector", "cs_rank_x_idio"),
+    ("cs_ret_1", "cs_rank_1", "cs_ret1_x_rank"),
+    ("cs_vol", "cs_vol", "cs_vol_sq"),
+    ("idio_sector", "idio_sector", "idio_sq"),
+    ("cs_ret_1", "cs_ret_1", "cs_ret1_sq"),
+    ("cs_rank_1", "cs_rank_1", "cs_rank_sq"),
+)
+CS_PRODUCT_FEATURES: tuple[str, ...] = tuple(name for _, _, name in CS_PRODUCTS)
+VOL_FEATURES: tuple[str, ...] = (
+    "vol_level",
+    "vol_change",
+    "volume_z",
+    "turnover_z",
+    "ret_vol",
+)
+
+# Same-bar CS z-scores (source column -> feature name). Known at close; not labels.
+CS_ZSCORE_SOURCES: tuple[tuple[str, str], ...] = (
+    ("ret_1", "cs_ret_1"),
+    ("ret_5", "cs_ret_5"),
+    ("ret_15", "cs_ret_15"),
+    ("ret_60", "cs_ret_60"),
+    ("volume_z", "cs_volume"),
+    ("vol_level", "cs_vol"),
+)
 
 OHLCV_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 
@@ -141,6 +231,9 @@ def normalize_bars(df: pd.DataFrame, *, origin: str = "bars") -> pd.DataFrame:
         raise ValueError(
             f"{origin}: {int(nonpos.sum())} rows with close <= 0 (log-price is undefined)"
         )
+    for col in ("open", "high", "low"):
+        px = pd.to_numeric(out[col], errors="coerce")
+        out[col] = px.where(px > 0)
     out = out.sort_values("datetime").drop_duplicates("datetime", keep="last")
     return out.reset_index(drop=True)
 
@@ -284,6 +377,23 @@ def _gap_limit_days(cfg: DataConfig) -> int:
     return cfg.max_session_gap_days
 
 
+def _forward_log_return(out: pd.DataFrame, log_close: pd.Series, cfg: DataConfig) -> pd.Series:
+    """Causal label return. Features never see these future prices.
+
+    Overnight is ``log(open_{t+h}) - log(close_t)``. Invalid / non-positive
+    next opens are NaN (not clipped to 1e-12). Same-bar ``open_t`` is unused
+    here; it only appears in candle features via ``same_bar_open_for_features``.
+    """
+    del log_close  # recomputed inside forward_log_return from raw close
+    return forward_log_return(
+        close=out["close"],
+        open_px=out["open"],
+        kind=str(getattr(cfg, "label_return", "close") or "close"),
+        horizon=int(cfg.horizon),
+        fill_minutes=int(getattr(cfg, "fill_minutes", 0) or 0),
+    )
+
+
 def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     """Attach features, the forward-return target, its scale, and a validity mask."""
     out = grid.copy()
@@ -311,11 +421,12 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
         out[name] = raw / (sigma * math.sqrt(k))
 
     out["range_hl"] = ((out["high"] - out["low"]) / close) / sigma
-    out["body_co"] = ((close - out["open"]) / close) / sigma
+    open_feat = same_bar_open_for_features(out["open"], close)
+    out["body_co"] = ((close - open_feat) / close) / sigma
     hl = (out["high"] - out["low"]).clip(lower=1e-12)
     out["close_loc"] = (2.0 * (close - out["low"]) / hl) - 1.0
-    upper = np.maximum(close, out["open"])
-    lower = np.minimum(close, out["open"])
+    upper = np.maximum(close, open_feat)
+    lower = np.minimum(close, open_feat)
     out["wick_up"] = ((out["high"] - upper) / close) / sigma
     out["wick_dn"] = ((lower - out["low"]) / close) / sigma
 
@@ -333,6 +444,13 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     out["peer_ret_1"] = 0.0
     out["mkt_ret_1"] = 0.0
     out["idio_ret_1"] = 0.0
+    out["sector_ret_1"] = 0.0
+    out["idio_sector"] = 0.0
+    out["cs_rank_1"] = 0.0
+    for _src, dest in CS_ZSCORE_SOURCES:
+        out[dest] = 0.0
+    for _a, _b, dest in CS_PRODUCTS:
+        out[dest] = 0.0
 
     # Bars elapsed since the last real print, so stale prices are discountable.
     position = np.arange(len(out), dtype=np.float64)
@@ -359,7 +477,7 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     out["dow_frac"] = out["datetime"].dt.dayofweek.astype(np.float64) / 4.0
 
     # Target: log return realized `horizon` bars later, in volatility units.
-    forward = log_close.shift(-cfg.horizon) - log_close
+    forward = _forward_log_return(out, log_close, cfg)
     out["target_raw"] = forward
     out["target"] = forward / out["scale"]
     horizon_traded = out["traded"].shift(-cfg.horizon)
@@ -379,6 +497,8 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     )
     if cfg.require_horizon_traded:
         valid = valid & (horizon_traded > 0)
+    if uses_next_open(getattr(cfg, "label_return", "close")):
+        valid = valid & next_open_valid(out["open"], int(cfg.horizon)).to_numpy()
     if cfg.max_abs_log_return > 0:
         valid = valid & (out["target_raw"].abs() <= cfg.max_abs_log_return)
     if cfg.max_abs_target > 0:
@@ -400,77 +520,125 @@ def _cross_section_key(panel: pd.DataFrame, cfg: DataConfig) -> pd.Series:
     return pd.to_datetime(panel["datetime"])
 
 
+def _traded_wide(
+    panels: dict[str, pd.DataFrame],
+    symbols: list[str],
+    cfg: DataConfig,
+    column: str,
+) -> pd.DataFrame | None:
+    """Date x symbol matrix of a feature on real prints only."""
+    parts: list[pd.DataFrame] = []
+    for sym in symbols:
+        panel = panels[sym]
+        if column not in panel.columns:
+            continue
+        traded = panel["traded"].to_numpy(dtype=np.float64) > 0
+        if not bool(traded.any()):
+            continue
+        parts.append(
+            pd.DataFrame(
+                {
+                    "key": _cross_section_key(panel, cfg).to_numpy()[traded],
+                    "symbol": sym,
+                    "val": panel[column].to_numpy(dtype=np.float64)[traded],
+                }
+            )
+        )
+    if len(parts) < 2:
+        return None
+    long = pd.concat(parts, ignore_index=True)
+    return long.pivot_table(index="key", columns="symbol", values="val", aggfunc="mean")
+
+
+def _cs_zscore_wide(wide: pd.DataFrame) -> pd.DataFrame:
+    """Z-score each date across names. Constant rows become 0."""
+    mean = wide.mean(axis=1, skipna=True)
+    std = wide.std(axis=1, skipna=True)
+    std = std.where(std >= 1e-8, np.nan)
+    return wide.sub(mean, axis=0).div(std, axis=0)
+
+
+def _cs_rank_wide(wide: pd.DataFrame) -> pd.DataFrame:
+    """Centered within-date percentile rank of ``ret_1`` in [-1, 1]."""
+    ranks = wide.rank(axis=1, method="average")
+    n = wide.notna().sum(axis=1).astype(np.float64)
+    denom = (n - 1.0).where(n >= 2, np.nan)
+    return ranks.sub(1.0, axis=0).div(denom, axis=0).mul(2.0).sub(1.0)
+
+
+def _indexed_col(panel: pd.DataFrame, cfg: DataConfig, column: str) -> pd.Series:
+    key = pd.Index(_cross_section_key(panel, cfg).to_numpy())
+    return pd.Series(
+        panel[column].to_numpy(dtype=np.float64), index=key
+    ).groupby(level=0).last()
+
+
+def trading_panel_symbols(panels: dict[str, pd.DataFrame], cfg: DataConfig) -> list[str]:
+    """Names that enter the CS book (benchmark always excluded)."""
+    bench = str(cfg.benchmark_symbol or "").upper()
+    names = [s for s in panels if s != bench]
+    if bool(getattr(cfg, "equities_only", False)):
+        names = [s for s in names if is_equity_name(s)]
+    return names
+
+
 def attach_cross_section_features(
     panels: dict[str, pd.DataFrame],
     cfg: DataConfig,
 ) -> dict[str, pd.DataFrame]:
-    """Peer / market return known at bar ``t``. Strictly causal.
+    """Peer / market / CS-z features known at bar ``t``. Strictly causal.
 
     ``mkt_ret_1`` is the benchmark ticker's ``ret_1`` when that parquet is in
     ``panels``, otherwise the equal-weight mean of trading names.
     ``peer_ret_1`` averages the other *trading* names (benchmark excluded).
     ``idio_ret_1`` is own ``ret_1`` minus ``mkt_ret_1``.
+    ``sector_ret_1`` / ``idio_sector`` use the mapped sector ETF's same-bar
+    ``ret_1`` (SPY if that ETF is missing). Never uses t+1.
+    ``cs_*`` columns are same-day z-scores across trading names (not SPY).
+    ``cs_rank_1`` is the centered within-date rank of ``ret_1``.
     """
     if not panels:
         return panels
     bench = str(cfg.benchmark_symbol or "").upper()
-    trade_syms = [s for s in panels if s != bench]
+    trade_syms = trading_panel_symbols(panels, cfg)
     clip = float(cfg.clip)
 
     mkt: pd.Series | None = None
     if bench in panels:
-        bpanel = panels[bench]
-        mkt = pd.Series(
-            bpanel["ret_1"].to_numpy(dtype=np.float64),
-            index=pd.Index(_cross_section_key(bpanel, cfg).to_numpy()),
-        ).groupby(level=0).mean()
+        mkt = _indexed_col(panels[bench], cfg, "ret_1")
     elif len(trade_syms) >= 2:
-        parts: list[pd.DataFrame] = []
-        for sym in trade_syms:
-            panel = panels[sym]
-            traded = panel["traded"].to_numpy(dtype=np.float64) > 0
-            if not bool(traded.any()):
-                continue
-            parts.append(
-                pd.DataFrame(
-                    {
-                        "key": _cross_section_key(panel, cfg).to_numpy()[traded],
-                        "symbol": sym,
-                        "ret_1": panel["ret_1"].to_numpy(dtype=np.float64)[traded],
-                    }
-                )
-            )
-        if len(parts) >= 2:
-            long = pd.concat(parts, ignore_index=True)
-            wide = long.pivot_table(
-                index="key", columns="symbol", values="ret_1", aggfunc="mean"
-            )
-            mkt = wide.mean(axis=1, skipna=True)
+        wide_mkt = _traded_wide(panels, trade_syms, cfg, "ret_1")
+        if wide_mkt is not None:
+            mkt = wide_mkt.mean(axis=1, skipna=True)
 
-    peer_wide: pd.DataFrame | None = None
-    if len(trade_syms) >= 2:
-        parts = []
-        for sym in trade_syms:
-            panel = panels[sym]
-            traded = panel["traded"].to_numpy(dtype=np.float64) > 0
-            if not bool(traded.any()):
-                continue
-            parts.append(
-                pd.DataFrame(
-                    {
-                        "key": _cross_section_key(panel, cfg).to_numpy()[traded],
-                        "symbol": sym,
-                        "ret_1": panel["ret_1"].to_numpy(dtype=np.float64)[traded],
-                    }
-                )
-            )
-        if len(parts) >= 2:
-            long = pd.concat(parts, ignore_index=True)
-            peer_wide = long.pivot_table(
-                index="key", columns="symbol", values="ret_1", aggfunc="mean"
-            )
+    hedge_ret: dict[str, pd.Series] = {}
+    for hedge in {hedge_symbol_for(
+        s,
+        sector_residual=bool(getattr(cfg, "sector_residual", False)),
+        benchmark=bench,
+    ) for s in panels}:
+        if hedge in panels:
+            hedge_ret[hedge] = _indexed_col(panels[hedge], cfg, "ret_1")
 
-    if mkt is None and peer_wide is None:
+    peer_wide = _traded_wide(panels, trade_syms, cfg, "ret_1") if len(trade_syms) >= 2 else None
+    rank_wide = _cs_rank_wide(peer_wide) if peer_wide is not None else None
+    cs_wides: dict[str, pd.DataFrame] = {}
+    if bool(cfg.cs_zscore) and peer_wide is not None:
+        for src, dest in CS_ZSCORE_SOURCES:
+            src_wide = peer_wide if src == "ret_1" else _traded_wide(
+                panels, trade_syms, cfg, src
+            )
+            if src_wide is None:
+                continue
+            cs_wides[dest] = _cs_zscore_wide(src_wide)
+
+    if (
+        mkt is None
+        and peer_wide is None
+        and not cs_wides
+        and not hedge_ret
+        and rank_wide is None
+    ):
         return panels
 
     out: dict[str, pd.DataFrame] = {}
@@ -490,54 +658,208 @@ def attach_cross_section_features(
                 peer_s = others.mean(axis=1, skipna=True)
                 peer = keys.map(peer_s).to_numpy(dtype=np.float64)
                 peer = np.where(np.isfinite(peer), peer, 0.0)
+        hedge = hedge_symbol_for(
+            sym,
+            sector_residual=bool(getattr(cfg, "sector_residual", False)),
+            benchmark=bench,
+        )
+        if hedge not in hedge_ret and bench in hedge_ret:
+            hedge = bench
+        if hedge in hedge_ret:
+            sec_vals = keys.map(hedge_ret[hedge]).to_numpy(dtype=np.float64)
+            sec_vals = np.where(np.isfinite(sec_vals), sec_vals, 0.0)
+        else:
+            sec_vals = np.zeros(len(p), dtype=np.float64)
+        rank_vals = np.zeros(len(p), dtype=np.float64)
+        if rank_wide is not None and sym in getattr(rank_wide, "columns", []):
+            rank_vals = keys.map(rank_wide[sym]).to_numpy(dtype=np.float64)
+            rank_vals = np.where(np.isfinite(rank_vals), rank_vals, 0.0)
         p["peer_ret_1"] = np.clip(peer, -clip, clip)
         p["mkt_ret_1"] = np.clip(mkt_vals, -clip, clip)
         p["idio_ret_1"] = np.clip(own - mkt_vals, -clip, clip)
+        p["sector_ret_1"] = np.clip(sec_vals, -clip, clip)
+        p["idio_sector"] = np.clip(own - sec_vals, -clip, clip)
+        p["cs_rank_1"] = np.clip(rank_vals, -clip, clip)
+        for _src, dest in CS_ZSCORE_SOURCES:
+            if dest not in p.columns:
+                p[dest] = 0.0
+            wide = cs_wides.get(dest)
+            if wide is None or sym not in getattr(wide, "columns", []):
+                p[dest] = 0.0
+                continue
+            vals = keys.map(wide[sym]).to_numpy(dtype=np.float64)
+            p[dest] = np.clip(np.where(np.isfinite(vals), vals, 0.0), -clip, clip)
+        for a, b, dest in CS_PRODUCTS:
+            left = p[a].to_numpy(dtype=np.float64) if a in p.columns else np.zeros(len(p))
+            right = p[b].to_numpy(dtype=np.float64) if b in p.columns else np.zeros(len(p))
+            p[dest] = np.clip(left * right, -clip, clip)
         out[sym] = p
     return out
+
+
+def _ewm_beta(y: np.ndarray, x: np.ndarray, hl: int) -> np.ndarray:
+    frame = pd.DataFrame({"y": y, "x": x})
+    cov = frame["y"].ewm(halflife=hl, min_periods=hl).cov(frame["x"])
+    var = frame["x"].ewm(halflife=hl, min_periods=hl).var()
+    return (cov / var.replace(0.0, np.nan)).fillna(0.0).clip(-5.0, 5.0).to_numpy()
+
+
+def _ewm_multi_beta(y: np.ndarray, xs: list[np.ndarray], hl: int) -> list[np.ndarray]:
+    """Causal EWM betas of ``y`` on one or more ``xs``. Falls back if singular."""
+    if len(xs) == 1:
+        return [_ewm_beta(y, xs[0], hl)]
+    cols = {f"x{i}": xs[i] for i in range(len(xs))}
+    cols["y"] = y
+    df = pd.DataFrame(cols)
+    y_s = df["y"]
+    k = len(xs)
+    cov_yx = [
+        y_s.ewm(halflife=hl, min_periods=hl).cov(df[f"x{i}"]).to_numpy()
+        for i in range(k)
+    ]
+    cov_xx = np.zeros((len(df), k, k), dtype=np.float64)
+    for i in range(k):
+        for j in range(i, k):
+            if i == j:
+                v = df[f"x{i}"].ewm(halflife=hl, min_periods=hl).var().to_numpy()
+                cov_xx[:, i, j] = v
+            else:
+                c = df[f"x{i}"].ewm(halflife=hl, min_periods=hl).cov(df[f"x{j}"]).to_numpy()
+                cov_xx[:, i, j] = c
+                cov_xx[:, j, i] = c
+    rhs = np.stack(cov_yx, axis=1)
+    betas = np.zeros((len(df), k), dtype=np.float64)
+    eye = 1e-8 * np.eye(k)
+    for t in range(len(df)):
+        a = cov_xx[t] + eye
+        try:
+            betas[t] = np.linalg.solve(a, rhs[t])
+        except np.linalg.LinAlgError:
+            betas[t] = 0.0
+    return [np.clip(betas[:, i], -5.0, 5.0) for i in range(k)]
 
 
 def attach_residual_target(
     panels: dict[str, pd.DataFrame],
     cfg: DataConfig,
 ) -> dict[str, pd.DataFrame]:
-    """Replace the label with trailing-beta residual vs the benchmark forward return.
+    """Replace the label with trailing-beta residual vs hedge forward return(s).
 
-    ``beta_t`` uses same-bar returns through ``t`` only. The benchmark's
-    *forward* return enters the label, never ``FEATURE_NAMES``.
+    ``beta_t`` uses same-bar returns through ``t`` only. Hedge *forward* return
+    enters the label, never ``FEATURE_NAMES``. Default hedge is SPY;
+    ``sector_residual`` uses the mapped sector ETF when that parquet exists.
+    ``double_residual`` adds SPY as a second factor next to the sector hedge.
+    ``industry_residual`` adds a mapped industry ETF when present.
+    ``residualize_features`` subtracts the same causal betas times same-bar
+    hedge ``ret_*`` from the name's own ``ret_*`` (not a label leak).
+    ``label_return`` selects which forward log-return is residualized.
+    Overnight is ``log(open_{t+h})-log(close_t)``; the hedge's *forward*
+    overnight return is a label term. Features stay at close ``t``.
     """
     bench = str(cfg.benchmark_symbol or "").upper()
-    if not cfg.residual_target or bench not in panels:
+    if not cfg.residual_target:
         return panels
-    spy = panels[bench]
-    spy_key = pd.Index(_cross_section_key(spy, cfg).to_numpy())
-    spy_fwd = pd.Series(
-        spy["target_raw"].to_numpy(dtype=np.float64), index=spy_key
-    ).groupby(level=0).last()
-    spy_r = pd.Series(
-        spy["ret_raw"].to_numpy(dtype=np.float64), index=spy_key
-    ).groupby(level=0).last()
+    if bench not in panels and not any(
+        hedge_symbol_for(
+            s,
+            sector_residual=bool(getattr(cfg, "sector_residual", False)),
+            benchmark=bench,
+        )
+        in panels
+        for s in panels
+    ):
+        return panels
+
+    cache_fwd: dict[str, pd.Series] = {}
+    cache_r: dict[str, pd.Series] = {}
+    cache_ret: dict[tuple[str, str], pd.Series] = {}
+
+    def _hedge_series(name: str) -> tuple[pd.Series, pd.Series] | None:
+        if name not in panels:
+            return None
+        if name not in cache_fwd:
+            cache_fwd[name] = _indexed_col(panels[name], cfg, "target_raw")
+            cache_r[name] = _indexed_col(panels[name], cfg, "ret_raw")
+        return cache_fwd[name], cache_r[name]
+
+    def _hedge_ret(name: str, col: str) -> pd.Series | None:
+        if name not in panels or col not in panels[name].columns:
+            return None
+        key = (name, col)
+        if key not in cache_ret:
+            cache_ret[key] = _indexed_col(panels[name], cfg, col)
+        return cache_ret[key]
+
     hl = max(2, int(cfg.beta_halflife))
+    double = bool(getattr(cfg, "double_residual", False))
+    industry = bool(getattr(cfg, "industry_residual", False))
+    resid_feat = bool(getattr(cfg, "residualize_features", False))
+    feat_cols = ("ret_1", "ret_5", "ret_15", "ret_60", "ret_390")
     out: dict[str, pd.DataFrame] = {}
     for sym, panel in panels.items():
         p = panel.copy()
         if sym == bench:
             out[sym] = p
             continue
+        names: list[str] = []
+        sector = hedge_symbol_for(
+            sym,
+            sector_residual=bool(getattr(cfg, "sector_residual", False)),
+            benchmark=bench,
+        )
+        if double:
+            if bench in panels:
+                names.append(bench)
+            if sector != bench and sector in panels:
+                names.append(sector)
+        else:
+            if sector in panels:
+                names.append(sector)
+            elif bench in panels:
+                names.append(bench)
+        if industry:
+            ind = industry_symbol_for(sym)
+            if ind and ind in panels and ind not in names:
+                names.append(ind)
+        series = [_hedge_series(n) for n in names]
+        series = [s for s in series if s is not None]
+        if not series:
+            out[sym] = p
+            continue
         keys = _cross_section_key(p, cfg)
-        spy_r_al = keys.map(spy_r).to_numpy(dtype=np.float64)
-        spy_fwd_al = keys.map(spy_fwd).to_numpy(dtype=np.float64)
         own_r = p["ret_raw"].to_numpy(dtype=np.float64)
-        frame = pd.DataFrame({"y": own_r, "x": spy_r_al})
-        cov = frame["y"].ewm(halflife=hl, min_periods=hl).cov(frame["x"])
-        var = frame["x"].ewm(halflife=hl, min_periods=hl).var()
-        beta = (cov / var.replace(0.0, np.nan)).fillna(0.0).clip(-5.0, 5.0).to_numpy()
+        xs = []
+        fwds = []
+        for hedge_fwd, hedge_r in series:
+            xs.append(keys.map(hedge_r).to_numpy(dtype=np.float64))
+            fwd = keys.map(hedge_fwd).to_numpy(dtype=np.float64)
+            fwds.append(np.where(np.isfinite(fwd), fwd, 0.0))
+        betas = _ewm_multi_beta(own_r, xs, hl) if len(xs) > 1 else [_ewm_beta(own_r, xs[0], hl)]
         own_fwd = p["target_raw"].to_numpy(dtype=np.float64)
-        spy_fwd_al = np.where(np.isfinite(spy_fwd_al), spy_fwd_al, 0.0)
-        resid = own_fwd - beta * spy_fwd_al
+        resid = own_fwd.astype(np.float64, copy=True)
+        for b, fwd in zip(betas, fwds):
+            resid = resid - b * fwd
         scale = p["scale"].to_numpy(dtype=np.float64)
         p["target_raw"] = resid
         p["target"] = np.divide(resid, scale, out=np.zeros_like(resid), where=scale > 0)
+        if resid_feat:
+            for col in feat_cols:
+                if col not in p.columns:
+                    continue
+                own = p[col].to_numpy(dtype=np.float64)
+                adj = own.copy()
+                for b, hedge_name in zip(betas, names):
+                    hs = _hedge_ret(hedge_name, col)
+                    if hs is None:
+                        continue
+                    hx = keys.map(hs).to_numpy(dtype=np.float64)
+                    hx = np.where(np.isfinite(hx), hx, 0.0)
+                    adj = adj - b * hx
+                p[col] = adj
+            if "idio_ret_1" in p.columns and "ret_1" in p.columns and "mkt_ret_1" in p.columns:
+                p["idio_ret_1"] = p["ret_1"] - p["mkt_ret_1"]
+            if "idio_sector" in p.columns and "ret_1" in p.columns and "sector_ret_1" in p.columns:
+                p["idio_sector"] = p["ret_1"] - p["sector_ret_1"]
         valid = p["valid"].to_numpy(dtype=bool).copy()
         if cfg.max_abs_log_return > 0:
             valid &= np.abs(resid) <= cfg.max_abs_log_return
@@ -841,11 +1163,10 @@ def split_session_bounds(n_sessions: int, cfg: DataConfig) -> tuple[int, int]:
 
 
 def embargo_calendar_horizon(panel: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
-    """Drop labels whose horizon close sits outside this split.
+    """Drop labels whose horizon bar sits outside this split.
 
-    Intraday targets cannot leave their session, so a session-boundary cut is
-    already an embargo. Daily/weekly/monthly bars *are* sessions, so the last
-    ``horizon`` train labels would otherwise be the first val/test returns.
+    Overnight uses ``open_{t+h}`` on that same next bar, so the last
+    ``horizon`` train dates would otherwise label the first val open.
     """
     if panel.empty or not cfg.is_calendar() or int(cfg.horizon) < 1:
         return panel
@@ -910,6 +1231,22 @@ def build_datasets(
     paths = list(paths) if paths is not None else discover_symbol_files(
         cfg.data_dir, interval=cfg.interval
     )
+    allowed = allowed_symbols(cfg.universe)
+    if allowed is not None:
+        kept = [p for p in paths if symbol_from_path(p) in allowed]
+        skipped = len(paths) - len(kept)
+        if log_fn:
+            log_fn(
+                f"universe={cfg.universe!r}: {len(kept)} parquet(s) "
+                f"(dropped {skipped} non-members)"
+            )
+        paths = kept
+        if not paths:
+            raise FileNotFoundError(
+                f"no parquets in {cfg.data_dir} match universe={cfg.universe!r}. "
+                "Download with: python -m forecast.download --universe liquid "
+                "--source yahoo --replace --interval daily"
+            )
 
     raw_panels: dict[str, pd.DataFrame] = {}
     path_by_symbol: dict[str, Path] = {}
@@ -939,10 +1276,27 @@ def build_datasets(
     raw_panels = attach_residual_target(raw_panels, cfg)
 
     bench = str(cfg.benchmark_symbol or "").upper()
-    trade_panels = {s: p for s, p in raw_panels.items() if s != bench}
+    trade_names = trading_panel_symbols(raw_panels, cfg)
+    trade_panels = {s: raw_panels[s] for s in trade_names}
+    train_from_ts: pd.Timestamp | None = None
+    raw_from = str(getattr(cfg, "train_from", "") or "").strip()
+    if raw_from:
+        train_from_ts = pd.Timestamp(raw_from)
     if not trade_panels:
         raise ValueError(
-            f"only benchmark {bench} was loaded; add trading-name parquets"
+            f"no trading names after filters (benchmark={bench}, "
+            f"equities_only={bool(getattr(cfg, 'equities_only', False))}); "
+            "add single-name equity parquets"
+        )
+    if log_fn:
+        dropped = [s for s in raw_panels if s not in trade_panels and s != bench]
+        log_fn(
+            f"trading names={len(trade_panels)} equities_only="
+            f"{bool(getattr(cfg, 'equities_only', False))} "
+            f"sector_residual={bool(getattr(cfg, 'sector_residual', False))} "
+            f"train_from={raw_from or 'all'} "
+            f"{formula_log_line(getattr(cfg, 'label_return', 'close'), horizon=int(cfg.horizon), fill_minutes=int(getattr(cfg, 'fill_minutes', 0) or 0))}"
+            + (f" (held out of book: {','.join(sorted(dropped))})" if dropped else "")
         )
 
     if cfg.global_calendar_split and cfg.is_calendar() and len(trade_panels) >= 1:
@@ -965,6 +1319,8 @@ def build_datasets(
             sym_train_end, sym_val_end = train_end, val_end
 
         is_train = (panel["session"] < sym_train_end).to_numpy()
+        if train_from_ts is not None:
+            is_train = is_train & (pd.to_datetime(panel["session"]) >= train_from_ts).to_numpy()
         is_val = (
             (panel["session"] >= sym_train_end) & (panel["session"] < sym_val_end)
         ).to_numpy()
@@ -1000,6 +1356,13 @@ def build_datasets(
                 "test_source_mix": test_mix,
                 "residual_target": bool(cfg.residual_target and bench in raw_panels),
                 "benchmark": bench if bench in raw_panels else "",
+                "sector_residual": bool(getattr(cfg, "sector_residual", False)),
+                "hedge": hedge_symbol_for(
+                    symbol,
+                    sector_residual=bool(getattr(cfg, "sector_residual", False)),
+                    benchmark=bench,
+                ),
+                "train_from": raw_from,
             }
         )
         if log_fn:
@@ -1101,6 +1464,12 @@ def build_datasets(
         "feature_names": list(FEATURE_NAMES),
         "meta": meta,
         "cross_section": use_cs,
+        "cs_min_names": int(cfg.cross_section_min_names),
+        "universe": cfg.universe,
+        "equities_only": bool(getattr(cfg, "equities_only", False)),
+        "train_from": raw_from,
+        "n_trading_names": int(len(trade_panels)),
+        "label_return": normalize_label_return(getattr(cfg, "label_return", "close")),
     }
 
 
@@ -1123,48 +1492,45 @@ def fit_ridge_readout(
     feature_std: np.ndarray,
     *,
     ridge: float = 1.0,
+    cs_demean: bool = False,
+    min_names: int = 8,
+    cs_zscore: bool = False,
+    rank_target: bool = False,
+    feature_mask_bool: np.ndarray | None = None,
+    date_halflife: float = 0.0,
+    y_winsor: float = 0.0,
+    feat_winsor: float = 0.0,
+    drop_disp_q: float = 0.0,
+    huber_delta: float = 0.0,
+    sign_constrain: bool = False,
+    drop_crashes: bool = False,
+    exclude_dates: set[int] | None = None,
 ) -> tuple[np.ndarray, float, float]:
-    """Train-only ridge of target on normalized features. Returns weight, bias, IC."""
-    n_features = int(np.asarray(feature_mean).shape[0])
-    chunks_x: list[np.ndarray] = []
-    chunks_y: list[np.ndarray] = []
-    mean = np.asarray(feature_mean, dtype=np.float64)
-    std = np.asarray(feature_std, dtype=np.float64)
-    for sym in symbols:
-        if not bool(sym.valid.any()):
-            continue
-        raw = sym.features[sym.valid].astype(np.float64, copy=False)
-        chunks_x.append((raw - mean) / std)
-        chunks_y.append(sym.target[sym.valid].astype(np.float64, copy=False))
-    if not chunks_x:
-        return np.zeros(n_features, dtype=np.float32), 0.0, float("nan")
+    """Train-only ridge of target on normalized features. Returns weight, bias, IC.
 
-    x = np.concatenate(chunks_x, axis=0)
-    y = np.concatenate(chunks_y, axis=0)
-    design = np.concatenate([x, np.ones((x.shape[0], 1), dtype=np.float64)], axis=1)
-    lam = max(0.0, float(ridge))
-    xtx = design.T @ design
-    xtx.flat[:: xtx.shape[0] + 1] += lam
-    try:
-        coef = np.linalg.solve(xtx, design.T @ y)
-    except np.linalg.LinAlgError:
-        coef = np.linalg.lstsq(xtx, design.T @ y, rcond=None)[0]
-    weights = coef[:-1].astype(np.float32)
-    bias = float(coef[-1])
-    pred = x @ coef[:-1] + coef[-1]
-    ic = float("nan")
-    if pred.size >= 2:
-        pc = pred - pred.mean()
-        yc = y - y.mean()
-        denom = float(np.sqrt((pc * pc).sum() * (yc * yc).sum()))
-        if denom > 1e-12:
-            ic = float((pc * yc).sum() / denom)
-    # OLS can match correlation with huge |w|. Scale to the MSE-optimal
-    # amplitude rho * sigma_y so the skip does not start 2x too volatile.
-    pred_std = float(pred.std())
-    y_std = float(y.std())
-    if pred_std > 1e-8 and y_std > 1e-8 and np.isfinite(ic):
-        amp = abs(ic) * y_std / pred_std
-        weights = (weights * amp).astype(np.float32)
-        bias = float(bias * amp)
-    return weights, bias, ic
+    ``cs_demean=True`` date-demeans X and y (the CS linear baseline). Inference
+    still applies ``w·x + b`` without demeaning: within-date Pearson is invariant
+    to a per-date additive shift, so CS IC matches the demeaned fit.
+    """
+    from forecast.ridge import fit_ridge_xy, labelled_rows
+
+    x, y, dates = labelled_rows(symbols, feature_mean, feature_std)
+    return fit_ridge_xy(
+        x,
+        y,
+        dates,
+        ridge=ridge,
+        min_names=min_names,
+        cs_demean=cs_demean,
+        cs_zscore=cs_zscore,
+        rank_target=rank_target,
+        feature_mask_bool=feature_mask_bool,
+        date_halflife=date_halflife,
+        y_winsor=y_winsor,
+        feat_winsor=feat_winsor,
+        drop_disp_q=drop_disp_q,
+        huber_delta=huber_delta,
+        sign_constrain=sign_constrain,
+        drop_crashes=drop_crashes,
+        exclude_dates=exclude_dates,
+    )

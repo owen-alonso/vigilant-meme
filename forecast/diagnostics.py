@@ -13,6 +13,11 @@ from forecast.config import DataConfig
 
 MIX_AUTOCORR_FAIL = -0.2
 MIX_ABS_LOG = 0.25
+# Same-bar |log(open/close)| this large is a split, not a candle. Persistent
+# mass there means adj-close with raw open — overnight labels become garbage.
+UNADJUSTED_OPEN_BODY = 0.40
+UNADJUSTED_OPEN_FRAC = 0.05
+UNADJUSTED_OPEN_MEDIAN = 0.15
 
 
 def close_return_diagnostics(close: np.ndarray) -> dict[str, float]:
@@ -47,11 +52,55 @@ def close_return_diagnostics(close: np.ndarray) -> dict[str, float]:
     }
 
 
+def ohlc_body_diagnostics(open_px: np.ndarray, close: np.ndarray) -> dict[str, float]:
+    """Same-bar log(open/close). Split-sized bodies flag raw-open vs adj-close."""
+    o = np.asarray(open_px, dtype=np.float64)
+    c = np.asarray(close, dtype=np.float64)
+    ok = np.isfinite(o) & np.isfinite(c) & (o > 0) & (c > 0)
+    n_bad_open = float(np.size(o) - int(ok.sum())) if o.size else 0.0
+    if int(ok.sum()) < 3:
+        return {
+            "n_body": float(int(ok.sum())),
+            "n_nonpositive_open": n_bad_open,
+            "median_abs_log_oc": float("nan"),
+            "frac_abs_log_oc_gt_0.4": float("nan"),
+            "max_abs_log_oc": 0.0,
+        }
+    body = np.log(o[ok]) - np.log(c[ok])
+    abs_body = np.abs(body)
+    return {
+        "n_body": float(abs_body.size),
+        "n_nonpositive_open": n_bad_open,
+        "median_abs_log_oc": float(np.median(abs_body)),
+        "frac_abs_log_oc_gt_0.4": float(np.mean(abs_body > UNADJUSTED_OPEN_BODY)),
+        "max_abs_log_oc": float(np.max(abs_body)),
+    }
+
+
+def looks_like_unadjusted_open(stats: dict[str, Any]) -> bool:
+    """True when opens live on a different split scale than closes."""
+    frac = stats.get("frac_abs_log_oc_gt_0.4", float("nan"))
+    med = stats.get("median_abs_log_oc", float("nan"))
+    if np.isfinite(frac) and float(frac) >= UNADJUSTED_OPEN_FRAC:
+        return True
+    if np.isfinite(med) and float(med) >= UNADJUSTED_OPEN_MEDIAN:
+        return True
+    return False
+
+
 def parquet_close_diagnostics(path: str | Path) -> dict[str, Any]:
     bars = pd.read_parquet(path)
     close_col = "close" if "close" in bars.columns else "Close"
+    open_col = "open" if "open" in bars.columns else "Open"
     time_col = "datetime" if "datetime" in bars.columns else "Date"
     stats = close_return_diagnostics(bars[close_col].to_numpy(dtype=np.float64))
+    if open_col in bars.columns:
+        stats.update(
+            ohlc_body_diagnostics(
+                bars[open_col].to_numpy(dtype=np.float64),
+                bars[close_col].to_numpy(dtype=np.float64),
+            )
+        )
     stats["path"] = str(path)
     stats["first"] = str(bars[time_col].iloc[0]) if time_col in bars.columns else ""
     stats["last"] = str(bars[time_col].iloc[-1]) if time_col in bars.columns else ""
@@ -70,14 +119,23 @@ def assert_calendar_price_quality(
     *,
     log_fn: Any | None = None,
 ) -> dict[str, Any]:
-    """Raise on weekly mix-toggle caches. Daily/intraday are logged only."""
+    """Raise on weekly mix-toggle caches. Overnight also rejects raw-open vs adj-close."""
+    from forecast.overnight import normalize_label_return
+
     stats = parquet_close_diagnostics(path)
     mixed = looks_like_mixed_scale(stats)
+    open_mismatch = looks_like_unadjusted_open(stats)
     if log_fn:
+        extra = ""
+        if "median_abs_log_oc" in stats:
+            extra = (
+                f" median_|log(o/c)|={stats['median_abs_log_oc']:.3f} "
+                f"frac_|oc|>0.4={stats.get('frac_abs_log_oc_gt_0.4', float('nan')):.3f}"
+            )
         log_fn(
             f"price quality {Path(path).name}: lag1_autocorr="
             f"{stats['lag1_autocorr']:+.3f} big_jumps={int(stats['n_big_jumps'])} "
-            f"max_|r|={stats['max_abs_log_return']:.3f}"
+            f"max_|r|={stats['max_abs_log_return']:.3f}{extra}"
         )
     if cfg.interval == "weekly" and mixed and not cfg.allow_mixed_prices:
         raise ValueError(
@@ -86,6 +144,16 @@ def assert_calendar_price_quality(
             "Delete the parquet and re-download with "
             "`python -m forecast.download --source yahoo --interval weekly "
             "--replace --symbols AAPL,MSFT`. Do not upsert onto the mixed file."
+        )
+    overnight = normalize_label_return(getattr(cfg, "label_return", "close")) == "overnight"
+    if overnight and open_mismatch and not cfg.allow_mixed_prices:
+        raise ValueError(
+            f"{path} looks like unadjusted opens vs split-adjusted closes "
+            f"(median |log(open/close)|={stats.get('median_abs_log_oc', float('nan')):.3f}, "
+            f"frac>|0.40|={stats.get('frac_abs_log_oc_gt_0.4', float('nan')):.3f}). "
+            "Overnight labels would be split jumps, not gaps. Re-download Yahoo/Stooq "
+            "daily so adjclose/close rescales OHLC together "
+            "(`python -m forecast.download --universe liquid --source yahoo --replace`)."
         )
     return stats
 
@@ -100,6 +168,11 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Mix-jump / scale-toggle diagnostics for price caches.")
     p.add_argument("--data-dir", default=DataConfig().data_dir)
     p.add_argument("--interval", default="weekly")
+    p.add_argument(
+        "--delete-mixed",
+        action="store_true",
+        help="delete weekly parquets that fail the lag-1 mix-toggle gate",
+    )
     args = p.parse_args(argv)
     cfg = DataConfig(interval=args.interval, allow_mixed_prices=True)
     try:
@@ -123,7 +196,10 @@ def main(argv: list[str] | None = None) -> int:
                 "      fail: weekly lag-1 autocorr < -0.2 is the mixed adjusted/raw signature",
                 file=sys.stderr,
             )
-    return 1 if mixed_any and str(args.interval) == "weekly" else 0
+            if args.delete_mixed:
+                Path(path).unlink()
+                print(f"      deleted {path}", file=sys.stderr)
+    return 1 if mixed_any and str(args.interval) == "weekly" and not args.delete_mixed else 0
 
 
 if __name__ == "__main__":

@@ -18,20 +18,34 @@ if str(_REPO_ROOT) not in sys.path:
 import pandas as pd
 
 from forecast.config import DataConfig
-from forecast.data import build_session_grid, load_bars, split_session_bounds
+from forecast.data import (
+    build_daily_index,
+    build_session_grid,
+    load_bars,
+    split_session_bounds,
+)
 from mamba_lm.paths import resolve_path
 
 
 def main(path: str) -> None:
-    cfg = DataConfig()
     resolved = resolve_path(path)
     if not resolved.exists():
         raise SystemExit(
             f"data file not found: {resolved}\n"
-            "Pass a parquet path, e.g. scripts/split_report.py data/AAPL_1min.parquet"
+            "Pass a parquet path, e.g. scripts/split_report.py data/AAPL_daily.parquet"
         )
+    stem = resolved.stem.lower()
+    interval = "daily"
+    for cand in ("1min", "5min", "15min", "30min", "60min", "weekly", "monthly", "daily"):
+        if stem.endswith("_" + cand):
+            interval = cand
+            break
+    cfg = DataConfig(interval=interval)
     raw = load_bars(resolved)
-    grid = build_session_grid(raw, cfg)
+    if cfg.is_calendar():
+        grid = build_daily_index(raw)
+    else:
+        grid = build_session_grid(raw, cfg)
     sessions = grid["session"].drop_duplicates().sort_values().to_numpy()
     n = len(sessions)
     cut_train, cut_val = split_session_bounds(n, cfg)
@@ -78,8 +92,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "path",
         nargs="?",
-        default="data/AAPL_1min.parquet",
-        help="parquet file to inspect (default: data/AAPL_1min.parquet)",
+        default="data/AAPL_daily.parquet",
+        help="parquet file to inspect (default: data/AAPL_daily.parquet)",
     )
     return p
 

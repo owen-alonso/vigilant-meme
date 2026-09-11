@@ -165,6 +165,9 @@ def bars_to_canonical(
         out["datetime"] = out["datetime"].dt.tz_convert("America/New_York")
     for col in ("open", "high", "low", "close", "volume"):
         out[col] = pd.to_numeric(out[col], errors="coerce")
+    for col in ("open", "high", "low"):
+        if col in out.columns:
+            out[col] = out[col].where(out[col] > 0)
     out["source"] = source
     out["interval"] = interval
     out = out.dropna(subset=["datetime", "close"])
