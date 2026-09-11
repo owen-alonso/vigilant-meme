@@ -138,11 +138,12 @@ INDUSTRY_ETFS: tuple[str, ...] = ("SMH", "KBE", "XBI", "IYR", "XRT")
 
 # Additional 2018-era large-caps for the 150–200 name book. No post-2018 IPOs.
 # Sized so liquid + extras lands ~170–180 equities (plan band), not 200+.
+# MET/TROW replace MMC/BK: Yahoo chart 404s on those two tickers in-cloud.
 LIQUID_WIDE_EXTRA: tuple[str, ...] = (
     "ORCL", "AMD", "MU", "LRCX", "KLAC", "SNPS", "CDNS", "ADI", "NXPI",
     "ADSK", "APH", "FTNT", "PANW", "MSI", "HPQ",
-    "MS", "USB", "PNC", "TFC", "COF", "AIG", "MMC", "ICE", "CME", "MCO",
-    "AON", "BK", "STT",
+    "MS", "USB", "PNC", "TFC", "COF", "AIG", "MET", "ICE", "CME", "MCO",
+    "AON", "TROW", "STT",
     "LLY", "BDX", "BSX", "EW", "REGN", "ZTS", "HCA", "IDXX", "BIIB",
     "COP", "SLB", "EOG", "MPC", "PSX", "VLO",
     "UPS", "FDX", "MMM", "ITW", "ETN", "EMR", "GD", "NOC", "WM", "NSC", "CSX",
@@ -189,8 +190,8 @@ SECTOR_ETF_BY_SYMBOL: dict[str, str] = {
     "HPQ": "XLK", "ANSS": "XLK", "TMUS": "XLK", "CHTR": "XLK",
     "MS": "XLF", "USB": "XLF", "PNC": "XLF", "TFC": "XLF", "COF": "XLF",
     "MET": "XLF", "AIG": "XLF", "PRU": "XLF", "AFL": "XLF", "ALL": "XLF",
-    "TRV": "XLF", "MMC": "XLF", "ICE": "XLF", "CME": "XLF", "MCO": "XLF",
-    "AON": "XLF", "BK": "XLF", "STT": "XLF", "TROW": "XLF",
+    "TRV": "XLF", "ICE": "XLF", "CME": "XLF", "MCO": "XLF",
+    "AON": "XLF", "STT": "XLF", "TROW": "XLF",
     "LLY": "XLV", "BDX": "XLV", "BSX": "XLV", "EW": "XLV", "REGN": "XLV",
     "ZTS": "XLV", "HCA": "XLV", "MCK": "XLV", "IQV": "XLV", "IDXX": "XLV",
     "RMD": "XLV", "BIIB": "XLV", "HUM": "XLV", "CNC": "XLV",

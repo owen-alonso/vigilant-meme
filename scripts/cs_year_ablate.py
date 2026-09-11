@@ -388,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             verdict = (
                 "promote"
-                if baseline_val is not None and val_ic > float(baseline_val) + 1e-5
+                if baseline_val is not None and val_ic > float(baseline_val) + 0.002
                 else "discard"
             )
         verdicts.append({"name": name, "val_cs_ic": val_ic, "verdict": verdict})

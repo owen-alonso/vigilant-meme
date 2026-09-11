@@ -56,7 +56,7 @@ python -m forecast.training --universe liquid --interval daily --skip-only --che
 # optional: --no-sector-residual --no-equities-only --no-train-from --no-ridge-rank-target
 ```
 
-The skip defaults to **within-date rank-target ridge** with ``ridge=10``, feature winsor 3, and ``--ridge-features no_long_ts``, plus same-bar CS product features (val-selected). Do **not** enable walk-forward / later ``train_from`` / ListNet-skip / crash-date drop from test: those lost on locked val.
+The skip defaults to **within-date rank-target ridge** with ``ridge=10``, feature winsor 3, and ``--ridge-features no_long_ts``, plus same-bar CS product features (val-selected). Do **not** enable walk-forward / later ``train_from`` / ListNet-skip / crash-date drop / year-balance / year-stable mask / double residual / feature residualization / industry residual / ``liquid_wide`` as the default from test: those lost or were a dead heat on locked val.
 
 Optional next levers (val-gate; do not promote from test):
 
