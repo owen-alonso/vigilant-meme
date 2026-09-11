@@ -151,12 +151,20 @@ def test_listnet_linear_tracks_rank_feature():
 
 
 def test_new_feature_masks_are_stricter():
+    from forecast.data import CS_PRODUCT_FEATURES, FEATURE_NAMES, VOL_FEATURES
     from forecast.ridge import feature_mask
 
     all_m = feature_mask("all")
     core = feature_mask("core")
     no_long = feature_mask("no_long_ts")
+    no_vol = feature_mask("no_vol_products")
+    names = list(FEATURE_NAMES)
     assert int(core.sum()) < int(no_long.sum()) < int(all_m.sum())
+    assert int(no_vol.sum()) < int(no_long.sum())
+    for col in VOL_FEATURES:
+        assert not bool(no_vol[names.index(col)])
+    for col in CS_PRODUCT_FEATURES:
+        assert not bool(no_vol[names.index(col)])
 
 
 def test_year_balance_equalizes_short_years():
@@ -218,3 +226,106 @@ def test_year_cs_ics_splits_calendar_years():
     years = {int(r["year"]) for r in rows}
     assert years == {2018, 2019}
     assert all(r["cs_ic"] > 0.9 for r in rows)
+
+
+def test_trailing_vol_is_causal():
+    from forecast.ridge import trailing_realized_vol
+
+    keys = np.arange(40, dtype=np.int64)
+    rets = np.linspace(-0.02, 0.03, 40)
+    vol = trailing_realized_vol(keys, rets, window=10, min_obs=5)
+    rets2 = rets.copy()
+    rets2[-1] = 0.5
+    vol2 = trailing_realized_vol(keys, rets2, window=10, min_obs=5)
+    for k in keys[:-1]:
+        if k in vol and k in vol2:
+            assert vol[int(k)] == pytest.approx(vol2[int(k)])
+    assert vol[int(keys[-1])] != pytest.approx(vol2[int(keys[-1])])
+
+
+def test_regime_bucket_edges_ignore_held_out_scores():
+    from forecast.ridge import assign_score_buckets, bucket_edges_from_train
+
+    train = {i: float(i) for i in range(10)}
+    edges = bucket_edges_from_train(train, 2)
+    held = {100: 1e9}
+    b_train = assign_score_buckets(train, edges)
+    b_all = assign_score_buckets({**train, **held}, edges)
+    for k, v in b_train.items():
+        assert b_all[k] == v
+    assert b_all[100] == 1
+
+
+def test_regime_heads_recover_dispersion_sign_flip():
+    from forecast.ridge import (
+        assign_score_buckets,
+        bucket_edges_from_train,
+        fit_regime_heads,
+        fit_ridge_xy,
+        mean_cs_ic,
+        predict_regime_heads,
+        regime_score_map,
+    )
+
+    n_dates, n_names = 80, 12
+    names = ["ret_1", "sig", "mkt_ret_1", "noise"]
+    rng = np.random.default_rng(11)
+    rows_x = []
+    rows_y = []
+    dates = []
+    for d in range(n_dates):
+        high = d >= 40
+        ret1 = rng.normal(scale=3.0 if high else 0.25, size=n_names)
+        sig = rng.normal(size=n_names)
+        mkt = np.full(n_names, 0.01 if high else 0.0)
+        noise = rng.normal(size=n_names)
+        rows_x.append(np.stack([ret1, sig, mkt, noise], axis=1))
+        y = (-sig if high else sig) + 0.05 * rng.normal(size=n_names)
+        rows_y.append(y)
+        dates.extend([d] * n_names)
+    x = np.concatenate(rows_x)
+    y = np.concatenate(rows_y)
+    d = np.asarray(dates, dtype=np.int64)
+    scores = regime_score_map(x, d, kind="cs_disp", names=names)
+    edges = bucket_edges_from_train(scores, 2)
+    buckets = assign_score_buckets(scores, edges)
+    w_heads, _, counts = fit_regime_heads(
+        x,
+        y,
+        d,
+        buckets,
+        n_buckets=2,
+        ridge=1e-3,
+        min_names=8,
+        rank_target=True,
+        feat_winsor=0.0,
+        min_dates_per_bucket=10,
+    )
+    pred = predict_regime_heads(x, d, buckets, w_heads)
+    w_one, _, _ = fit_ridge_xy(x, y, d, ridge=1e-3, min_names=8, rank_target=True)
+    ic_reg = mean_cs_ic(pred, y, d, min_names=8)
+    ic_one = mean_cs_ic(x @ w_one.astype(np.float64), y, d, min_names=8)
+    assert min(counts) >= 10
+    assert ic_reg > 0.4
+    assert ic_reg > ic_one + 0.15
+
+
+def test_trailing_window_keep_is_left_closed():
+    from forecast.ridge import trailing_window_keep
+
+    end = int((np.datetime64("2014-01-01") - np.datetime64("1970-01-01")) / np.timedelta64(1, "D"))
+    dates = np.array([end - 200, end - 10, end, end + 10], dtype=np.int64)
+    keep = trailing_window_keep(dates, end_days=end, years=1.0)
+    assert bool(keep[0]) and bool(keep[1])
+    assert not bool(keep[2]) and not bool(keep[3])
+
+
+def test_late_train_holdout_is_disjoint_and_last():
+    from forecast.ridge import late_train_holdout_mask
+
+    d0 = int((np.datetime64("2008-01-01") - np.datetime64("1970-01-01")) / np.timedelta64(1, "D"))
+    dates = np.repeat(np.arange(2000, dtype=np.int64) + d0, 4)
+    fit, sel = late_train_holdout_mask(dates, holdout_years=2, min_holdout_dates=60)
+    assert not bool((fit & sel).any())
+    assert bool(fit.any()) and bool(sel.any())
+    assert int(dates[sel].min()) > int(dates[fit].max())

@@ -1379,8 +1379,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "--ridge-features",
         default=t.ridge_features,
-        choices=("all", "cs", "no_calendar", "no_long_ts", "no_ohlc", "core"),
-        help="mask skip features: all, CS-only, drop calendar/long-TS/OHLC, or core",
+        choices=("all", "cs", "no_calendar", "no_long_ts", "no_ohlc", "core", "no_vol_products"),
+        help="mask skip features: all, CS-only, drop calendar/long-TS/OHLC, core, or drop vol+CS products",
     )
     g.add_argument(
         "--ridge-date-halflife",

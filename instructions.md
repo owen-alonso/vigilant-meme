@@ -61,6 +61,8 @@ The skip defaults to **within-date rank-target ridge** with ``ridge=10``, featur
 Optional next levers (val-gate; do not promote from test):
 
 ```bash
+# regime heads / surgical vol+CS-product drop / trailing readout window
+python scripts/cs_regime_ablate.py --data-dir data --universe liquid
 # ~170-equity 2018-era book (Yahoo extras; --skip-existing reuses the 85-name cache)
 python -m forecast.download --universe liquid_wide --source yahoo --interval daily --skip-existing
 python -m forecast.training --universe liquid_wide --interval daily --skip-only

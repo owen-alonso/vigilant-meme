@@ -11,13 +11,21 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from forecast.data import CROSS_SECTION_FEATURES, FEATURE_NAMES, SymbolArrays
+from forecast.data import (
+    CROSS_SECTION_FEATURES,
+    CS_PRODUCT_FEATURES,
+    FEATURE_NAMES,
+    VOL_FEATURES,
+    SymbolArrays,
+)
 
 CALENDAR_FEATURES = frozenset(
     {"traded", "staleness", "new_session", "tod_sin", "tod_cos", "tod_frac", "dow_frac"}
 )
 OHLC_FEATURES = frozenset({"range_hl", "body_co", "close_loc", "wick_up", "wick_dn"})
 LONG_TS_FEATURES = frozenset({"ret_60", "ret_390", "vol_level"})
+VOL_FEATURE_SET = frozenset(VOL_FEATURES)
+CS_PRODUCT_SET = frozenset(CS_PRODUCT_FEATURES)
 # Dot-com + GFC inside the 1999–2009 train window. Used only when drop_crashes=True.
 CRASH_WINDOWS = (
     ("2000-03-01", "2002-10-31"),
@@ -65,6 +73,10 @@ def feature_mask(mode: str) -> np.ndarray:
         return np.array([nm not in drop for nm in names], dtype=bool)
     if raw in ("core", "core_cs"):
         drop = LONG_TS_FEATURES | OHLC_FEATURES | CALENDAR_FEATURES
+        return np.array([nm not in drop for nm in names], dtype=bool)
+    if raw in ("no_vol_products", "no_vol_cs_products"):
+        # Promoted no_long_ts, plus the year-ablation unstable groups.
+        drop = LONG_TS_FEATURES | CALENDAR_FEATURES | VOL_FEATURE_SET | CS_PRODUCT_SET
         return np.array([nm not in drop for nm in names], dtype=bool)
     raise ValueError(f"unknown feature mask {mode!r}")
 
@@ -737,6 +749,305 @@ def predict_regime(
         w = w_high if score >= split else w_low
         pred[sel] = x[sel] @ np.asarray(w, dtype=np.float64)
     return pred
+
+
+def date_level_mean(
+    x: np.ndarray,
+    dates: np.ndarray,
+    col: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sorted unique dates and the within-date mean of one column."""
+    keys = np.unique(np.asarray(dates, dtype=np.int64))
+    vals = np.empty(keys.size, dtype=np.float64)
+    col_i = int(col)
+    for i, key in enumerate(keys):
+        sel = dates == key
+        vals[i] = float(np.nanmean(x[sel, col_i]))
+    return keys.astype(np.int64), vals
+
+
+def date_level_std(
+    x: np.ndarray,
+    dates: np.ndarray,
+    col: int,
+) -> dict[int, float]:
+    """Within-date std of one feature column (known at close; not a label)."""
+    out: dict[int, float] = {}
+    col_i = int(col)
+    for key in np.unique(np.asarray(dates, dtype=np.int64)):
+        sel = dates == key
+        sl = x[sel, col_i]
+        if sl.size < 2:
+            continue
+        out[int(key)] = float(np.nanstd(sl))
+    return out
+
+
+def trailing_realized_vol(
+    date_keys: np.ndarray,
+    date_ret: np.ndarray,
+    *,
+    window: int = 60,
+    min_obs: int = 20,
+) -> dict[int, float]:
+    """Causal trailing std of a date-level return series, including today.
+
+    ``date_keys`` must be sorted. Score at ``t`` uses returns through ``t`` only.
+    """
+    keys = np.asarray(date_keys, dtype=np.int64)
+    rets = np.asarray(date_ret, dtype=np.float64)
+    n = int(keys.size)
+    out: dict[int, float] = {}
+    if n == 0:
+        return out
+    csum = np.cumsum(rets)
+    csum2 = np.cumsum(rets * rets)
+    win = max(2, int(window))
+    need = max(2, int(min_obs))
+    for i in range(n):
+        lo = max(0, i + 1 - win)
+        cnt = i - lo + 1
+        if cnt < need:
+            continue
+        s = float(csum[i] - (csum[lo - 1] if lo > 0 else 0.0))
+        s2 = float(csum2[i] - (csum2[lo - 1] if lo > 0 else 0.0))
+        var = (s2 - s * s / cnt) / max(cnt - 1, 1)
+        out[int(keys[i])] = float(np.sqrt(max(var, 0.0)))
+    return out
+
+
+def regime_score_map(
+    x: np.ndarray,
+    dates: np.ndarray,
+    *,
+    kind: str,
+    names: Sequence[str] | None = None,
+    window: int = 60,
+    min_obs: int = 20,
+) -> dict[int, float]:
+    """Date-level decision-time regime scores. Never uses ``y``.
+
+    ``spy_vol``: trailing SPY/market 60d realized vol from ``mkt_ret_1``.
+    ``cs_disp``: within-date std of ``ret_1``.
+    """
+    feat = list(names) if names is not None else list(FEATURE_NAMES)
+    raw = (kind or "spy_vol").strip().lower()
+    if raw in ("spy_vol", "mkt_vol", "spy60"):
+        if "mkt_ret_1" not in feat:
+            raise ValueError("mkt_ret_1 required for spy_vol regime")
+        keys, rets = date_level_mean(x, dates, feat.index("mkt_ret_1"))
+        return trailing_realized_vol(keys, rets, window=window, min_obs=min_obs)
+    if raw in ("cs_disp", "cs_dispersion", "ret1_disp"):
+        col = feat.index("ret_1") if "ret_1" in feat else 0
+        return date_level_std(x, dates, col)
+    raise ValueError(f"unknown regime kind {kind!r}")
+
+
+def bucket_edges_from_train(
+    train_scores: dict[int, float],
+    n_buckets: int,
+) -> np.ndarray:
+    """Quantile edges from train dates only. Length ``n_buckets + 1``."""
+    k = max(2, int(n_buckets))
+    vals = np.asarray(list(train_scores.values()), dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return np.array([-np.inf, np.inf], dtype=np.float64)
+    qs = np.linspace(0.0, 1.0, k + 1)
+    edges = np.quantile(vals, qs).astype(np.float64)
+    for i in range(1, edges.size):
+        if edges[i] <= edges[i - 1]:
+            edges[i] = np.nextafter(edges[i - 1], np.inf)
+    edges[0] = -np.inf
+    edges[-1] = np.inf
+    return edges
+
+
+def assign_score_buckets(
+    scores: dict[int, float],
+    edges: np.ndarray,
+) -> dict[int, int]:
+    """Map each date to a bucket in ``[0, n_buckets)``. Missing scores -> middle."""
+    k = max(1, int(np.asarray(edges).size) - 1)
+    mid = k // 2
+    out: dict[int, int] = {}
+    ed = np.asarray(edges, dtype=np.float64)
+    for key, val in scores.items():
+        if not np.isfinite(val):
+            out[int(key)] = mid
+            continue
+        b = int(np.searchsorted(ed, val, side="right") - 1)
+        out[int(key)] = int(np.clip(b, 0, k - 1))
+    return out
+
+
+def dates_to_buckets(
+    dates: np.ndarray,
+    score_map: dict[int, float],
+    edges: np.ndarray,
+) -> np.ndarray:
+    """Per-row bucket ids aligned with ``dates``."""
+    assigned = assign_score_buckets(score_map, edges)
+    k = max(1, int(np.asarray(edges).size) - 1)
+    mid = k // 2
+    out = np.empty(np.asarray(dates).shape[0], dtype=np.int64)
+    for i, key in enumerate(np.asarray(dates, dtype=np.int64)):
+        out[i] = assigned.get(int(key), mid)
+    return out
+
+
+def fit_regime_heads(
+    x: np.ndarray,
+    y: np.ndarray,
+    dates: np.ndarray,
+    buckets: dict[int, int],
+    *,
+    n_buckets: int,
+    ridge: float = 10.0,
+    min_names: int = 8,
+    rank_target: bool = True,
+    feat_winsor: float = 3.0,
+    feature_mask_bool: np.ndarray | None = None,
+    min_dates_per_bucket: int = 60,
+) -> tuple[np.ndarray, float, list[int]]:
+    """Fit one last-bar CS ridge per train-declared bucket.
+
+    Returns ``W [K, F]``, train hard-assignment CS IC, and counts per bucket.
+    """
+    k = max(2, int(n_buckets))
+    f = int(x.shape[1]) if x.ndim == 2 else 0
+    weights = np.zeros((k, f), dtype=np.float32)
+    counts: list[int] = []
+    date_keys = np.unique(np.asarray(dates, dtype=np.int64))
+    for b in range(k):
+        in_b = {int(d) for d in date_keys if int(buckets.get(int(d), -1)) == b}
+        counts.append(len(in_b))
+        if len(in_b) < int(min_dates_per_bucket):
+            continue
+        other = {int(d) for d in date_keys if int(d) not in in_b}
+        w, _, _ = fit_ridge_xy(
+            x,
+            y,
+            dates,
+            ridge=ridge,
+            min_names=min_names,
+            rank_target=rank_target,
+            feat_winsor=feat_winsor,
+            feature_mask_bool=feature_mask_bool,
+            exclude_dates=other,
+        )
+        weights[b] = w.astype(np.float32)
+    pred = predict_regime_heads(x, dates, buckets, weights)
+    ic = mean_cs_ic(pred, y, dates, min_names=min_names)
+    return weights, ic, counts
+
+
+def predict_regime_heads(
+    x: np.ndarray,
+    dates: np.ndarray,
+    buckets: dict[int, int],
+    weights: np.ndarray,
+) -> np.ndarray:
+    """Hard-assign each date to its train-edge bucket head."""
+    w = np.asarray(weights, dtype=np.float64)
+    k = int(w.shape[0])
+    mid = max(k // 2, 0)
+    pred = np.zeros(x.shape[0], dtype=np.float64)
+    for key in np.unique(np.asarray(dates, dtype=np.int64)):
+        sel = dates == key
+        b = int(buckets.get(int(key), mid))
+        b = int(np.clip(b, 0, k - 1))
+        pred[sel] = x[sel] @ w[b]
+    return pred
+
+
+def predict_regime_mixture(
+    x: np.ndarray,
+    dates: np.ndarray,
+    score_map: dict[int, float],
+    weights: np.ndarray,
+    edges: np.ndarray,
+    *,
+    temperature: float,
+) -> np.ndarray:
+    """Soft mix of bucket heads using distance of the date score to centers."""
+    w = np.asarray(weights, dtype=np.float64)
+    ed = np.asarray(edges, dtype=np.float64)
+    finite = ed[np.isfinite(ed)]
+    if finite.size == 0:
+        return predict_regime_heads(x, dates, assign_score_buckets(score_map, edges), w)
+    # Restore finite span for centers; inf edges are the outer buckets.
+    lo = float(finite.min())
+    hi = float(finite.max())
+    ed_c = ed.copy()
+    if not np.isfinite(ed_c[0]):
+        ed_c[0] = lo
+    if not np.isfinite(ed_c[-1]):
+        ed_c[-1] = hi
+    centers = 0.5 * (ed_c[:-1] + ed_c[1:])
+    temp = max(float(temperature), 1e-6)
+    k = int(w.shape[0])
+    pred = np.zeros(x.shape[0], dtype=np.float64)
+    default = float(np.mean(centers)) if centers.size else 0.0
+    for key in np.unique(np.asarray(dates, dtype=np.int64)):
+        sel = dates == key
+        s = float(score_map.get(int(key), default))
+        if not np.isfinite(s):
+            s = default
+        logits = -((s - centers) / temp) ** 2
+        logits = logits - float(np.max(logits))
+        gate = np.exp(logits)
+        gate = gate / max(float(gate.sum()), 1e-12)
+        mixed = gate[:k] @ w[:k]
+        pred[sel] = x[sel] @ mixed
+    return pred
+
+
+def trailing_window_keep(
+    dates: np.ndarray,
+    *,
+    end_days: int,
+    years: float,
+) -> np.ndarray:
+    """Train rows in ``[end - years, end)``. ``end_days`` is typically val start."""
+    span = int(round(float(years) * 365.25))
+    lo = int(end_days) - span
+    d = np.asarray(dates, dtype=np.int64)
+    return (d >= lo) & (d < int(end_days))
+
+
+def late_train_holdout_mask(
+    dates: np.ndarray,
+    *,
+    holdout_years: int = 2,
+    min_holdout_dates: int = 60,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split train dates into fit vs leak-free late-train selection slice.
+
+    Returns boolean masks over rows. Falls back to last 20% of unique dates
+    when the last ``holdout_years`` calendar years are too thin.
+    """
+    d = np.asarray(dates, dtype=np.int64)
+    uniq = np.unique(d)
+    if uniq.size == 0:
+        empty = np.zeros(d.shape[0], dtype=bool)
+        return empty, empty
+    years = dates_to_year(uniq)
+    max_year = int(years.max())
+    cut_year = max_year - max(1, int(holdout_years)) + 1
+    hold_keys = set(int(k) for k, y in zip(uniq, years) if int(y) >= cut_year)
+    if len(hold_keys) < int(min_holdout_dates):
+        n_hold = max(int(min_holdout_dates), int(round(0.2 * uniq.size)))
+        n_hold = min(n_hold, max(1, uniq.size - 1))
+        hold_keys = set(int(k) for k in uniq[-n_hold:])
+    sel = np.array([int(v) in hold_keys for v in d], dtype=bool)
+    fit = ~sel
+    if not bool(fit.any()) or not bool(sel.any()):
+        n_hold = max(1, int(round(0.2 * uniq.size)))
+        hold_keys = set(int(k) for k in uniq[-n_hold:])
+        sel = np.array([int(v) in hold_keys for v in d], dtype=bool)
+        fit = ~sel
+    return fit, sel
 
 
 def augment_cs_products(x: np.ndarray, cols: Sequence[int]) -> np.ndarray:

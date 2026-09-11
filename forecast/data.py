@@ -121,6 +121,14 @@ CS_PRODUCTS: tuple[tuple[str, str, str], ...] = (
     ("cs_ret_1", "cs_ret_1", "cs_ret1_sq"),
     ("cs_rank_1", "cs_rank_1", "cs_rank_sq"),
 )
+CS_PRODUCT_FEATURES: tuple[str, ...] = tuple(name for _, _, name in CS_PRODUCTS)
+VOL_FEATURES: tuple[str, ...] = (
+    "vol_level",
+    "vol_change",
+    "volume_z",
+    "turnover_z",
+    "ret_vol",
+)
 
 # Same-bar CS z-scores (source column -> feature name). Known at close; not labels.
 CS_ZSCORE_SOURCES: tuple[tuple[str, str], ...] = (

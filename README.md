@@ -158,6 +158,7 @@ python -m forecast.training --universe liquid --skip-only
 python -m forecast.backtest --checkpoint checkpoints/forecast/best.pt --cost-bps 10
 python scripts/cs_collapse_ablate.py --data-dir data --universe liquid
 python scripts/cs_year_ablate.py --data-dir data --universe liquid
+python scripts/cs_regime_ablate.py --data-dir data --universe liquid
 python scripts/ablate_cs.py
 python scripts/split_report.py data/AAPL_daily.parquet
 ```
