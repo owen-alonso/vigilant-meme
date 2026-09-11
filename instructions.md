@@ -111,6 +111,9 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/be
 # LS haircut experiment (NOT default): HTB shorts at half size, short NAV 0.30
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --live-costs --ls-haircut-experiment
+# causal trailing overnight CS-IC trade gate (TRAIN-fit W,τ; default off)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --long-only --ic-gate-window 60 --ic-gate-tau 0.0
 # harsh auction stress
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --cost-bundle harsh

@@ -145,6 +145,36 @@ def cs_ic_by_date(
     return pd.DataFrame(rows).set_index("datetime")
 
 
+def trailing_mean_cs_ic(
+    pred: pd.DataFrame,
+    realized: pd.DataFrame,
+    *,
+    window: int,
+    min_names: int = 3,
+    kind: str = "pearson",
+    min_obs: int | None = None,
+) -> pd.Series:
+    """Causal trailing mean CS IC known at close ``t``.
+
+    Per-date IC on ``s`` uses the overnight label that realizes at the next
+    open, so the value at ``s`` is *not* known at close ``s``. The series
+    at ``t`` is the mean of ICs on the prior ``window`` sessions
+    ``s < t`` only. Date ``t``'s own overnight realization never enters.
+    Warmup (too few prior ICs) is NaN — caller should leave those dates on.
+    """
+    ics = cs_ic_by_date(pred, realized, min_names=min_names)
+    if ics.empty:
+        return pd.Series(dtype=np.float64)
+    col = "ic_spearman" if str(kind).lower() in ("spearman", "rank") else "ic"
+    if col not in ics.columns:
+        col = "ic"
+    prior = ics[col].astype(np.float64).sort_index()
+    # shift(1): at t, the newest term is IC[t-1], known after open t / by close t.
+    w = max(1, int(window))
+    need = int(min_obs) if min_obs is not None else max(8, w // 3)
+    return prior.shift(1).rolling(w, min_periods=need).mean()
+
+
 def quantile_weights(
     scores: pd.Series,
     *,
@@ -460,6 +490,10 @@ def book_pnl(
     adv_floor_pctile: float = 0.0,
     long_size: str = "equal",
     conf_pctile: float = 0.0,
+    ic_gate_window: int = 0,
+    ic_gate_tau: float = 0.0,
+    ic_gate_kind: str = "pearson",
+    ic_gate_trail: pd.Series | None = None,
 ) -> dict[str, Any]:
     """Cost-aware long-short with optional rank weights, hold smoothing, causal vol.
 
@@ -487,9 +521,24 @@ def book_pnl(
         # Session carry would mix open→close into an overnight / open+N book.
         hold_halflife = 0.0
     dates = pred.index.intersection(realized.index)
+    trail_ic = None
+    gate_w = int(ic_gate_window or 0)
+    if ic_gate_trail is not None:
+        trail_ic = ic_gate_trail
+        gate_w = gate_w if gate_w > 0 else max(1, int(getattr(ic_gate_trail, "name", 0) or 1))
+    elif gate_w > 0:
+        trail_ic = trailing_mean_cs_ic(
+            pred,
+            realized,
+            window=gate_w,
+            min_names=int(min_names),
+            kind=str(ic_gate_kind or "pearson"),
+        )
     raw_w: list[pd.Series] = []
     gross: list[float] = []
     kept: list[Any] = []
+    n_gated = 0
+    n_gate_dates = 0
     for ts in dates:
         pair_all = pd.concat(
             [pred.loc[ts], realized.loc[ts]], axis=1, keys=["p", "r"]
@@ -525,6 +574,17 @@ def book_pnl(
                 long_size=str(long_size or "equal"),
                 conf_pctile=float(conf_pctile),
             )
+        if trail_ic is not None:
+            n_gate_dates += 1
+            tval = (
+                float(trail_ic.loc[ts])
+                if ts in trail_ic.index
+                else float("nan")
+            )
+            # NaN warmup: leave the date on (same as skip-IC shrink).
+            if np.isfinite(tval) and tval < float(ic_gate_tau):
+                w = w * 0.0
+                n_gated += 1
         r = pair_all["r"].reindex(w.index)
         pair = pd.concat([w, r], axis=1, keys=["w", "r"]).dropna()
         if len(pair) < 2:
@@ -716,6 +776,14 @@ def book_pnl(
         "adv_floor_pctile": float(adv_floor_pctile),
         "long_size": str(long_size or "equal"),
         "conf_pctile": float(conf_pctile),
+        "ic_gate_window": float(gate_w),
+        "ic_gate_tau": float(ic_gate_tau) if gate_w > 0 else 0.0,
+        "ic_gate_kind": str(ic_gate_kind or "pearson") if gate_w > 0 else "",
+        "ic_gate_n_flat": float(n_gated),
+        "ic_gate_n_dates": float(n_gate_dates),
+        "ic_gate_coverage": (
+            float(1.0 - n_gated / n_gate_dates) if n_gate_dates else float("nan")
+        ),
         "ex_post_gap_k": float(ex_post_gap_k),
         "mean_long_nav": sides["mean_long_nav"],
         "mean_short_nav": sides["mean_short_nav"],
@@ -757,7 +825,14 @@ def format_report(stats: dict[str, Any], *, checkpoint: Path, test_start: Any) -
         f"quantile {stats.get('quantile', float('nan')):.2f}  "
         f"hold_hl {stats.get('hold_halflife', 0):.1f}  "
         f"holding {stats.get('holding', 'close')}"
-        f"{'  LONG-ONLY' if stats.get('long_only') else ''}",
+        f"{'  LONG-ONLY' if stats.get('long_only') else ''}"
+        + (
+            f"  ic_gate W={int(stats.get('ic_gate_window') or 0)} "
+            f"τ={float(stats.get('ic_gate_tau') or 0):+.3f} "
+            f"cover {100 * float(stats.get('ic_gate_coverage') or float('nan')):.0f}%"
+            if float(stats.get("ic_gate_window") or 0) > 0
+            else ""
+        ),
         f"  round-trip  {stats.get('round_trip_bps', float('nan')):.1f} bp"
         f"  moc {stats.get('moc_bps', 0):.1f} bp"
         f"  moo {stats.get('moo_bps', 0):.1f} bp"
@@ -937,6 +1012,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="long-only: drop sleeve names with |pred| below this CS percentile "
         "(0=off, 0.5=date-median conviction). Causal; ignored unless --long-only.",
+    )
+    p.add_argument(
+        "--ic-gate-window",
+        type=int,
+        default=0,
+        help="causal trailing overnight CS-IC sessions used at close t "
+        "(0=off). Decision uses only dates < t; t's own overnight is never in.",
+    )
+    p.add_argument(
+        "--ic-gate-tau",
+        type=float,
+        default=0.0,
+        help="trade the overnight book only if trailing mean CS IC >= this "
+        "(flat otherwise). Used with --ic-gate-window.",
     )
     p.add_argument(
         "--locate-adv-pctile",
@@ -1170,6 +1259,8 @@ def main(argv: list[str] | None = None) -> int:
         adv_floor_pctile=float(args.adv_floor_pctile or 0.0),
         long_size=str(getattr(args, "long_size", "equal") or "equal"),
         conf_pctile=float(getattr(args, "conf_pctile", 0.0) or 0.0),
+        ic_gate_window=int(getattr(args, "ic_gate_window", 0) or 0),
+        ic_gate_tau=float(getattr(args, "ic_gate_tau", 0.0) or 0.0),
     )
     stats = book_pnl(pred, realized, long_only=args.long_only, **book_kw)
     print(format_report(stats, checkpoint=ckpt_path, test_start=start))

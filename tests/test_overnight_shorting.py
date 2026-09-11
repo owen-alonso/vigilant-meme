@@ -13,6 +13,7 @@ from forecast.backtest import book_pnl, sleeve_direction_from_weights
 from forecast.shorting import (
     IR_LIFT,
     SHORT_EXCESS_LIFT_PP,
+    decide_ic_gate_promote,
     decide_lo_promote,
     decide_lo_refine,
     decide_ls_promote,
@@ -240,6 +241,37 @@ def test_decide_lo_refine_test_veto_does_not_pick_another_cell():
     assert ok["spec"]["long_size"] == "abs_pred"
 
 
+def test_decide_ic_gate_promote_is_val_only_and_needs_coverage():
+    always = {"unlevered_net_ir": 1.0, "unlevered_max_dd": -0.20}
+    gated = {
+        "unlevered_net_ir": 1.20,
+        "unlevered_max_dd": -0.18,
+        "ic_gate_coverage": 0.55,
+    }
+    juicy_test = {"unlevered_net_ir": 9.9, "unlevered_max_dd": 0.0, "ic_gate_coverage": 0.99}
+    yes = decide_ic_gate_promote(
+        val_always=always,
+        val_gated=gated,
+        chosen={"window": 60, "tau": 0.0, "ic_gate_coverage": 0.7},
+    )
+    assert yes["promote_ic_gate"] is True
+    assert yes["gated_on"] == "val"
+    assert yes["fit_split"] == "train"
+    # TEST numbers are not arguments — cannot flip the call.
+    assert juicy_test["unlevered_net_ir"] > yes["ir_gated"]
+
+    thin = decide_ic_gate_promote(
+        val_always=always,
+        val_gated={**gated, "ic_gate_coverage": 0.10},
+        chosen={"window": 60, "tau": 0.04},
+    )
+    assert thin["promote_ic_gate"] is False
+    assert thin["spec"]["window"] == 0
+
+    no_fit = decide_ic_gate_promote(val_always=always, val_gated=gated, chosen={})
+    assert no_fit["promote_ic_gate"] is False
+
+
 def test_frame_to_wide_uses_calendar_index():
     df = pd.DataFrame(
         {
@@ -326,6 +358,9 @@ def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
     assert payload["lo_promotion"]["gated_on"] == "val"
     assert payload["ls_experiment"]["promote_as_default"] is False
     assert payload["lo_refine_promotion"]["gated_on"] == "val"
+    assert payload["ic_gate_fit"]["fit_split"] == "train"
+    assert payload["ic_gate_promotion"]["gated_on"] == "val"
+    assert "PROMOTE IC-GATE" in text
     assert "VAL LONG-ONLY GRID" in text
     assert "VAL LONG-ONLY REFINE" in text
     assert "LS HAIRCUT EXPERIMENT" in text

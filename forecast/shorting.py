@@ -26,7 +26,7 @@ from forecast.accuracy import (
     overnight_skip_data_config,
     score_eval_frame,
 )
-from forecast.backtest import book_pnl
+from forecast.backtest import book_pnl, trailing_mean_cs_ic
 from forecast.data import build_datasets
 from forecast.overnight import (
     LIVE_BUNDLE,
@@ -98,12 +98,18 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/be
 # long-only live (no locate, borrow=0) — default live book after LS failed VAL
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only
-# VAL-promoted long-only spec on synthetic (rank vs q20); confirm on liquid VAL
+# VAL-promoted long-only spec on synthetic (rank vs q20); TEST did not confirm
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only --weighting rank
+# long-only conviction / inv-vol (VAL refine: no lift vs q20 equal)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
+  --holding overnight --live-costs --long-only --long-size inv_vol --conf-pctile 0.5
 # VAL-gated LS haircut experiment (NOT default): HTB shorts at half size, short NAV 0.30
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --ls-haircut-experiment
+# causal trailing CS-IC trade gate (TRAIN-fit W,τ; default off until VAL promote)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
+  --holding overnight --live-costs --long-only --ic-gate-window 60 --ic-gate-tau 0.0
 """
 
 
@@ -174,6 +180,9 @@ def _run_overnight_book(
     adv_floor_pctile: float = 0.0,
     long_size: str = "equal",
     conf_pctile: float = 0.0,
+    ic_gate_window: int = 0,
+    ic_gate_tau: float = 0.0,
+    ic_gate_trail: pd.Series | None = None,
 ) -> dict[str, Any]:
     stats = book_pnl(
         pred,
@@ -193,6 +202,9 @@ def _run_overnight_book(
         adv_floor_pctile=float(adv_floor_pctile),
         long_size=str(long_size or "equal"),
         conf_pctile=float(conf_pctile),
+        ic_gate_window=int(ic_gate_window or 0),
+        ic_gate_tau=float(ic_gate_tau or 0.0),
+        ic_gate_trail=ic_gate_trail,
         overnight_r=overnight_r,
         turnover_z=turnover_z,
         vol_level=vol_level,
@@ -579,6 +591,191 @@ def decide_lo_refine(
     }
 
 
+IC_GATE_WINDOWS = (20, 60, 120)
+IC_GATE_TAUS = (-0.02, 0.0, 0.02, 0.04)
+IC_GATE_COVER_TRAIN = 0.40
+IC_GATE_COVER_VAL = 0.30
+
+
+def _wide_from_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
+    pred = frame_to_wide(df, "pred")
+    y = frame_to_wide(df, "y")
+    r_on = frame_to_wide(df, "r_on")
+    tz = frame_to_wide(df, "turnover_z") if "turnover_z" in df.columns else None
+    vol = frame_to_wide(df, "vol_level") if "vol_level" in df.columns else None
+    return pred, y, r_on, tz, vol
+
+
+def _lo_q20_book(
+    pred: pd.DataFrame,
+    y: pd.DataFrame,
+    *,
+    min_names: int,
+    vol_target: float,
+    overnight_r: pd.DataFrame | None,
+    turnover_z: pd.DataFrame | None,
+    vol_level: pd.DataFrame | None,
+    ic_gate_window: int = 0,
+    ic_gate_tau: float = 0.0,
+    ic_gate_trail: pd.Series | None = None,
+) -> dict[str, Any]:
+    return _run_overnight_book(
+        pred,
+        y,
+        bundle=LIVE_LONG_ONLY_BUNDLE,
+        long_only=True,
+        min_names=min_names,
+        vol_target=vol_target,
+        overnight_r=overnight_r,
+        turnover_z=turnover_z,
+        vol_level=vol_level,
+        quantile=0.2,
+        weighting="quantile",
+        ic_gate_window=int(ic_gate_window),
+        ic_gate_tau=float(ic_gate_tau),
+        ic_gate_trail=ic_gate_trail,
+    )
+
+
+def fit_ic_gate_on_train(
+    df: pd.DataFrame,
+    *,
+    min_names: int,
+    vol_target: float = 0.15,
+) -> dict[str, Any]:
+    """Select (W, τ) on TRAIN only. VAL/TEST must never enter."""
+    empty = {"rows": [], "chosen": {}, "baseline": {}, "fit_split": "train"}
+    if df.empty:
+        return empty
+    pred, y, r_on, tz, vol = _wide_from_frame(df)
+    if pred.empty or pred.shape[1] < 2:
+        return empty
+    base = _lo_q20_book(
+        pred, y, min_names=min_names, vol_target=vol_target,
+        overnight_r=r_on, turnover_z=tz, vol_level=vol,
+    )
+    rows: list[dict[str, Any]] = []
+    chosen: dict[str, Any] = {}
+    best_ir = -1e18
+    for window in IC_GATE_WINDOWS:
+        for tau in IC_GATE_TAUS:
+            stats = _lo_q20_book(
+                pred, y, min_names=min_names, vol_target=vol_target,
+                overnight_r=r_on, turnover_z=tz, vol_level=vol,
+                ic_gate_window=window, ic_gate_tau=tau,
+            )
+            cover = _as_float(stats.get("ic_gate_coverage"))
+            ir = _as_float(stats.get("unlevered_net_ir"))
+            row = {
+                "name": f"ic_gate_W{window}_t{tau:+.2f}",
+                "window": window,
+                "tau": tau,
+                "unlevered_net_ir": stats.get("unlevered_net_ir"),
+                "unlevered_max_dd": stats.get("unlevered_max_dd"),
+                "mean_cost_unlev_bp": stats.get("mean_cost_unlev_bp"),
+                "ic_gate_coverage": cover,
+                "ic_gate_n_flat": stats.get("ic_gate_n_flat"),
+            }
+            rows.append(row)
+            if (not np.isfinite(ir)) or (not np.isfinite(cover)):
+                continue
+            if cover < IC_GATE_COVER_TRAIN:
+                continue
+            if ir > best_ir + 1e-12:
+                best_ir = ir
+                chosen = dict(row)
+    rows.sort(key=lambda r: (-_as_float(r.get("unlevered_net_ir"), default=-1e9), str(r.get("name"))))
+    return {
+        "rows": rows,
+        "chosen": chosen,
+        "baseline": {
+            "name": "live_long_only_q20",
+            "unlevered_net_ir": base.get("unlevered_net_ir"),
+            "unlevered_max_dd": base.get("unlevered_max_dd"),
+            "mean_cost_unlev_bp": base.get("mean_cost_unlev_bp"),
+            "ic_gate_coverage": 1.0,
+        },
+        "fit_split": "train",
+        "cover_min_train": IC_GATE_COVER_TRAIN,
+    }
+
+
+def decide_ic_gate_promote(
+    *,
+    val_always: dict[str, Any],
+    val_gated: dict[str, Any],
+    chosen: dict[str, Any],
+) -> dict[str, Any]:
+    """VAL-only vs always-on q20. TEST never enters."""
+    ir_on = _as_float(val_always.get("unlevered_net_ir"))
+    ir_g = _as_float(val_gated.get("unlevered_net_ir"))
+    dd_on = _as_float(val_always.get("unlevered_max_dd"))
+    dd_g = _as_float(val_gated.get("unlevered_max_dd"))
+    cover = _as_float(val_gated.get("ic_gate_coverage"))
+    ir_delta = (
+        float(ir_g - ir_on) if np.isfinite(ir_g) and np.isfinite(ir_on) else float("nan")
+    )
+    dd_delta = (
+        float(dd_g - dd_on) if np.isfinite(dd_g) and np.isfinite(dd_on) else float("nan")
+    )
+    have_spec = bool(chosen.get("window"))
+    ir_ok = bool(np.isfinite(ir_delta) and ir_delta >= LO_IR_LIFT)
+    dd_ok = bool(not np.isfinite(dd_delta) or dd_delta >= -LO_DD_TOL)
+    cover_ok = bool(np.isfinite(cover) and cover >= IC_GATE_COVER_VAL)
+    promote = bool(have_spec and ir_ok and dd_ok and cover_ok)
+    if not have_spec:
+        reason = (
+            "NO PROMOTE: TRAIN did not select a (W, τ) with coverage "
+            f">= {IC_GATE_COVER_TRAIN:.0%}. Keep always-on q20."
+        )
+    elif not cover_ok:
+        reason = (
+            f"NO PROMOTE: TRAIN chose W={chosen.get('window')} τ={chosen.get('tau'):+.2f} "
+            f"but VAL coverage {100 * cover:.0f}% < {100 * IC_GATE_COVER_VAL:.0f}% "
+            "(catastrophic flatten). Keep always-on q20."
+        )
+    elif not ir_ok:
+        reason = (
+            f"NO PROMOTE: IC gate W={chosen.get('window')} τ={chosen.get('tau'):+.2f} "
+            f"VAL unlev net IR {ir_g:+.3f} vs always-on {ir_on:+.3f} "
+            f"(delta {ir_delta:+.3f} < {LO_IR_LIFT:.2f}). Keep always-on q20."
+        )
+    elif not dd_ok:
+        reason = (
+            f"NO PROMOTE: IC gate IR lift {ir_delta:+.3f} but VAL max DD "
+            f"{dd_g:+.3f} vs always-on {dd_on:+.3f} exceeds {LO_DD_TOL:.2f}. "
+            "Keep always-on q20."
+        )
+    else:
+        reason = (
+            f"PROMOTE IC gate W={chosen.get('window')} τ={chosen.get('tau'):+.2f}: "
+            f"VAL IR {ir_g:+.3f} vs {ir_on:+.3f} (delta {ir_delta:+.3f}), "
+            f"max DD {dd_g:+.3f} vs {dd_on:+.3f}, coverage {100 * cover:.0f}%."
+        )
+    return {
+        "promote_ic_gate": promote,
+        "gated_on": "val",
+        "fit_split": "train",
+        "reason": reason,
+        "spec": {
+            "window": chosen.get("window", 0),
+            "tau": chosen.get("tau", 0.0),
+        }
+        if promote
+        else {"window": 0, "tau": 0.0},
+        "chosen": chosen,
+        "ir_always": ir_on,
+        "ir_gated": ir_g,
+        "ir_delta": ir_delta,
+        "dd_always": dd_on,
+        "dd_gated": dd_g,
+        "dd_delta": dd_delta,
+        "coverage": cover,
+        "cover_min_val": IC_GATE_COVER_VAL,
+        "ir_lift": LO_IR_LIFT,
+    }
+
+
 def decide_ls_experiment(val: dict[str, Any], experiment_book: dict[str, Any]) -> dict[str, Any]:
     """VAL-only haircut experiment. Never changes the default live book."""
     lo = (val.get("books") or {}).get("live_long_only") or {}
@@ -775,6 +972,63 @@ def evaluate_overnight_shorting(
     lo_grid = val_long_only_grid(frames["val"], min_names=min_names, vol_target=vol_target)
     lo_promo = decide_lo_promote(lo_grid)
     lo_refine = val_long_only_refine(frames["val"], min_names=min_names, vol_target=vol_target)
+    ic_fit = fit_ic_gate_on_train(
+        frames["train"], min_names=min_names, vol_target=vol_target
+    )
+    ic_chosen = ic_fit.get("chosen") or {}
+    ic_W = int(ic_chosen.get("window") or 0)
+    ic_tau = float(ic_chosen.get("tau") or 0.0)
+
+    def _gated_lo(split: str, hist: tuple[str, ...], window: int, tau: float) -> dict[str, Any]:
+        if frames[split].empty:
+            return {}
+        pred, y, r_on, tz, vol = _wide_from_frame(frames[split])
+        if pred.empty or pred.shape[1] < 2:
+            return {}
+        trail = None
+        if window > 0:
+            parts_p = [
+                frame_to_wide(frames[s], "pred")
+                for s in hist
+                if s in frames and not frames[s].empty
+            ]
+            parts_y = [
+                frame_to_wide(frames[s], "y")
+                for s in hist
+                if s in frames and not frames[s].empty
+            ]
+            if parts_p and parts_y:
+                hp = pd.concat(parts_p).sort_index().groupby(level=0).last()
+                hy = pd.concat(parts_y).sort_index().groupby(level=0).last()
+                trail = trailing_mean_cs_ic(
+                    hp, hy, window=window, min_names=min_names
+                )
+        return _lo_q20_book(
+            pred,
+            y,
+            min_names=min_names,
+            vol_target=vol_target,
+            overnight_r=r_on,
+            turnover_z=tz,
+            vol_level=vol,
+            ic_gate_window=window,
+            ic_gate_tau=tau,
+            ic_gate_trail=trail,
+        )
+
+    ic_val_always = _gated_lo("val", ("train", "val"), 0, 0.0)
+    ic_val_gated = (
+        _gated_lo("val", ("train", "val"), ic_W, ic_tau) if ic_W else dict(ic_val_always)
+    )
+    ic_test_always = _gated_lo("test", ("train", "val", "test"), 0, 0.0)
+    ic_test_gated = (
+        _gated_lo("test", ("train", "val", "test"), ic_W, ic_tau)
+        if ic_W
+        else dict(ic_test_always)
+    )
+    ic_promo = decide_ic_gate_promote(
+        val_always=ic_val_always, val_gated=ic_val_gated, chosen=ic_chosen
+    )
     exp_book = {}
     if not frames["val"].empty:
         pred = frame_to_wide(frames["val"], "pred")
@@ -893,6 +1147,12 @@ def evaluate_overnight_shorting(
         "promotion": promo,
         "lo_promotion": lo_promo,
         "lo_refine_promotion": lo_refine_promo,
+        "ic_gate_fit": ic_fit,
+        "ic_gate_promotion": ic_promo,
+        "ic_gate_val_always": ic_val_always,
+        "ic_gate_val_gated": ic_val_gated,
+        "ic_gate_test_always": ic_test_always,
+        "ic_gate_test_gated": ic_test_gated,
         "ls_experiment": ls_exp,
         "test_long_only_promoted": test_lo_promoted,
         "test_long_only_refine_best": test_refine_best,
@@ -924,6 +1184,8 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
         f"{'YES' if (payload.get('lo_refine_promotion') or {}).get('promote_lo') else 'NO'}",
         f"  spec = {(payload.get('lo_refine_promotion') or {}).get('spec')}",
         f"  {(payload.get('lo_refine_promotion') or {}).get('reason')}",
+        "",
+        _ic_gate_block(payload),
         "",
         _lo_refine_block(
             payload.get("val_long_only_refine") or {},
@@ -967,6 +1229,42 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
             DESKTOP_COMMANDS.rstrip(),
         ]
     )
+    return "\n".join(lines)
+
+
+def _ic_gate_block(payload: dict[str, Any]) -> str:
+    promo = payload.get("ic_gate_promotion") or {}
+    fit = payload.get("ic_gate_fit") or {}
+    chosen = fit.get("chosen") or promo.get("chosen") or {}
+    va = payload.get("ic_gate_val_always") or {}
+    vg = payload.get("ic_gate_val_gated") or {}
+    ta = payload.get("ic_gate_test_always") or {}
+    tg = payload.get("ic_gate_test_gated") or {}
+
+    def _cov(value: Any) -> str:
+        x = _as_float(value)
+        return "nan%" if not np.isfinite(x) else f"{100.0 * x:.0f}%"
+
+    lines = [
+        f"PROMOTE IC-GATE? {'YES' if promo.get('promote_ic_gate') else 'NO'}",
+        f"  TRAIN chose W={chosen.get('window')} τ={chosen.get('tau')}  "
+        f"cover {_cov(chosen.get('ic_gate_coverage'))}  "
+        f"(fit_split={fit.get('fit_split')})",
+        f"  {promo.get('reason')}",
+        f"  VAL always-on  IR {_fmt(va.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(va.get('unlevered_max_dd'), '+.3f')}  "
+        f"cost {_fmt(va.get('mean_cost_unlev_bp'), '.1f')} bp",
+        f"  VAL gated      IR {_fmt(vg.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(vg.get('unlevered_max_dd'), '+.3f')}  "
+        f"cover {_cov(vg.get('ic_gate_coverage'))}  "
+        f"flat {int(_as_float(vg.get('ic_gate_n_flat'), 0.0))}/"
+        f"{int(_as_float(vg.get('ic_gate_n_dates'), 0.0))}",
+        f"  TEST always-on IR {_fmt(ta.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(ta.get('unlevered_max_dd'), '+.3f')}  (report-only)",
+        f"  TEST gated     IR {_fmt(tg.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(tg.get('unlevered_max_dd'), '+.3f')}  "
+        f"cover {_cov(tg.get('ic_gate_coverage'))}  (report-only)",
+    ]
     return "\n".join(lines)
 
 

@@ -6,7 +6,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from forecast.backtest import book_pnl, quantile_weights, rank_weights, resize_long_only
+from forecast.backtest import (
+    book_pnl,
+    quantile_weights,
+    rank_weights,
+    resize_long_only,
+    trailing_mean_cs_ic,
+)
 
 
 def test_quantile_weights_two_name_spread():
@@ -22,6 +28,65 @@ def test_quantile_weights_long_short_equal_notional():
     w = quantile_weights(s, quantile=0.2)
     assert w[w > 0].sum() == pytest.approx(0.5)
     assert w[w < 0].sum() == pytest.approx(-0.5)
+
+
+def test_trailing_mean_cs_ic_ignores_same_day_label():
+    dates = pd.bdate_range("2022-01-03", periods=40)
+    names = [f"S{i}" for i in range(10)]
+    pred = pd.DataFrame(
+        np.tile(np.linspace(-1, 1, 10), (40, 1)), index=dates, columns=names
+    )
+    realized = pred * 0.02
+    trail = trailing_mean_cs_ic(pred, realized, window=10, min_names=5, min_obs=5)
+    y2 = realized.copy()
+    y2.loc[dates[-1]] = -pred.loc[dates[-1]] * 0.5
+    trail2 = trailing_mean_cs_ic(pred, y2, window=10, min_names=5, min_obs=5)
+    assert trail.equals(trail2) or np.allclose(trail, trail2, equal_nan=True)
+    # First dates are warmup (NaN); a later date is finite and uses only prior ICs.
+    later = trail.dropna()
+    assert len(later) > 0
+    assert not np.isfinite(trail.iloc[0])
+
+
+def test_ic_gate_flattens_when_trailing_ic_is_dead():
+    dates = pd.bdate_range("2022-01-03", periods=50)
+    names = [f"S{i}" for i in range(10)]
+    pred = pd.DataFrame(
+        np.tile(np.linspace(-1, 1, 10), (50, 1)), index=dates, columns=names
+    )
+    realized = pred.copy()
+    realized.iloc[:25] = pred.iloc[:25] * 0.02
+    realized.iloc[25:] = -pred.iloc[25:] * 0.02
+    always = book_pnl(
+        pred,
+        realized,
+        holding="overnight",
+        hold_halflife=0.0,
+        vol_target=0.0,
+        causal_vol=False,
+        long_only=True,
+        min_names=8,
+        round_trip_bps=10.0,
+    )
+    gated = book_pnl(
+        pred,
+        realized,
+        holding="overnight",
+        hold_halflife=0.0,
+        vol_target=0.0,
+        causal_vol=False,
+        long_only=True,
+        min_names=8,
+        round_trip_bps=10.0,
+        ic_gate_window=12,
+        ic_gate_tau=0.0,
+    )
+    assert gated["ic_gate_window"] == 12
+    assert gated["ic_gate_n_flat"] > 0
+    assert gated["ic_gate_coverage"] < 1.0
+    assert gated["ic_gate_coverage"] > 0.2
+    # Dead second half should cut some nights vs always-on path length still kept.
+    assert gated["n_dates"] == always["n_dates"]
 
 
 def test_resize_long_only_conf_drops_low_abs_pred():
