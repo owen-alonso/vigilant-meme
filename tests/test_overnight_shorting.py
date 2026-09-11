@@ -458,25 +458,30 @@ def test_ensemble_alphas_are_train_grid_without_pure_c2c():
 
 def test_fit_ensemble_on_train_picks_overnight_when_c2c_is_anti():
     rng = np.random.default_rng(0)
-    dates = np.repeat(np.arange(40, dtype=np.int64) + 18000, 8)
-    names = np.tile([f"S{i}" for i in range(8)], 40)
-    true = np.tile(np.linspace(-1.0, 1.0, 8), 40)
-    r_on = true * 0.01
+    n_days, n_names = 40, 8
+    dates = np.repeat(np.arange(n_days, dtype=np.int64) + 18000, n_names)
+    names = np.tile([f"S{i}" for i in range(n_names)], n_days)
+    true = np.tile(np.linspace(-1.0, 1.0, n_names), n_days)
+    day_shock = np.repeat(rng.normal(0.0, 0.008, n_days), n_names)
+    amp = np.repeat(0.4 + np.abs(rng.normal(1.0, 0.35, n_days)), n_names)
+    r_on = true * 0.012 + day_shock
     frame_on = pd.DataFrame(
         {
             "symbol": names,
             "date": dates,
             "pred": true,
-            "y": true,
+            "y": true * amp,
             "r_on": r_on,
             "turnover_z": -true,
             "vol_level": np.full(len(dates), 0.2),
         }
     )
     frame_cc = frame_on.copy()
-    frame_cc["pred"] = -true + rng.normal(0.0, 0.05, size=len(true))
-    fit = fit_ensemble_on_train(frame_on, frame_cc, min_names=6, vol_target=0.0)
+    # Exact anti-rank: α>0.5 keeps A's order, so TRAIN IR ties and larger α wins.
+    frame_cc["pred"] = -true
+    fit = fit_ensemble_on_train(frame_on, frame_cc, min_names=6, vol_target=0.15)
     assert fit["fit_split"] == "train"
+    assert fit["chosen"]
     assert float(fit["chosen"]["alpha"]) == 1.0
     assert {round(float(r["alpha"]), 2) for r in fit["rows"]} <= set(ENSEMBLE_ALPHAS)
 
