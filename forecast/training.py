@@ -707,6 +707,7 @@ def apply_ridge_skip(
     if (not model.config.linear_skip) or float(train_cfg.ridge_skip) <= 0:
         return float("nan")
     from forecast.ridge import fit_skip_xy, labelled_rows, year_stable_mask
+    from forecast.levers import sign_consistency_weights
 
     x, y, dates = labelled_rows(
         bundle["train_symbols"],
@@ -714,7 +715,17 @@ def apply_ridge_skip(
         bundle["feature_std"],
     )
     min_names = int(bundle.get("cs_min_names", 8))
+    floor = float(bundle.get("adv_floor_pctile", 0.0) or 0.0)
+    if floor > 0 and "turnover_z" in FEATURE_NAMES:
+        from forecast.levers import sleeve_row_mask
+
+        tz = x[:, list(FEATURE_NAMES).index("turnover_z")]
+        keep_liq = sleeve_row_mask(tz, dates, floor=floor)
+        if bool(keep_liq.any()):
+            x, y, dates = x[keep_liq], y[keep_liq], dates[keep_liq]
+            min_names = max(3, int(round(min_names * max(0.05, 1.0 - floor))))
     stable = str(getattr(train_cfg, "ridge_year_stable", "") or "")
+    col_scale = None
     if stable in ("train", "train_val"):
         xv = yv = dv = None
         if stable == "train_val" and bundle.get("val_symbols"):
@@ -736,7 +747,10 @@ def apply_ridge_skip(
 
         kw = ridge_kwargs_from_train_cfg(train_cfg, {"cs_min_names": min_names})
         kw["feature_mask_bool"] = feature_mask(str(train_cfg.ridge_features or "all")) & keep
-        weights, bias, ic = fit_ridge_xy(x, y, dates, **kw)
+        if bool(getattr(train_cfg, "ridge_sign_shrink", False)):
+            col_scale = sign_consistency_weights(x, y, dates, min_names=min_names)
+        kw["col_scale"] = col_scale
+        weights, bias, ic = fit_ridge_xy(x, y, dates, **{k: v for k, v in kw.items() if k != "sign_shrink"})
     else:
         weights, bias, ic = fit_skip_xy(
             x,
@@ -1296,6 +1310,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="add a mapped industry ETF as a third residual factor when present",
     )
     g.add_argument(
+        "--size-residual",
+        action="store_true",
+        help="add IWM as a size factor (trailing beta through t; hedge, not a book name)",
+    )
+    g.add_argument(
+        "--peer-residual",
+        action="store_true",
+        help="add equal-weight other-names residual (same-bar beta; forward peer is a label)",
+    )
+    g.add_argument(
+        "--adv-floor-pctile",
+        type=float,
+        default=None,
+        help="CS turnover_z percentile floor for the skip/book (0.67 = top tercile sleeve)",
+    )
+    g.add_argument(
+        "--adv-floor-usd",
+        type=float,
+        default=0.0,
+        help="drop bars whose close*volume proxy is below this (0=off). Not vendor ADV.",
+    )
+    g.add_argument(
+        "--train-era-adv-pctile",
+        type=float,
+        default=0.0,
+        help="lock trading names to train-era median dollar-ADV percentile (0=off)",
+    )
+    g.add_argument(
         "--label-return",
         default=d.label_return,
         help="residual label: close (default/locked book), overnight "
@@ -1480,6 +1522,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="keep features whose univariate CS IC sign is stable across years",
     )
     g.add_argument(
+        "--ridge-sign-shrink",
+        action="store_true",
+        help="soft train-only year-sign shrink (scale columns; does not hard-drop OHLC)",
+    )
+    g.add_argument(
+        "--ridge-long-only",
+        action="store_true",
+        help="fit the skip on a long-sleeve ranking target (top quantile of y)",
+    )
+    g.add_argument(
+        "--ridge-long-only-quantile",
+        type=float,
+        default=t.ridge_long_only_quantile,
+        help="top quantile for --ridge-long-only (default 0.2)",
+    )
+    g.add_argument(
         "--listnet-loss-weight",
         type=float,
         default=t.listnet_loss_weight,
@@ -1578,6 +1636,11 @@ def configs_from_cli(
         double_residual=args.double_residual,
         residualize_features=args.residualize_features,
         industry_residual=args.industry_residual,
+        size_residual=bool(getattr(args, "size_residual", False)),
+        peer_residual=bool(getattr(args, "peer_residual", False)),
+        adv_floor_pctile=float(getattr(args, "adv_floor_pctile", None) or 0.0),
+        adv_floor_usd=float(getattr(args, "adv_floor_usd", 0.0) or 0.0),
+        train_era_adv_pctile=float(getattr(args, "train_era_adv_pctile", 0.0) or 0.0),
         label_return=_cli_label_return(args),
         fill_minutes=_cli_fill_minutes(args),
     )
@@ -1624,6 +1687,11 @@ def configs_from_cli(
         ridge_drop_crashes=args.ridge_drop_crashes,
         ridge_year_balance=args.ridge_year_balance,
         ridge_year_stable=args.ridge_year_stable,
+        ridge_sign_shrink=bool(getattr(args, "ridge_sign_shrink", False)),
+        ridge_long_only=bool(getattr(args, "ridge_long_only", False)),
+        ridge_long_only_quantile=float(
+            getattr(args, "ridge_long_only_quantile", 0.2) or 0.2
+        ),
         listnet_loss_weight=args.listnet_loss_weight,
         sigma_aux_weight=(
             0.0

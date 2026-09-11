@@ -537,6 +537,7 @@ def test_live_cost_parts_sum_to_total():
             "borrow",
             "hedge",
             "impact",
+            "adv_impact",
             "ex_post_gap",
         )
     )

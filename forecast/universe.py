@@ -118,6 +118,8 @@ LIQUID_NAMES: tuple[str, ...] = (
 )
 
 BENCHMARK_SYMBOL = "SPY"
+# Size / small-cap factor used only when size_residual=True. Hedge, not a book name.
+SIZE_HEDGE = "IWM"
 
 INDEX_ETFS: tuple[str, ...] = ("QQQ", "IWM", "DIA")
 SECTOR_ETFS: tuple[str, ...] = (

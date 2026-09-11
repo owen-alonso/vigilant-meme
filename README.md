@@ -162,6 +162,7 @@ python scripts/cs_regime_ablate.py --data-dir data --universe liquid
 python scripts/cs_shrink_ablate.py --data-dir data --universe liquid --also-labels
 python -m forecast.training --universe liquid --skip-only --label-return overnight
 python scripts/cs_overnight.py --data-dir data --universe liquid
+python scripts/cs_accuracy_levers.py --data-dir data --universe liquid --rebuild-residuals
 python scripts/ablate_cs.py
 python scripts/split_report.py data/AAPL_daily.parquet
 ```
@@ -178,13 +179,19 @@ Overnight (`--label-return overnight`) replaces \(r_{t+1}\) with
 \(\log(\mathrm{open}_{t+1})-\log(\mathrm{close}_t)\). Next open is a **label**,
 never a feature. Backtest `--holding overnight` flattens every open (MOC→MOO).
 `--live-costs` is the Owen-runnable pack (20 bp RT + name-level MOC/MOO +
-thin/vol impact + 5 bp borrow + 10 bp hedge). `--long-only` drops shorts and
+thin/vol impact + 5 bp borrow + 10 bp hedge). `--cost-bundle live_micro` adds
+ADV-scaled borrow and sqrt-participation impact. `--long-only` drops shorts and
 borrow (no locate). `--locate-adv-pctile 0.3` blocks shorts in the bottom
 turnover tercile. `--adv-floor-pctile 0.67 --min-names 8` is the liquid
-sleeve (same skip, drop thin names before weights). `--compare-long-only`
+sleeve (same skip, drop thin names before weights). `--ic-shrink-lookback 63`
+shrinks causal leverage when trailing CS IC is dead (does not retarget IC).
+`--gap-risk-cap 0.2` caps overnight name weights. `--compare-long-only`
 prints both books. Do not headline `vol_target=1`. Open+N fill
 (`--label-return open15`) is a **separate** estimand; it does not replace
-overnight `y` unless it wins the locked-val gate.
+overnight `y` unless it wins the locked-val gate. `--ridge-sign-shrink` is a
+soft train-only year-sign scale (not the hard year-stable drop that lost val).
+`--ridge-long-only` fits the skip to the long sleeve. `--size-residual` /
+`--peer-residual` add trailing-beta factors (IWM / other names); val-gate.
 
 `best.pt` is selected by mean CS IC when a cross-section exists. `backtest.py`
 builds a dollar-neutral (or `--long-only`) quantile book on the locked
