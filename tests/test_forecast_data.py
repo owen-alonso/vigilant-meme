@@ -552,6 +552,9 @@ def test_weekly_cli_uses_week_scale_context():
     assert data_cfg.double_residual is False
     assert data_cfg.residualize_features is False
     assert data_cfg.industry_residual is False
+    assert data_cfg.size_residual is False
+    assert data_cfg.peer_residual is False
+    assert data_cfg.adv_floor_pctile == pytest.approx(0.0)
     assert data_cfg.label_return == "close"
     assert train_cfg.ridge_year_balance is False
     assert train_cfg.ridge_year_stable == ""

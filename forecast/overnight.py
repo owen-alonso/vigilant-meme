@@ -88,6 +88,8 @@ PAPER_BUNDLE: dict[str, Any] = {
     "thin_pctile": 0.0,
     "locate_pctile": 0.0,
     "ex_post_gap_k": 0.0,
+    "borrow_thin_k": 0.0,
+    "impact_adv_k": 0.0,
 }
 
 # Flat overlay used in the first overnight live-ish print (IR ~1.6–2.0).
@@ -139,6 +141,24 @@ LIVE_LONG_ONLY_BUNDLE: dict[str, Any] = {
     "locate_pctile": 0.0,
 }
 
+# ADV-aware microstructure: HTB borrow scales with thin names; extra impact on
+# low CS turnover_z (sqrt-participation proxy). Compare vs live; do not silently
+# replace the live headline unless Owen prefers this pack.
+LIVE_MICRO_BUNDLE: dict[str, Any] = {
+    **LIVE_BUNDLE,
+    "name": "live_micro",
+    "borrow_thin_k": 1.0,
+    "impact_adv_k": 6.0,
+}
+
+LIVE_MICRO_LONG_ONLY_BUNDLE: dict[str, Any] = {
+    **LIVE_MICRO_BUNDLE,
+    "name": "live_micro_long_only",
+    "borrow_bps": 0.0,
+    "borrow_thin_k": 0.0,
+    "locate_pctile": 0.0,
+}
+
 # Stress: ugly MOO, more HTB, higher impact. If this kills the book, say so.
 HARSH_BUNDLE: dict[str, Any] = {
     "name": "harsh_auction",
@@ -187,6 +207,8 @@ COST_BUNDLES: dict[str, dict[str, Any]] = {
     "live": LIVE_BUNDLE,
     "live_locate": LIVE_LOCATE_BUNDLE,
     "live_long_only": LIVE_LONG_ONLY_BUNDLE,
+    "live_micro": LIVE_MICRO_BUNDLE,
+    "live_micro_long_only": LIVE_MICRO_LONG_ONLY_BUNDLE,
     "harsh": HARSH_BUNDLE,
     "harsh_auction": HARSH_BUNDLE,
     "ex_post_gap": EX_POST_GAP_BUNDLE,
@@ -421,6 +443,8 @@ def overnight_stress_costs(
     thin_mult: float = 1.0,
     thin_pctile: float = 0.0,
     ex_post_gap_k: float = 0.0,
+    borrow_thin_k: float = 0.0,
+    impact_adv_k: float = 0.0,
 ) -> np.ndarray:
     """Per-date cost (fraction of NAV) for an overnight flatten book.
 
@@ -450,6 +474,8 @@ def overnight_stress_costs(
         thin_mult=thin_mult,
         thin_pctile=thin_pctile,
         ex_post_gap_k=ex_post_gap_k,
+        borrow_thin_k=borrow_thin_k,
+        impact_adv_k=impact_adv_k,
     )["total"]
 
 
@@ -470,6 +496,8 @@ def overnight_cost_breakdown(
     thin_mult: float = 1.0,
     thin_pctile: float = 0.0,
     ex_post_gap_k: float = 0.0,
+    borrow_thin_k: float = 0.0,
+    impact_adv_k: float = 0.0,
 ) -> dict[str, np.ndarray]:
     """Named per-date cost components (fraction of NAV) plus ``total``."""
     w = np.asarray(weights, dtype=np.float64)
@@ -478,16 +506,29 @@ def overnight_cost_breakdown(
     abs_w = np.abs(w)
     one_way = overnight_one_way_turnover(w)
     exit_leg = 0.5 * abs_w.sum(axis=1)
-    short_nav = np.clip(-w, 0.0, None).sum(axis=1)
     rt = (float(round_trip_bps) * 1e-4) * one_way
     legacy_moo = (float(open_auction_bps) * 1e-4) * exit_leg
-    borrow = (float(borrow_bps) * 1e-4) * short_nav
-    hedge = (float(hedge_cost_bps) * 1e-4) * np.ones_like(one_way)
 
     thin_scale = np.ones_like(abs_w)
-    if float(thin_pctile) > 0 and turnover_z is not None and float(thin_mult) > 1.0:
+    thin = None
+    if float(thin_pctile) > 0 and turnover_z is not None:
         thin = row_cs_thin_mask(_as_2d(turnover_z, w.shape), float(thin_pctile))
-        thin_scale = np.where(thin, float(thin_mult), 1.0)
+        if float(thin_mult) > 1.0:
+            thin_scale = np.where(thin, float(thin_mult), 1.0)
+
+    short = np.clip(-w, 0.0, None)
+    borrow_scale = np.ones_like(abs_w)
+    if float(borrow_thin_k) > 0 and turnover_z is not None:
+        thin_b = thin
+        if thin_b is None:
+            thin_b = row_cs_thin_mask(
+                _as_2d(turnover_z, w.shape),
+                float(thin_pctile) if float(thin_pctile) > 0 else 0.30,
+            )
+        borrow_scale = np.where(thin_b, 1.0 + float(borrow_thin_k), 1.0)
+    borrow = (float(borrow_bps) * 1e-4) * (short * borrow_scale).sum(axis=1)
+    hedge = (float(hedge_cost_bps) * 1e-4) * np.ones_like(one_way)
+
     auction_notional = abs_w * thin_scale
     moc = (float(moc_bps) * 1e-4) * auction_notional.sum(axis=1)
     moo = (float(moo_bps) * 1e-4) * auction_notional.sum(axis=1)
@@ -499,6 +540,15 @@ def overnight_cost_breakdown(
         # Missing vol is "no extra impact", not a NaN date that pandas IR then drops.
         vol = np.nan_to_num(vol, nan=0.0, posinf=0.0, neginf=0.0)
         impact = (float(impact_vol_k) * 1e-4) * (vol * abs_w).sum(axis=1)
+    adv_impact = np.zeros_like(one_way)
+    if float(impact_adv_k) and turnover_z is not None:
+        tz = _as_2d(turnover_z, w.shape)
+        tz = np.nan_to_num(tz, nan=0.0, posinf=0.0, neginf=0.0)
+        # Extra bps on names below CS-median turnover: |w| * relu(-z) plus
+        # sqrt(|w|) participation (long-only sleeve is lumpier).
+        thin_pen = np.clip(-tz, 0.0, None)
+        part = np.sqrt(np.clip(abs_w, 0.0, None))
+        adv_impact = (float(impact_adv_k) * 1e-4) * (thin_pen * abs_w + 0.25 * part).sum(axis=1)
 
     ex_post = np.zeros_like(one_way)
     if float(ex_post_gap_k) and realized_abs is not None:
@@ -506,7 +556,7 @@ def overnight_cost_breakdown(
         # k * |r| * |w|: 0.25 * 1% gap * 1 NAV = 25 bp on a 1% move.
         ex_post = float(ex_post_gap_k) * (gap * abs_w).sum(axis=1)
 
-    total = rt + legacy_moo + moc + moo + sess + borrow + hedge + impact + ex_post
+    total = rt + legacy_moo + moc + moo + sess + borrow + hedge + impact + adv_impact + ex_post
     return {
         "round_trip": rt.astype(np.float64),
         "legacy_open_auction": legacy_moo.astype(np.float64),
@@ -516,6 +566,7 @@ def overnight_cost_breakdown(
         "borrow": borrow.astype(np.float64),
         "hedge": hedge.astype(np.float64),
         "impact": impact.astype(np.float64),
+        "adv_impact": adv_impact.astype(np.float64),
         "ex_post_gap": ex_post.astype(np.float64),
         "total": total.astype(np.float64),
     }

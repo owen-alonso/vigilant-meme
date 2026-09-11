@@ -326,6 +326,13 @@ def book_pnl(
     turnover_z: pd.DataFrame | None = None,
     vol_level: pd.DataFrame | None = None,
     adv_floor_pctile: float = 0.0,
+    borrow_thin_k: float = 0.0,
+    impact_adv_k: float = 0.0,
+    ic_shrink_lookback: int = 0,
+    ic_shrink_dead_t: float = 1.0,
+    ic_shrink_floor: float = 0.25,
+    gap_risk_cap: float = 0.0,
+    gap_vol_k: float = 0.0,
 ) -> dict[str, Any]:
     """Cost-aware long-short with optional rank weights, hold smoothing, causal vol.
 
@@ -378,6 +385,22 @@ def book_pnl(
             quantile=quantile,
             long_only=long_only,
         )
+        if float(gap_risk_cap) > 0 or float(gap_vol_k) > 0:
+            from forecast.levers import cap_name_risk
+
+            vol_row = None
+            if vol_level is not None and ts in vol_level.index:
+                vol_row = vol_level.loc[ts].reindex(w.index).to_numpy(dtype=np.float64)
+            capped = cap_name_risk(
+                w.to_numpy(dtype=np.float64),
+                vol_row,
+                max_weight=float(gap_risk_cap),
+                vol_k=float(gap_vol_k),
+                long_only=long_only,
+            )
+            w = pd.Series(
+                _renorm_row(capped, long_only=long_only), index=w.index, dtype=np.float64
+            )
         r = pair_all["r"].reindex(w.index)
         pair = pd.concat([w, r], axis=1, keys=["w", "r"]).dropna()
         if len(pair) < 2:
@@ -444,6 +467,8 @@ def book_pnl(
         thin_mult=thin_mult,
         thin_pctile=thin_pctile,
         ex_post_gap_k=ex_post_gap_k,
+        borrow_thin_k=borrow_thin_k,
+        impact_adv_k=impact_adv_k,
     )
     if flatten:
         turnover = pd.Series(overnight_one_way_turnover(w_arr), index=w_panel.index)
@@ -466,6 +491,8 @@ def book_pnl(
                 session_exit_bps,
                 impact_vol_k,
                 ex_post_gap_k,
+                borrow_thin_k,
+                impact_adv_k,
             )
         ):
             extra_kw = dict(cost_kwargs)
@@ -502,6 +529,47 @@ def book_pnl(
     else:
         lever_s = pd.Series(1.0, index=gross_s.index, dtype=np.float64)
         mean_lever = 1.0
+
+    if int(ic_shrink_lookback) > 0 and len(w_panel) >= 5:
+        from forecast.levers import trailing_leverage_scale
+
+        p_parts: list[np.ndarray] = []
+        y_parts: list[np.ndarray] = []
+        d_parts: list[np.ndarray] = []
+        for ts in w_panel.index:
+            dkey = int((pd.Timestamp(ts) - pd.Timestamp("1970-01-01")) // pd.Timedelta("1D"))
+            pair = pd.concat(
+                [pred.loc[ts], realized.loc[ts]], axis=1, keys=["p", "y"]
+            ).dropna()
+            if len(pair) < 3:
+                continue
+            p_parts.append(pair["p"].to_numpy(dtype=np.float64))
+            y_parts.append(pair["y"].to_numpy(dtype=np.float64))
+            d_parts.append(np.full(len(pair), dkey, dtype=np.int64))
+        if p_parts:
+            p_flat = np.concatenate(p_parts)
+            y_flat = np.concatenate(y_parts)
+            d_flat = np.concatenate(d_parts)
+            train_ic = 0.05
+            _keys, row_scale = trailing_leverage_scale(
+                p_flat,
+                y_flat,
+                d_flat,
+                lookback_days=int(ic_shrink_lookback),
+                train_ic=train_ic,
+                min_names=max(3, int(min_names) // 2),
+                dead_t=float(ic_shrink_dead_t),
+                floor=float(ic_shrink_floor),
+            )
+            date_scale: dict[int, float] = {}
+            for dkey, sc in zip(d_flat, row_scale):
+                date_scale.setdefault(int(dkey), float(sc))
+            conf = []
+            for ts in lever_s.index:
+                dkey = int((pd.Timestamp(ts) - pd.Timestamp("1970-01-01")) // pd.Timedelta("1D"))
+                conf.append(date_scale.get(dkey, 1.0))
+            lever_s = lever_s * pd.Series(conf, index=lever_s.index, dtype=np.float64)
+            mean_lever = float(lever_s.mean())
 
     cost = cost_unlev * lever_s
     net_s = lever_s * gross_s - cost
@@ -552,6 +620,11 @@ def book_pnl(
         "locate_pctile": float(locate_pctile),
         "adv_floor_pctile": float(adv_floor_pctile),
         "ex_post_gap_k": float(ex_post_gap_k),
+        "borrow_thin_k": float(borrow_thin_k),
+        "impact_adv_k": float(impact_adv_k),
+        "ic_shrink_lookback": float(ic_shrink_lookback),
+        "gap_risk_cap": float(gap_risk_cap),
+        "gap_vol_k": float(gap_vol_k),
         "mean_long_nav": sides["mean_long_nav"],
         "mean_short_nav": sides["mean_short_nav"],
         "mean_gross": sides["mean_gross"],
@@ -670,7 +743,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--cost-bundle",
         default="",
         help="named overnight cost pack: paper, live_flat, live, live_locate, "
-        "live_long_only, harsh, ex_post_gap, fill_live. CLI flags override fields.",
+        "live_long_only, live_micro, live_micro_long_only, harsh, ex_post_gap, fill_live. "
+        "CLI flags override fields.",
     )
     p.add_argument(
         "--live-costs",
@@ -750,6 +824,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="sensitivity: extra cost k*|overnight move|*|w| (uses realized; not default)",
     )
+    p.add_argument(
+        "--borrow-thin-k",
+        type=float,
+        default=None,
+        help="extra borrow multiplier on thin CS turnover_z shorts (live_micro=1)",
+    )
+    p.add_argument(
+        "--impact-adv-k",
+        type=float,
+        default=None,
+        help="extra ADV/participation impact k (live_micro=6)",
+    )
+    p.add_argument(
+        "--ic-shrink-lookback",
+        type=int,
+        default=0,
+        help="causal trailing CS-IC lookback (days) to shrink leverage when IC is dead (0=off)",
+    )
+    p.add_argument(
+        "--gap-risk-cap",
+        type=float,
+        default=0.0,
+        help="max |w_i| overnight name cap before renorm (0=off)",
+    )
+    p.add_argument(
+        "--gap-vol-k",
+        type=float,
+        default=0.0,
+        help="downweight names with positive vol_level: w /= 1+k*relu(vol) (0=off)",
+    )
     p.add_argument("--cost-bps", type=float, default=None, help="round-trip cost in basis points")
     p.add_argument(
         "--vol-target",
@@ -799,6 +903,8 @@ def cost_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
         name = "live"
     if bool(getattr(args, "long_only", False)) and name == "live":
         name = "live_long_only"
+    if bool(getattr(args, "long_only", False)) and name == "live_micro":
+        name = "live_micro_long_only"
     bundle = resolve_cost_bundle(name) if name else None
     overrides = {
         "round_trip_bps": getattr(args, "cost_bps", None),
@@ -813,6 +919,8 @@ def cost_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "thin_pctile": getattr(args, "thin_pctile", None),
         "locate_pctile": getattr(args, "locate_adv_pctile", None),
         "ex_post_gap_k": getattr(args, "ex_post_gap_k", None),
+        "borrow_thin_k": getattr(args, "borrow_thin_k", None),
+        "impact_adv_k": getattr(args, "impact_adv_k", None),
     }
     merged = merge_cost_kwargs(bundle, **overrides)
     if not name and args.cost_bps is None:
@@ -915,7 +1023,16 @@ def main(argv: list[str] | None = None) -> int:
         ex_post_gap_k=float(costs["ex_post_gap_k"]),
         turnover_z=tz,
         vol_level=vol,
-        adv_floor_pctile=float(args.adv_floor_pctile or 0.0),
+        adv_floor_pctile=float(
+            args.adv_floor_pctile
+            if args.adv_floor_pctile
+            else getattr(data_cfg, "adv_floor_pctile", 0.0) or 0.0
+        ),
+        borrow_thin_k=float(costs.get("borrow_thin_k", 0.0) or 0.0),
+        impact_adv_k=float(costs.get("impact_adv_k", 0.0) or 0.0),
+        ic_shrink_lookback=int(getattr(args, "ic_shrink_lookback", 0) or 0),
+        gap_risk_cap=float(getattr(args, "gap_risk_cap", 0.0) or 0.0),
+        gap_vol_k=float(getattr(args, "gap_vol_k", 0.0) or 0.0),
     )
     stats = book_pnl(pred, realized, long_only=args.long_only, **book_kw)
     print(format_report(stats, checkpoint=ckpt_path, test_start=start))

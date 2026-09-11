@@ -142,9 +142,10 @@ def _prepare_cs_design(
     feat_winsor: float = 0.0,
     drop_disp_q: float = 0.0,
     year_balance: bool = False,
+    long_only_quantile: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
     """Within-date design for ridge. Returns ``x, y, sample_weight, used_dates`` or None."""
-    if not cs_demean and not cs_zscore and not rank_target:
+    if not cs_demean and not cs_zscore and not rank_target and float(long_only_quantile) <= 0:
         keep = np.ones(x.shape[0], dtype=bool)
         if exclude_dates:
             keep &= ~np.isin(dates.astype(np.int64), list(exclude_dates))
@@ -194,12 +195,18 @@ def _prepare_cs_design(
             continue
         xd = x[sel].copy()
         yd = y[sel].copy()
-        if y_winsor > 0 and not rank_target:
+        if y_winsor > 0 and not rank_target and float(long_only_quantile) <= 0:
             yd = _winsor_1d(yd, y_winsor)
         if feat_winsor > 0:
             for j in range(xd.shape[1]):
                 xd[:, j] = _winsor_1d(xd[:, j], feat_winsor)
-        if rank_target:
+        if float(long_only_quantile) > 0:
+            from forecast.levers import long_only_cs_target
+
+            yd = long_only_cs_target(yd, quantile=float(long_only_quantile))
+            if float(yd.sum()) <= 1e-12:
+                continue
+        elif rank_target:
             order = np.argsort(yd, kind="mergesort")
             ranks = np.empty(n, dtype=np.float64)
             ranks[order] = np.arange(n, dtype=np.float64)
@@ -207,9 +214,9 @@ def _prepare_cs_design(
                 yd = (ranks - ranks.mean()) / max(ranks.std(), 1e-8)
             else:
                 yd = ranks - ranks.mean()
-        if cs_demean or cs_zscore or rank_target:
+        if cs_demean or cs_zscore or rank_target or float(long_only_quantile) > 0:
             xd = xd - xd.mean(axis=0, keepdims=True)
-            if not rank_target:
+            if not rank_target or float(long_only_quantile) > 0:
                 yd = yd - yd.mean()
         if cs_zscore:
             std = xd.std(axis=0, keepdims=True)
@@ -306,14 +313,22 @@ def fit_ridge_xy(
     sign_constrain: bool = False,
     drop_crashes: bool = False,
     year_balance: bool = False,
+    long_only_quantile: float = 0.0,
+    col_scale: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float, float]:
     """CS ridge of ``y`` on ``x``. Returns weights, bias (0 if CS), in-sample mean CS IC."""
     n_features = int(x.shape[1]) if x.ndim == 2 else 0
     blocked = set(exclude_dates or set())
     if drop_crashes:
         blocked |= crash_date_set()
+    x_fit = np.asarray(x, dtype=np.float64)
+    if col_scale is not None:
+        scale = np.asarray(col_scale, dtype=np.float64).reshape(-1)
+        if scale.size != x_fit.shape[1]:
+            raise ValueError(f"col_scale size {scale.size} != n_features {x_fit.shape[1]}")
+        x_fit = x_fit * scale
     prepared = _prepare_cs_design(
-        x,
+        x_fit,
         y,
         dates,
         min_names=min_names,
@@ -327,6 +342,7 @@ def fit_ridge_xy(
         feat_winsor=feat_winsor,
         drop_disp_q=drop_disp_q,
         year_balance=year_balance,
+        long_only_quantile=float(long_only_quantile or 0.0),
     )
     if prepared is None:
         return np.zeros(n_features, dtype=np.float32), 0.0, float("nan")
@@ -336,7 +352,11 @@ def fit_ridge_xy(
     else:
         raw_w, raw_b = _solve_weighted_ridge(xd, yd, w, ridge)
     weights = raw_w.astype(np.float32)
-    bias = 0.0 if (cs_demean or rank_target or cs_zscore) else float(raw_b)
+    bias = (
+        0.0
+        if (cs_demean or rank_target or cs_zscore or float(long_only_quantile) > 0)
+        else float(raw_b)
+    )
     if sign_constrain and n_features:
         uni = univariate_cs_ics(x, y, dates, min_names=min_names)
         for i in range(n_features):
@@ -344,6 +364,10 @@ def fit_ridge_xy(
                 weights[i] = 0.0
             elif float(uni[i]) * float(weights[i]) < 0:
                 weights[i] = 0.0
+    if col_scale is not None:
+        from forecast.levers import bake_col_scale
+
+        weights = bake_col_scale(weights, col_scale)
     pred = x @ weights.astype(np.float64) + bias
     kept = np.isin(dates.astype(np.int64), used_dates)
     if not bool(kept.any()):
@@ -1426,6 +1450,11 @@ def fit_skip_xy(
         feature_mask_bool=kwargs["feature_mask_bool"],
         drop_crashes=kwargs["drop_crashes"],
     )
+    col_scale = None
+    if bool(kwargs.get("sign_shrink")):
+        from forecast.levers import sign_consistency_weights
+
+        col_scale = sign_consistency_weights(x, y, dates, min_names=min_names)
     if objective == "listnet":
         return fit_listnet_xy(x, y, dates, **shared)
     if objective == "ranknet":
@@ -1441,12 +1470,16 @@ def fit_skip_xy(
         huber_delta=kwargs["huber_delta"],
         sign_constrain=kwargs["sign_constrain"],
         year_balance=kwargs["year_balance"],
+        long_only_quantile=float(kwargs.get("long_only_quantile") or 0.0),
+        col_scale=col_scale,
         **shared,
     )
 
 
 def ridge_kwargs_from_train_cfg(train_cfg: Any, bundle: dict[str, Any]) -> dict[str, Any]:
     mask_mode = str(getattr(train_cfg, "ridge_features", "all") or "all")
+    long_only = bool(getattr(train_cfg, "ridge_long_only", False))
+    q = float(getattr(train_cfg, "ridge_long_only_quantile", 0.2) or 0.2)
     return {
         "ridge": float(getattr(train_cfg, "ridge_skip", 1.0)),
         "min_names": int(bundle.get("cs_min_names", 8)),
@@ -1462,4 +1495,6 @@ def ridge_kwargs_from_train_cfg(train_cfg: Any, bundle: dict[str, Any]) -> dict[
         "sign_constrain": bool(getattr(train_cfg, "ridge_sign_constrain", False)),
         "drop_crashes": bool(getattr(train_cfg, "ridge_drop_crashes", False)),
         "year_balance": bool(getattr(train_cfg, "ridge_year_balance", False)),
+        "long_only_quantile": q if long_only else 0.0,
+        "sign_shrink": bool(getattr(train_cfg, "ridge_sign_shrink", False)),
     }

@@ -38,6 +38,7 @@ from forecast.overnight import (
     uses_next_open,
 )
 from forecast.universe import (
+    SIZE_HEDGE,
     allowed_symbols,
     hedge_symbol_for,
     industry_symbol_for,
@@ -750,6 +751,9 @@ def attach_residual_target(
     ``sector_residual`` uses the mapped sector ETF when that parquet exists.
     ``double_residual`` adds SPY as a second factor next to the sector hedge.
     ``industry_residual`` adds a mapped industry ETF when present.
+    ``size_residual`` adds IWM as a size factor when that parquet exists.
+    ``peer_residual`` adds an equal-weight basket of *other* trading names
+    (same-bar returns for beta; those names' *forward* returns are labels).
     ``residualize_features`` subtracts the same causal betas times same-bar
     hedge ``ret_*`` from the name's own ``ret_*`` (not a label leak).
     ``label_return`` selects which forward log-return is residualized.
@@ -793,12 +797,20 @@ def attach_residual_target(
     hl = max(2, int(cfg.beta_halflife))
     double = bool(getattr(cfg, "double_residual", False))
     industry = bool(getattr(cfg, "industry_residual", False))
+    size_res = bool(getattr(cfg, "size_residual", False))
+    peer_res = bool(getattr(cfg, "peer_residual", False))
     resid_feat = bool(getattr(cfg, "residualize_features", False))
     feat_cols = ("ret_1", "ret_5", "ret_15", "ret_60", "ret_390")
+    trade_syms = trading_panel_symbols(panels, cfg)
+    peer_spot_wide = None
+    peer_fwd_wide = None
+    if peer_res and len(trade_syms) >= 2:
+        peer_spot_wide = _traded_wide(panels, trade_syms, cfg, "ret_raw")
+        peer_fwd_wide = _traded_wide(panels, trade_syms, cfg, "target_raw")
     out: dict[str, pd.DataFrame] = {}
     for sym, panel in panels.items():
         p = panel.copy()
-        if sym == bench:
+        if sym == bench or (size_res and sym == str(SIZE_HEDGE)):
             out[sym] = p
             continue
         names: list[str] = []
@@ -821,19 +833,47 @@ def attach_residual_target(
             ind = industry_symbol_for(sym)
             if ind and ind in panels and ind not in names:
                 names.append(ind)
-        series = [_hedge_series(n) for n in names]
-        series = [s for s in series if s is not None]
-        if not series:
-            out[sym] = p
-            continue
+        if size_res:
+            size_name = str(SIZE_HEDGE)
+            if (
+                size_name in panels
+                and size_name not in names
+                and size_name != bench
+                and size_name != sym
+            ):
+                names.append(size_name)
         keys = _cross_section_key(p, cfg)
         own_r = p["ret_raw"].to_numpy(dtype=np.float64)
-        xs = []
-        fwds = []
-        for hedge_fwd, hedge_r in series:
+        xs: list[np.ndarray] = []
+        fwds: list[np.ndarray] = []
+        hedge_names: list[str] = []
+        for hedge_name in names:
+            pair = _hedge_series(hedge_name)
+            if pair is None:
+                continue
+            hedge_fwd, hedge_r = pair
             xs.append(keys.map(hedge_r).to_numpy(dtype=np.float64))
             fwd = keys.map(hedge_fwd).to_numpy(dtype=np.float64)
             fwds.append(np.where(np.isfinite(fwd), fwd, 0.0))
+            hedge_names.append(hedge_name)
+        if (
+            peer_res
+            and peer_spot_wide is not None
+            and peer_fwd_wide is not None
+            and sym in getattr(peer_spot_wide, "columns", [])
+        ):
+            others_spot = peer_spot_wide.drop(columns=[sym], errors="ignore")
+            others_fwd = peer_fwd_wide.drop(columns=[sym], errors="ignore")
+            if others_spot.shape[1] >= 1:
+                spot = others_spot.mean(axis=1, skipna=True)
+                fwd_peer = others_fwd.mean(axis=1, skipna=True)
+                xs.append(keys.map(spot).to_numpy(dtype=np.float64))
+                mapped = keys.map(fwd_peer).to_numpy(dtype=np.float64)
+                fwds.append(np.where(np.isfinite(mapped), mapped, 0.0))
+                hedge_names.append("__peer__")
+        if not xs:
+            out[sym] = p
+            continue
         betas = _ewm_multi_beta(own_r, xs, hl) if len(xs) > 1 else [_ewm_beta(own_r, xs[0], hl)]
         own_fwd = p["target_raw"].to_numpy(dtype=np.float64)
         resid = own_fwd.astype(np.float64, copy=True)
@@ -848,7 +888,12 @@ def attach_residual_target(
                     continue
                 own = p[col].to_numpy(dtype=np.float64)
                 adj = own.copy()
-                for b, hedge_name in zip(betas, names):
+                for b, hedge_name in zip(betas, hedge_names):
+                    if hedge_name == "__peer__":
+                        if col == "ret_1" and "peer_ret_1" in p.columns:
+                            hx = p["peer_ret_1"].to_numpy(dtype=np.float64)
+                            adj = adj - b * np.where(np.isfinite(hx), hx, 0.0)
+                        continue
                     hs = _hedge_ret(hedge_name, col)
                     if hs is None:
                         continue
@@ -1282,6 +1327,7 @@ def build_datasets(
     raw_from = str(getattr(cfg, "train_from", "") or "").strip()
     if raw_from:
         train_from_ts = pd.Timestamp(raw_from)
+    min_usd = float(getattr(cfg, "adv_floor_usd", 0.0) or 0.0)
     if not trade_panels:
         raise ValueError(
             f"no trading names after filters (benchmark={bench}, "
@@ -1304,6 +1350,29 @@ def build_datasets(
     else:
         train_end, val_end = None, None
 
+    era_pct = float(getattr(cfg, "train_era_adv_pctile", 0.0) or 0.0)
+    if (era_pct > 0 or min_usd > 0) and train_end is not None and len(trade_panels) >= 3:
+        from forecast.levers import train_era_liquid_names
+
+        kept = train_era_liquid_names(
+            raw_panels,
+            list(trade_panels),
+            train_end,
+            pctile=era_pct,
+            min_usd=min_usd,
+            train_from=train_from_ts,
+        )
+        dropped_liq = [s for s in trade_panels if s not in set(kept)]
+        trade_panels = {s: trade_panels[s] for s in kept if s in trade_panels}
+        if log_fn:
+            log_fn(
+                f"train-era ADV lock pctile={era_pct:.2f} min_usd={min_usd:.0f}: "
+                f"kept {len(trade_panels)} dropped {len(dropped_liq)}"
+                + (f" ({','.join(dropped_liq[:8])}{'...' if len(dropped_liq) > 8 else ''})" if dropped_liq else "")
+            )
+        if not trade_panels:
+            raise ValueError("train-era ADV lock dropped every trading name")
+
     train_syms: list[SymbolArrays] = []
     val_syms: list[SymbolArrays] = []
     test_syms: list[SymbolArrays] = []
@@ -1325,6 +1394,13 @@ def build_datasets(
             (panel["session"] >= sym_train_end) & (panel["session"] < sym_val_end)
         ).to_numpy()
         is_test = (panel["session"] >= sym_val_end).to_numpy()
+        if min_usd > 0:
+            from forecast.levers import apply_adv_usd_valid_mask
+
+            usd_ok = apply_adv_usd_valid_mask(panel, min_usd=min_usd)
+            is_train = is_train & usd_ok
+            is_val = is_val & usd_ok
+            is_test = is_test & usd_ok
         base = panel_to_arrays(panel, symbol)
         base_valid = panel["valid"].to_numpy(dtype=bool)
         train_syms.append(
@@ -1470,6 +1546,11 @@ def build_datasets(
         "train_from": raw_from,
         "n_trading_names": int(len(trade_panels)),
         "label_return": normalize_label_return(getattr(cfg, "label_return", "close")),
+        "adv_floor_pctile": float(getattr(cfg, "adv_floor_pctile", 0.0) or 0.0),
+        "adv_floor_usd": float(getattr(cfg, "adv_floor_usd", 0.0) or 0.0),
+        "train_era_adv_pctile": float(getattr(cfg, "train_era_adv_pctile", 0.0) or 0.0),
+        "size_residual": bool(getattr(cfg, "size_residual", False)),
+        "peer_residual": bool(getattr(cfg, "peer_residual", False)),
     }
 
 

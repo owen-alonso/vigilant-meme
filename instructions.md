@@ -87,6 +87,17 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/be
 # optional liquid sleeve (top CS turnover tercile; same skip w; use a lower min-names)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --live-costs --adv-floor-pctile 0.67 --min-names 8
+# accuracy levers (val-gate; sign-shrink / long-only skip / ensemble / micro / sizing)
+python scripts/cs_accuracy_levers.py --data-dir data --universe liquid \
+  --out checkpoints/forecast_ridge_overnight/accuracy_levers.json
+python scripts/cs_accuracy_levers.py --data-dir data --universe liquid --rebuild-residuals
+python -m forecast.training --universe liquid --skip-only --label-return overnight \
+  --ridge-sign-shrink --checkpoint-dir checkpoints/forecast_ridge_overnight_shrink
+python -m forecast.training --universe liquid --skip-only --label-return overnight \
+  --ridge-long-only --checkpoint-dir checkpoints/forecast_ridge_overnight_longonly
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --cost-bundle live_micro --long-only \
+  --ic-shrink-lookback 63 --gap-risk-cap 0.2
 # harsh auction stress
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --cost-bundle harsh
@@ -110,6 +121,8 @@ Overnight **live vs paper** (same flatten book, 15% causal vol):
 | `live` (`--live-costs`) | 20 bp RT + **5 bp MOC + 10 bp MOO on full \|w\|**, ×2 on the bottom 30% CS `turnover_z`, + `8 * max(vol_level,0)` bp impact, + 5 borrow + 10 hedge. |
 | `live_locate` | `live` plus no shorts in the bottom 30% turnover (HTB proxy). Report IR with and without this gate. |
 | `live_long_only` | `live` with no shorts, borrow=0. Residual still assumes a liquid ETF hedge overlay. Long sleeve ADV participation is ~2× the 50/50 long sleeve. |
+| `live_micro` | `live` plus HTB borrow on thin names and ADV/sqrt-participation impact. Compare vs live; val-gate before replacing the headline pack. |
+| `live_micro_long_only` | `live_micro` with no shorts/borrow. |
 | `harsh` | ugly MOO (30 bp), HTB, higher impact. If net IR dies, stop; next estimand is open+N fill or weekly residual — not bigger Mamba. |
 | `ex_post_gap` | sensitivity: extra `0.25 * \|overnight move\| * \|w\|`. Uses realized. Not the default. |
 | `fill_live` | MOC + continuous open+N exit (no MOO). Only with `--label-return open15`. |

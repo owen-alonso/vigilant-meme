@@ -106,6 +106,21 @@ class DataConfig:
     residualize_features: bool = False
     # Optional third factor vs a mapped industry ETF when that parquet exists.
     industry_residual: bool = False
+    # Optional size factor vs IWM (trailing beta through t). Off by default;
+    # promote only if locked val lifts vs sector/SPY. IWM is a hedge, not a book name.
+    size_residual: bool = False
+    # Optional equal-weight peer-basket residual (other trading names). Beta uses
+    # same-bar peer returns through t; peer *forward* return is a label term.
+    peer_residual: bool = False
+    # Drop names below this within-date CS turnover_z percentile before the skip
+    # *and* the book (0 = off). 0.67 = top tercile liquid sleeve. Known at t.
+    adv_floor_pctile: float = 0.0
+    # Optional dollar ADV floor using close*volume from the adjusted parquet (0 = off).
+    # Not vendor ADV. Future corporate-action-aware ADV belongs here later.
+    adv_floor_usd: float = 0.0
+    # Lock trading-name membership from train-era median dollar volume (percentile
+    # of names). 0 = off. Val/test cannot add names that were illiquid in train.
+    train_era_adv_pctile: float = 0.0
     # Which forward log-return the residual label uses. ``close`` is close_t →
     # close_{t+h} (the locked close-to-close book). ``overnight`` is
     # close_t → open_{t+h} (gap residual; next open is a *label*, never a
@@ -148,6 +163,16 @@ class DataConfig:
             payload["residualize_features"] = False
         if "industry_residual" not in payload:
             payload["industry_residual"] = False
+        if "size_residual" not in payload:
+            payload["size_residual"] = False
+        if "peer_residual" not in payload:
+            payload["peer_residual"] = False
+        if "adv_floor_pctile" not in payload:
+            payload["adv_floor_pctile"] = 0.0
+        if "adv_floor_usd" not in payload:
+            payload["adv_floor_usd"] = 0.0
+        if "train_era_adv_pctile" not in payload:
+            payload["train_era_adv_pctile"] = 0.0
         if "label_return" not in payload:
             payload["label_return"] = "close"
         if "fill_minutes" not in payload:
@@ -369,6 +394,13 @@ class ForecastTrainConfig:
     ridge_year_balance: bool = False
     # Year-sign stability mask: ``train`` or ``train_val`` (empty = off).
     ridge_year_stable: str = ""
+    # Soft train-only year-sign shrink (scale columns; does not hard-drop OHLC).
+    ridge_sign_shrink: bool = False
+    # Fit the skip on a long-sleeve ranking target (top quantile of y), aligned
+    # with the runnable long-only book. Off keeps LS rank-target.
+    ridge_long_only: bool = False
+    # Top quantile used when ridge_long_only is on (0.2 = top 20% longs).
+    ridge_long_only_quantile: float = 0.2
     # ListNet (softmax CE) within date. 0 keeps RankNet-only ranking.
     listnet_loss_weight: float = 0.0
     # Residual-std head. Trained by gaussian NLL, or by sigma_aux_weight when
