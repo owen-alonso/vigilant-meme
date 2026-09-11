@@ -130,6 +130,7 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight_sp
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --live-costs --long-only --disp-gate-kind cc --disp-gate-window 1 --disp-gate-tau 0.02
 # overnight ⊕ close-to-close rank ensemble is TRAIN-chosen α, VAL-gated (α=1 default)
+# causal adaptive α_t (trailing CS IC of overnight vs c2c) is TRAIN W/rule, VAL-gated (default off)
 # sticky long-only enter/exit hysteresis is TRAIN-chosen, VAL-gated (default always-rebuild q20)
 # soft trailing CS-IC gross scale is TRAIN-chosen, VAL-gated (default off / full q20)
 python -m forecast.training --universe liquid --interval daily --skip-only \

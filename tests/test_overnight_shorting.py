@@ -20,9 +20,17 @@ from forecast.shorting import (
     decide_sector_promote,
     decide_disp_gate_promote,
     decide_ensemble_promote,
+    decide_adaptive_ensemble_promote,
     blend_cs_scores,
+    blend_cs_scores_adaptive,
+    adaptive_alpha_series,
+    map_ics_to_alpha,
     ENSEMBLE_ALPHAS,
+    ADAPTIVE_WINDOWS,
+    ADAPTIVE_RULES,
+    FIXED_ENSEMBLE_ALPHA,
     fit_ensemble_on_train,
+    fit_adaptive_ensemble_on_train,
     STICKY_ENTERS,
     STICKY_EXITS,
     decide_sticky_promote,
@@ -486,6 +494,156 @@ def test_decide_ensemble_promote_is_val_only():
 
 def test_ensemble_alphas_are_train_grid_without_pure_c2c():
     assert ENSEMBLE_ALPHAS == (0.5, 0.6, 0.7, 0.8, 1.0)
+    assert FIXED_ENSEMBLE_ALPHA == pytest.approx(0.70)
+    assert ADAPTIVE_WINDOWS == (20, 60, 120)
+    assert ADAPTIVE_RULES == ("relu_ratio", "signed_ratio", "softmax")
+
+
+def test_map_ics_to_alpha_rules():
+    assert map_ics_to_alpha(0.2, 0.2, "relu_ratio") == pytest.approx(0.5, abs=1e-6)
+    assert map_ics_to_alpha(0.2, -0.1, "relu_ratio") == pytest.approx(1.0, abs=1e-6)
+    assert map_ics_to_alpha(-0.2, 0.1, "relu_ratio") == pytest.approx(0.0, abs=1e-6)
+    assert map_ics_to_alpha(0.2, 0.2, "signed_ratio") == pytest.approx(0.5, abs=1e-6)
+    assert map_ics_to_alpha(-0.2, -0.1, "signed_ratio") == pytest.approx(1.0)
+    assert map_ics_to_alpha(0.0, 0.0, "softmax") == pytest.approx(0.5, abs=1e-6)
+    assert not np.isfinite(map_ics_to_alpha(float("nan"), 0.1, "relu_ratio"))
+
+
+def test_adaptive_alpha_is_causal_dates_before_t():
+    rng = np.random.default_rng(2)
+    n_days, n_names = 40, 8
+    dates = pd.bdate_range("2018-01-02", periods=n_days)
+    names = [f"S{i}" for i in range(n_names)]
+    true = np.linspace(-1.0, 1.0, n_names)
+    pred_a = pd.DataFrame(np.tile(true, (n_days, 1)), index=dates, columns=names)
+    pred_b = pred_a * 0.35 + rng.normal(0.0, 0.25, size=pred_a.shape)
+    pred_b = pd.DataFrame(pred_b, index=dates, columns=names)
+    y = pd.DataFrame(np.tile(true, (n_days, 1)), index=dates, columns=names)
+    alpha = adaptive_alpha_series(
+        pred_a, pred_b, y, window=20, rule="relu_ratio", min_names=6
+    )
+    t = dates[25]
+    t_next = dates[26]
+    y_flip_t = y.copy()
+    y_flip_t.loc[t] = -y_flip_t.loc[t]
+    alpha_flip_t = adaptive_alpha_series(
+        pred_a, pred_b, y_flip_t, window=20, rule="relu_ratio", min_names=6
+    )
+    assert np.isfinite(alpha.loc[t])
+    assert alpha.loc[t] == pytest.approx(float(alpha_flip_t.loc[t]), abs=1e-12)
+    # Date t's overnight *does* enter α_{t+1} (newest prior IC).
+    assert abs(float(alpha.loc[t_next]) - float(alpha_flip_t.loc[t_next])) > 1e-12
+
+
+def test_blend_cs_scores_adaptive_constant_alpha_matches_fixed():
+    dates = pd.bdate_range("2022-01-03", periods=4)
+    names = ["A", "B", "C", "D"]
+    pred_a = pd.DataFrame([[1.0, 2.0, 3.0, 4.0]] * 4, index=dates, columns=names)
+    pred_b = pd.DataFrame([[4.0, 3.0, 2.0, 1.0]] * 4, index=dates, columns=names)
+    alpha = pd.Series(1.0, index=dates)
+    got = blend_cs_scores_adaptive(pred_a, pred_b, alpha)
+    want = blend_cs_scores(pred_a, pred_b, 1.0)
+    pd.testing.assert_frame_equal(got, want)
+    mid = blend_cs_scores_adaptive(pred_a, pred_b, pd.Series(0.5, index=dates))
+    assert mid.loc[dates[0]].abs().max() < 1e-9
+
+
+def test_decide_adaptive_ensemble_promote_is_val_only():
+    val_070 = {
+        "name": "ens_a0.70",
+        "alpha": 0.70,
+        "unlevered_net_ir": 1.10,
+        "unlevered_max_dd": -0.20,
+        "coverage": 1.0,
+        "net_ir": 0.90,
+    }
+    val_1 = {
+        "name": "ens_a1.00",
+        "alpha": 1.0,
+        "unlevered_net_ir": 1.00,
+        "unlevered_max_dd": -0.18,
+        "coverage": 1.0,
+        "net_ir": 0.80,
+    }
+    val_adp = {
+        "name": "adp_W60_relu_ratio",
+        "window": 60,
+        "rule": "relu_ratio",
+        "unlevered_net_ir": 1.20,
+        "unlevered_max_dd": -0.19,
+        "coverage": 1.0,
+        "net_ir": 1.00,
+        "mean_alpha": 0.55,
+    }
+    juicy_test = {"unlevered_net_ir": 9.9}
+    yes = decide_adaptive_ensemble_promote(
+        val_adaptive=val_adp,
+        val_fixed_070=val_070,
+        val_alpha1=val_1,
+        chosen={"window": 60, "rule": "relu_ratio"},
+    )
+    assert yes["promote_adaptive_ensemble"] is True
+    assert yes["gated_on"] == "val"
+    assert yes["baseline_name"] == "fixed_a0.70"
+    assert yes["ir_delta"] == pytest.approx(0.10)
+    assert juicy_test["unlevered_net_ir"] > yes["ir_adaptive"]
+
+    no = decide_adaptive_ensemble_promote(
+        val_adaptive=val_070,
+        val_fixed_070=val_070,
+        val_alpha1=val_1,
+        chosen={"window": 60, "rule": "relu_ratio"},
+    )
+    assert no["promote_adaptive_ensemble"] is False
+
+    thin = decide_adaptive_ensemble_promote(
+        val_adaptive={**val_adp, "coverage": 0.10},
+        val_fixed_070=val_070,
+        val_alpha1=val_1,
+        chosen={"window": 60, "rule": "relu_ratio"},
+    )
+    assert thin["promote_adaptive_ensemble"] is False
+
+    worse_dd = decide_adaptive_ensemble_promote(
+        val_adaptive={**val_adp, "unlevered_max_dd": -0.30},
+        val_fixed_070=val_070,
+        val_alpha1=val_1,
+        chosen={"window": 60, "rule": "relu_ratio"},
+    )
+    assert worse_dd["promote_adaptive_ensemble"] is False
+
+
+def test_fit_adaptive_ensemble_on_train_stays_on_train_grid():
+    rng = np.random.default_rng(0)
+    n_days, n_names = 80, 8
+    dates = np.repeat(np.arange(n_days, dtype=np.int64) + 18000, n_names)
+    names = np.tile([f"S{i}" for i in range(n_names)], n_days)
+    true = np.tile(np.linspace(-1.0, 1.0, n_names), n_days)
+    day_shock = np.repeat(rng.normal(0.0, 0.008, n_days), n_names)
+    amp = np.repeat(0.4 + np.abs(rng.normal(1.0, 0.35, n_days)), n_names)
+    r_on = true * 0.012 + day_shock
+    frame_on = pd.DataFrame(
+        {
+            "symbol": names,
+            "date": dates,
+            "pred": true,
+            "y": true * amp,
+            "r_on": r_on,
+            "turnover_z": -true,
+            "vol_level": np.full(len(dates), 0.2),
+        }
+    )
+    frame_cc = frame_on.copy()
+    frame_cc["pred"] = true * 0.4 + rng.normal(0.0, 0.3, size=len(true))
+    fit = fit_adaptive_ensemble_on_train(
+        frame_on, frame_cc, min_names=6, vol_target=0.15
+    )
+    assert fit["fit_split"] == "train"
+    assert fit["chosen"]
+    assert int(fit["chosen"]["window"]) in set(ADAPTIVE_WINDOWS)
+    assert str(fit["chosen"]["rule"]) in set(ADAPTIVE_RULES)
+    assert {int(r["window"]) for r in fit["rows"]} <= set(ADAPTIVE_WINDOWS)
+    assert {str(r["rule"]) for r in fit["rows"]} <= set(ADAPTIVE_RULES)
 
 
 def test_fit_ensemble_on_train_picks_overnight_when_c2c_is_anti():
@@ -707,6 +865,13 @@ def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
     assert train_a in set(ENSEMBLE_ALPHAS)
     assert payload["ensemble_compare"]["train_alpha"] == pytest.approx(train_a)
     assert "PROMOTE OVERNIGHT" in text and "ENSEMBLE" in text
+    assert payload["adaptive_ensemble_fit"]["fit_split"] == "train"
+    assert payload["adaptive_ensemble_promotion"]["gated_on"] == "val"
+    adp_ch = payload["adaptive_ensemble_fit"].get("chosen") or {}
+    if adp_ch:
+        assert int(adp_ch["window"]) in set(ADAPTIVE_WINDOWS)
+        assert str(adp_ch["rule"]) in set(ADAPTIVE_RULES)
+    assert "PROMOTE ADAPTIVE OVERNIGHT" in text
     assert payload["sticky_fit"]["fit_split"] == "train"
     assert payload["sticky_promotion"]["gated_on"] == "val"
     chosen_st = payload["sticky_fit"].get("chosen") or {}
