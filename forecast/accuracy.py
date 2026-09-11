@@ -5,22 +5,24 @@ converts that to an implied overnight log-return ``pred * sigma`` (same as
 ``generate.py``) and scores:
 
 - direction vs realized ``r_on = log(open_{t+1}) - log(close_t)``
+- excess hit rate vs the unconditional overnight-up drift (always-long)
 - implied next-open vs actual next open
+- long-only book up-rate on the within-date top residual names
 
 Default recipe is the PR #5 overnight skip (rank-target ridge, ``no_long_ts``).
 PR #7 levers stay off unless a checkpoint documents them.
 
-Train-only accuracy readouts (affine residual→raw overnight, TS overnight
-ridge, sign ridge, ADV sleeve, confidence slices) are fit on TRAIN and gated
-on locked VAL. They do not replace the residual CS skip. Next open is never a
-feature.
+Train-only accuracy readouts (affine residual→raw overnight, drift-veto,
+piecewise/bin calibration, weekday intercepts, TS overnight ridge, sign ridge,
+ADV sleeve, confidence slices) are fit on TRAIN and gated on locked VAL. They
+do not replace the residual CS skip. Next open is never a feature.
 """
 
 from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -48,6 +50,7 @@ from forecast.ridge import (
 # Accuracy readout gates (locked VAL). CS IC gate stays VAL_LIFT / VAL_2017_KEEP.
 DIR_LIFT = 0.002  # 0.2 pp hit-rate vs the residual*sigma baseline
 TURNOVER_COL = FEATURE_NAMES.index("turnover_z") if "turnover_z" in FEATURE_NAMES else None
+VOL_LEVEL_COL = FEATURE_NAMES.index("vol_level") if "vol_level" in FEATURE_NAMES else None
 # PR #8 locked-TEST residual*sigma print (do not retarget; compare on the same window).
 BASELINE_TEST = {
     "dir_pct": 51.1,
@@ -107,6 +110,79 @@ def two_sided_normal_p(z: float) -> float:
     if not np.isfinite(z):
         return float("nan")
     return float(math.erfc(abs(float(z)) / math.sqrt(2.0)))
+
+
+def weekday_of_dates(dates: np.ndarray) -> np.ndarray:
+    """Monday=0 … Sunday=6 from day-since-epoch keys (known at close t)."""
+    d = np.asarray(dates, dtype=np.int64)
+    if d.size == 0:
+        return np.zeros((0,), dtype=np.int64)
+    cal = np.datetime64("1970-01-01") + d.astype("timedelta64[D]")
+    return pd.to_datetime(cal).dayofweek.to_numpy(dtype=np.int64)
+
+
+def recency_weights(dates: np.ndarray, *, halflife_years: float = 6.0) -> np.ndarray:
+    """Train-only year recency. Newer train years get more weight; no val/test."""
+    years = dates_to_year(np.asarray(dates, dtype=np.int64)).astype(np.float64)
+    if years.size == 0:
+        return np.zeros((0,), dtype=np.float64)
+    hl = max(float(halflife_years), 1e-6)
+    ymax = float(np.max(years))
+    return np.power(0.5, (ymax - years) / hl)
+
+
+def weighted_median(values: np.ndarray, weights: np.ndarray | None = None) -> float:
+    v = np.asarray(values, dtype=np.float64)
+    if weights is None:
+        v = v[np.isfinite(v)]
+        return float(np.median(v)) if v.size else 0.0
+    w = np.asarray(weights, dtype=np.float64)
+    ok = np.isfinite(v) & np.isfinite(w) & (w > 0)
+    v, w = v[ok], w[ok]
+    if v.size == 0:
+        return 0.0
+    order = np.argsort(v)
+    v, w = v[order], w[order]
+    cw = np.cumsum(w)
+    idx = int(np.searchsorted(cw, 0.5 * cw[-1], side="left"))
+    idx = min(max(idx, 0), v.size - 1)
+    return float(v[idx])
+
+
+def hit_rate_vs_p0(hits: np.ndarray, p0: float) -> dict[str, float]:
+    """Hit rate vs a known base rate (overnight-up drift), not vs 50%."""
+    h = np.asarray(hits, dtype=np.float64)
+    h = h[np.isfinite(h)]
+    n = int(h.size)
+    p_base = float(p0)
+    empty = {
+        "n": float(n),
+        "hit_rate": float("nan"),
+        "hit_rate_pct": float("nan"),
+        "p0": p_base,
+        "p0_pct": float(100.0 * p_base) if np.isfinite(p_base) else float("nan"),
+        "excess": float("nan"),
+        "excess_pp": float("nan"),
+        "z_vs_p0": float("nan"),
+        "p_vs_p0": float("nan"),
+    }
+    if n <= 0 or not np.isfinite(p_base) or p_base <= 0.0 or p_base >= 1.0:
+        return empty
+    k = float(h.sum())
+    p = k / n
+    se = math.sqrt(p_base * (1.0 - p_base) / n)
+    z = (p - p_base) / se if se > 0 else float("nan")
+    return {
+        "n": float(n),
+        "hit_rate": float(p),
+        "hit_rate_pct": float(100.0 * p),
+        "p0": p_base,
+        "p0_pct": float(100.0 * p_base),
+        "excess": float(p - p_base),
+        "excess_pp": float(100.0 * (p - p_base)),
+        "z_vs_p0": float(z),
+        "p_vs_p0": two_sided_normal_p(z),
+    }
 
 
 def hit_rate_inference(hits: np.ndarray) -> dict[str, float]:
@@ -261,8 +337,11 @@ def collect_eval_frame(
             close, nxt_open = px
             r_on = math.log(nxt_open) - math.log(close)
             turn = float("nan")
+            vol = float("nan")
             if TURNOVER_COL is not None and TURNOVER_COL < raw.shape[1]:
                 turn = float(raw[i, TURNOVER_COL])
+            if VOL_LEVEL_COL is not None and VOL_LEVEL_COL < raw.shape[1]:
+                vol = float(raw[i, VOL_LEVEL_COL])
             rows.append(
                 {
                     "symbol": sym.symbol,
@@ -274,6 +353,7 @@ def collect_eval_frame(
                     "next_open": float(nxt_open),
                     "r_on": float(r_on),
                     "turnover_z": turn,
+                    "vol_level": vol,
                 }
             )
             if return_features:
@@ -288,6 +368,8 @@ def collect_eval_frame(
         "next_open",
         "r_on",
         "turnover_z",
+        "vol_level",
+        "weekday",
         "pred_r",
         "implied_open",
         "implied_open_given_hedge",
@@ -298,6 +380,7 @@ def collect_eval_frame(
             return df, np.zeros((0, int(mean.shape[0])), dtype=np.float64)
         return df
     df = pd.DataFrame(rows)
+    df["weekday"] = weekday_of_dates(df["date"].to_numpy(dtype=np.int64))
     df["pred_r"] = df["pred"] * df["scale"]
     df["implied_open"] = df["close"] * np.exp(df["pred_r"])
     # resid = y * scale = r_on - beta * r_hedge. Adding the realized hedge
@@ -307,6 +390,60 @@ def collect_eval_frame(
     if return_features:
         return df, np.stack(feat_rows, axis=0).astype(np.float64)
     return df
+
+
+def long_only_book_block(
+    df: pd.DataFrame,
+    *,
+    score_col: str = "pred",
+    q: float = 0.80,
+    min_names: int = 3,
+) -> dict[str, float]:
+    """Overnight up-rate on the within-date top residual names (long-only sleeve)."""
+    empty = {
+        "quantile": float(q),
+        "n": 0.0,
+        "coverage": float("nan"),
+        "up_pct": float("nan"),
+        "uncond_up_pct": float("nan"),
+        "excess_pp": float("nan"),
+        "n_dates": 0.0,
+    }
+    if df.empty or score_col not in df.columns:
+        return empty
+    dates = df["date"].to_numpy(dtype=np.int64)
+    score = df[score_col].to_numpy(dtype=np.float64)
+    r_on = df["r_on"].to_numpy(dtype=np.float64)
+    mask = np.zeros(len(df), dtype=bool)
+    n_dates = 0
+    for key in np.unique(dates):
+        sel = dates == key
+        row = score[sel]
+        if int(np.isfinite(row).sum()) < int(min_names):
+            continue
+        cut = float(np.nanquantile(row, float(q)))
+        mask[sel] = np.isfinite(row) & (row >= cut)
+        n_dates += 1
+    moved = mask & np.isfinite(r_on) & (r_on != 0.0)
+    uncond = r_on[np.isfinite(r_on) & (r_on != 0.0)]
+    uncond_up = float((uncond > 0).mean()) if uncond.size else float("nan")
+    if int(moved.sum()) == 0:
+        empty["n_dates"] = float(n_dates)
+        empty["uncond_up_pct"] = (
+            float(100.0 * uncond_up) if np.isfinite(uncond_up) else float("nan")
+        )
+        empty["coverage"] = float(mask.mean()) if mask.size else float("nan")
+        return empty
+    up = float((r_on[moved] > 0).mean())
+    return {
+        "quantile": float(q),
+        "n": float(int(moved.sum())),
+        "coverage": float(mask.mean()) if mask.size else float("nan"),
+        "up_pct": float(100.0 * up),
+        "uncond_up_pct": float(100.0 * uncond_up) if np.isfinite(uncond_up) else float("nan"),
+        "excess_pp": float(100.0 * (up - uncond_up)) if np.isfinite(uncond_up) else float("nan"),
+        "n_dates": float(n_dates),
+    }
 
 
 def _restrict_cs_dates(df: pd.DataFrame, min_names: int) -> pd.DataFrame:
@@ -369,6 +506,21 @@ def score_eval_frame(
     finite_p = pred_r[np.isfinite(pred_r)]
     realized_up = float((finite_r > 0).mean()) if finite_r.size else float("nan")
     pred_up = float((finite_p > 0).mean()) if finite_p.size else float("nan")
+    vs_drift = hit_rate_vs_p0(ts_hits, realized_up)
+    book_top20 = long_only_book_block(df, score_col="pred", q=0.80, min_names=min_names)
+    book_top30 = long_only_book_block(df, score_col="pred", q=0.70, min_names=min_names)
+    down_hi = (
+        np.isfinite(pred_r)
+        & np.isfinite(r_on)
+        & (r_on != 0.0)
+        & (pred_r < 0.0)
+    )
+    if mag.size:
+        tail_cut = float(np.quantile(np.abs(pred_r[moved]), 0.70)) if moved.any() else 0.0
+    else:
+        tail_cut = 0.0
+    strong_down = down_hi & (np.abs(pred_r) >= tail_cut)
+    down_hits = (r_on[strong_down] < 0.0).astype(np.float64) if int(strong_down.sum()) else np.zeros(0)
 
     return {
         "empty": False,
@@ -389,6 +541,20 @@ def score_eval_frame(
             "cross_sectional_residual_sign": cs_sign,
             "realized_overnight_up_pct": float(100.0 * realized_up),
             "pred_positive_pct": float(100.0 * pred_up),
+            "overall_vs_drift": vs_drift,
+            "excess_pp": _as_float(vs_drift.get("excess_pp")),
+            "strong_down_when_pred_negative_and_high_abs": hit_rate_inference(
+                down_hits
+            ),
+        },
+        "book": {
+            "kind": (
+                "long-only runnable sleeve: within-date residual-pred quantile, "
+                "then overnight up-rate vs the unconditional gap up-rate. "
+                "This is the book object, not pooled TS direction."
+            ),
+            "long_only_top20": book_top20,
+            "long_only_top30": book_top30,
         },
         "cs_ic": {
             "cs_ic": float(cs.get("cs_ic", float("nan"))),
@@ -539,6 +705,13 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
     conv = direction.get("abs_pred_above_median") or {}
     resid = direction.get("residual_vs_residual") or {}
     cs_sign = direction.get("cross_sectional_residual_sign") or {}
+    vs_drift = direction.get("overall_vs_drift") or {}
+    book_top = (payload.get("book") or {}).get("long_only_top20") or {}
+    up_pct = _as_float(direction.get("realized_overnight_up_pct"))
+    excess = _as_float(vs_drift.get("excess_pp"))
+    if not np.isfinite(excess) and np.isfinite(hit) and np.isfinite(up_pct):
+        excess = float(hit) - float(up_pct)
+    z_drift = _as_float(vs_drift.get("z_vs_p0"))
     lines = [
         "OVERNIGHT SKIP ACCURACY (locked TEST, predictive only — not live P&L)",
         f"  recipe: {payload.get('recipe')}  {payload.get('levers')}",
@@ -549,7 +722,9 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         f"  CS IC (residual, locked test)={cs.get('cs_ic'):+.4f} "
         f"t={cs.get('cs_ic_tstat')}",
         "",
-        f"HEADLINE direction accuracy = {hit:.1f}%  (vs 50% chance)",
+        f"HEADLINE direction accuracy = {hit:.1f}%  (vs 50% chance; "
+        f"vs {up_pct:.1f}% overnight-up drift: excess {excess:+.2f} pp"
+        f"{'' if not np.isfinite(z_drift) else f', z_vs_drift={z_drift:.2f}'})",
         f"  {better}  z={z:.2f}  p={p:.3g}  t={overall.get('t_vs_half')}",
         f"  this is pooled name-date TIME-SERIES direction of implied overnight "
         f"move (pred*sigma) vs realized r_on = log(open_{{t+1}})-log(close_t).",
@@ -557,9 +732,13 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         f"CS demeaned residual sign={float(cs_sign.get('cs_sign_hit_pct') or float('nan')):.1f}% "
         f"(that last one is the cross-sectional object).",
         f"  long-only (pred>0): {long_only.get('hit_rate_pct'):.1f}%  "
-        f"(unconditional overnight up-rate {direction.get('realized_overnight_up_pct'):.1f}%; "
+        f"(unconditional overnight up-rate {up_pct:.1f}%; "
         f"model predicts up {direction.get('pred_positive_pct'):.1f}% of the time)  "
         f"|pred|>=median: {conv.get('hit_rate_pct'):.1f}%",
+        f"  long-only BOOK top 20% CS residual: up-rate "
+        f"{_as_float(book_top.get('up_pct')):.1f}%  "
+        f"excess {_as_float(book_top.get('excess_pp')):+.2f} pp vs {up_pct:.1f}% "
+        f"n={int(_as_float(book_top.get('n'), 0.0))}",
         "",
         f"HEADLINE |price error|  MAE ${price.get('mae'):.4f}  "
         f"median ${price.get('median_ae'):.4f}  RMSE ${price.get('rmse'):.4f}",
@@ -592,6 +771,8 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
                     f"VAL-GATED ACCURACY READOUT = {default_name}  "
                     f"(CS skip unchanged; selected on locked VAL, reported on TEST)",
                     f"  TEST dir={_as_float(t.get('dir_pct')):.1f}%  "
+                    f"excess {_as_float(t.get('excess_pp')):+.2f} pp vs "
+                    f"{_as_float(t.get('up_pct')):.1f}% up-rate  "
                     f"MAE ${_as_float(t.get('mae_usd')):.4f} / "
                     f"{100.0 * _as_float(t.get('mae_pct')):.4f}%  "
                     f"vs residual*sigma {hit:.1f}% / "
@@ -600,12 +781,13 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
                     f"vs zero-move ${_as_float(zero_d.get('mae')):.4f} / "
                     f"{100.0 * _as_float(zero_p.get('mae')):.4f}%",
                     f"  VAL dir={_as_float(v.get('dir_pct')):.1f}%  "
+                    f"excess {_as_float(v.get('excess_pp')):+.2f} pp  "
                     f"MAE%={100.0 * _as_float(v.get('mae_pct')):.4f}  "
-                    f"a={cal.get('a')} b={cal.get('b')}  "
+                    f"kind={cal.get('kind')!r} a={cal.get('a')} b={cal.get('b')}  "
                     f"promote_dir={promo.get('direction')!r} promote_mae={promo.get('price')!r}",
-                    "  Direction above 51% here can mix residual signal with overnight drift "
-                    "(train intercept). Unconditional up-rate / train-median gap is the "
-                    "drift baseline; this is not a live P&L claim.",
+                    "  Skill vs overnight drift is excess hit rate vs the unconditional "
+                    "up-rate / train-median gap (always-up). CS skip is unchanged. "
+                    "This is not a live P&L claim.",
                 ]
             )
     ablate = payload.get("ablation")
@@ -672,38 +854,56 @@ def fit_affine_l1(
     r_on: np.ndarray,
     *,
     n_grid: int = 41,
+    weights: np.ndarray | None = None,
 ) -> tuple[float, float]:
     """Train-only L1 affine: grid ``a``, ``b = median(r_on - a*pred_r)``.
 
     ``a=0`` recovers the train-median overnight gap (MAE-optimal constant).
+    Optional ``weights`` are train-only (recency); they do not use val/test.
     """
     p = np.asarray(pred_r, dtype=np.float64)
     y = np.asarray(r_on, dtype=np.float64)
     ok = np.isfinite(p) & np.isfinite(y)
+    if weights is not None:
+        w_all = np.asarray(weights, dtype=np.float64)
+        if w_all.shape[0] != p.shape[0]:
+            raise ValueError("weights must align with pred_r")
+        ok = ok & np.isfinite(w_all) & (w_all > 0)
+        w = w_all[ok]
+    else:
+        w = None
     p, y = p[ok], y[ok]
     if y.size < 8:
-        return 0.0, float(np.median(y) if y.size else 0.0)
+        return 0.0, weighted_median(y, w)
     p_std = float(np.std(p))
     span = 3.0 if p_std < 1e-12 else max(2.0, 4.0 * float(np.std(y)) / max(p_std, 1e-12))
     grid = np.linspace(-span, span, max(9, int(n_grid)))
     best_a = 0.0
-    best_b = float(np.median(y))
-    best = float(np.mean(np.abs(y - best_b)))
-    for a in grid:
+    best_b = weighted_median(y, w)
+    if w is None:
+        best = float(np.mean(np.abs(y - best_b)))
+    else:
+        best = float(np.average(np.abs(y - best_b), weights=w))
+
+    def _mae(a: float) -> tuple[float, float, float]:
         resid = y - float(a) * p
-        b = float(np.median(resid))
-        mae = float(np.mean(np.abs(resid - b)))
+        b = weighted_median(resid, w)
+        if w is None:
+            mae = float(np.mean(np.abs(resid - b)))
+        else:
+            mae = float(np.average(np.abs(resid - b), weights=w))
+        return mae, float(a), b
+
+    for a in grid:
+        mae, aa, bb = _mae(float(a))
         if mae < best:
-            best, best_a, best_b = mae, float(a), b
-    # Fine grid around the winner.
+            best, best_a, best_b = mae, aa, bb
     half = (grid[1] - grid[0]) if grid.size > 1 else 0.05
     fine = np.linspace(best_a - half, best_a + half, 21)
     for a in fine:
-        resid = y - float(a) * p
-        b = float(np.median(resid))
-        mae = float(np.mean(np.abs(resid - b)))
+        mae, aa, bb = _mae(float(a))
         if mae < best:
-            best, best_a, best_b = mae, float(a), b
+            best, best_a, best_b = mae, aa, bb
     return best_a, best_b
 
 
@@ -717,6 +917,450 @@ def train_constant(r_on: np.ndarray, how: str = "median") -> float:
     if how == "zero":
         return 0.0
     return float(np.median(y))
+
+
+def fit_affine_huber(
+    pred_r: np.ndarray,
+    r_on: np.ndarray,
+    *,
+    n_iter: int = 25,
+) -> tuple[float, float]:
+    """Train-only Huber IRLS affine. Starts at OLS; no val/test rows."""
+    a, b = fit_affine_ols(pred_r, r_on)
+    p = np.asarray(pred_r, dtype=np.float64)
+    y = np.asarray(r_on, dtype=np.float64)
+    ok = np.isfinite(p) & np.isfinite(y)
+    p, y = p[ok], y[ok]
+    if y.size < 8:
+        return a, b
+    resid0 = y - (a * p + b)
+    mad = float(np.median(np.abs(resid0 - np.median(resid0))))
+    delta = max(1.345 * mad / 0.6745, 1e-8) if mad > 0 else max(float(np.std(resid0)), 1e-8)
+    for _ in range(int(n_iter)):
+        resid = y - (a * p + b)
+        absr = np.abs(resid)
+        w = np.ones_like(resid)
+        big = absr > delta
+        w[big] = delta / np.clip(absr[big], 1e-12, None)
+        sw = np.sqrt(w)
+        design = np.column_stack([p * sw, sw])
+        coef, *_ = np.linalg.lstsq(design, y * sw, rcond=None)
+        a, b = float(coef[0]), float(coef[1])
+    return a, b
+
+
+def fit_piecewise_l1(
+    pred_r: np.ndarray,
+    r_on: np.ndarray,
+) -> tuple[float, float, float, float]:
+    """Separate train-only L1 affine for ``pred_r >= 0`` and ``pred_r < 0``."""
+    p = np.asarray(pred_r, dtype=np.float64)
+    y = np.asarray(r_on, dtype=np.float64)
+    ok = np.isfinite(p) & np.isfinite(y)
+    p, y = p[ok], y[ok]
+    pos = p >= 0.0
+    if int(pos.sum()) >= 8:
+        a_pos, b_pos = fit_affine_l1(p[pos], y[pos])
+    else:
+        a_pos, b_pos = 0.0, float(np.median(y) if y.size else 0.0)
+    if int((~pos).sum()) >= 8:
+        a_neg, b_neg = fit_affine_l1(p[~pos], y[~pos])
+    else:
+        a_neg, b_neg = 0.0, float(np.median(y) if y.size else 0.0)
+    return a_pos, b_pos, a_neg, b_neg
+
+
+def apply_piecewise_l1(
+    pred_r: np.ndarray,
+    a_pos: float,
+    b_pos: float,
+    a_neg: float,
+    b_neg: float,
+) -> np.ndarray:
+    p = np.asarray(pred_r, dtype=np.float64)
+    out = np.empty_like(p)
+    pos = p >= 0.0
+    out[pos] = float(a_pos) * p[pos] + float(b_pos)
+    out[~pos] = float(a_neg) * p[~pos] + float(b_neg)
+    return out
+
+
+def fit_bin_constants(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    n_bins: int = 7,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Train-only quantile bins of ``x`` → median ``y``. Edges do not use val/test."""
+    xv = np.asarray(x, dtype=np.float64)
+    yv = np.asarray(y, dtype=np.float64)
+    ok = np.isfinite(xv) & np.isfinite(yv)
+    xv, yv = xv[ok], yv[ok]
+    n_bins = max(3, int(n_bins))
+    fallback = float(np.median(yv) if yv.size else 0.0)
+    if xv.size < n_bins * 4:
+        edges = np.array([-1e18, 1e18], dtype=np.float64)
+        return edges, np.array([fallback], dtype=np.float64)
+    qs = np.linspace(0.0, 1.0, n_bins + 1)
+    cuts = np.quantile(xv, qs[1:-1])
+    cuts = np.unique(cuts)
+    edges = np.concatenate([[-1e18], cuts, [1e18]]).astype(np.float64)
+    values = np.zeros(edges.size - 1, dtype=np.float64)
+    for i in range(values.size):
+        if i == values.size - 1:
+            sel = xv >= edges[i]
+        else:
+            sel = (xv >= edges[i]) & (xv < edges[i + 1])
+        values[i] = float(np.median(yv[sel])) if int(sel.sum()) else fallback
+    return edges, values
+
+
+def apply_bin_constants(
+    x: np.ndarray,
+    edges: np.ndarray,
+    values: np.ndarray,
+) -> np.ndarray:
+    xv = np.asarray(x, dtype=np.float64)
+    e = np.asarray(edges, dtype=np.float64)
+    v = np.asarray(values, dtype=np.float64)
+    if v.size == 0:
+        return np.zeros_like(xv)
+    inner = e[1:-1] if e.size >= 2 else np.zeros(0)
+    if inner.size == 0:
+        return np.full_like(xv, float(v[0]))
+    idx = np.digitize(xv, inner, right=False)
+    idx = np.clip(idx, 0, v.size - 1)
+    out = v[idx]
+    out = out.astype(np.float64, copy=True)
+    out[~np.isfinite(xv)] = np.nan
+    return out
+
+
+def fit_group_median(
+    values: np.ndarray,
+    groups: np.ndarray,
+) -> tuple[dict[int, float], float]:
+    y = np.asarray(values, dtype=np.float64)
+    g = np.asarray(groups, dtype=np.int64)
+    default = float(np.median(y[np.isfinite(y)])) if y.size else 0.0
+    table: dict[int, float] = {}
+    for key in np.unique(g):
+        sel = g == int(key)
+        yy = y[sel]
+        yy = yy[np.isfinite(yy)]
+        table[int(key)] = float(np.median(yy)) if yy.size else default
+    return table, default
+
+
+def apply_group_median(
+    groups: np.ndarray,
+    table: dict[Any, float],
+    default: float,
+) -> np.ndarray:
+    g = np.asarray(groups, dtype=np.int64)
+    out = np.full(g.shape[0], float(default), dtype=np.float64)
+    for key, val in table.items():
+        out[g == int(key)] = float(val)
+    return out
+
+
+def _direction_excess(pred_r: np.ndarray, r_on: np.ndarray) -> float:
+    hits = direction_hits(pred_r, r_on)
+    r = np.asarray(r_on, dtype=np.float64)
+    moved = np.isfinite(r) & (r != 0.0)
+    up = float((r[moved] > 0).mean()) if int(moved.sum()) else float("nan")
+    if hits.size == 0 or not np.isfinite(up):
+        return float("nan")
+    return float(hits.mean() - up)
+
+
+def fit_drift_veto(
+    pred_r: np.ndarray,
+    r_on: np.ndarray,
+    *,
+    quantiles: Sequence[float] = (0.05, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25, 0.30),
+) -> dict[str, float]:
+    """Always-up except a train-chosen left tail of residual*sigma.
+
+    Threshold and region constants are train-only. Predicting down on the tail
+    beats the overnight-up base rate iff that tail is more than 50% down.
+    """
+    p = np.asarray(pred_r, dtype=np.float64)
+    y = np.asarray(r_on, dtype=np.float64)
+    ok = np.isfinite(p) & np.isfinite(y)
+    p, y = p[ok], y[ok]
+    b_up = float(np.median(y) if y.size else 0.0)
+    fallback = {
+        "tau": float(np.quantile(p, 0.10) if p.size else 0.0),
+        "a_dn": 0.0,
+        "b_dn": b_up,
+        "b_up": b_up,
+        "q": 0.10,
+        "mode": 0.0,
+    }
+    if p.size < 32:
+        return fallback
+    best_spec = dict(fallback)
+    best_key = (-1e9, 1e9)
+    for q in quantiles:
+        tau = float(np.quantile(p, float(q)))
+        down = p <= tau
+        n_dn = int(down.sum())
+        n_up = int((~down).sum())
+        if n_dn < 24 or n_up < 24:
+            continue
+        cover = n_dn / float(p.size)
+        if cover < 0.02 or cover > 0.45:
+            continue
+        b_dn_c = float(np.median(y[down]))
+        b_up_c = float(np.median(y[~down]))
+        candidates: list[tuple[str, np.ndarray, dict[str, float]]] = [
+            (
+                "const",
+                np.where(down, b_dn_c, b_up_c),
+                {"tau": tau, "a_dn": 0.0, "b_dn": b_dn_c, "b_up": b_up_c, "q": float(q), "mode": 0.0},
+            )
+        ]
+        if n_dn >= 32:
+            a_dn, b_dn_a = fit_affine_l1(p[down], y[down])
+            hat_a = np.where(down, apply_affine(p, a_dn, b_dn_a), b_up_c)
+            candidates.append(
+                (
+                    "affine",
+                    hat_a,
+                    {
+                        "tau": tau,
+                        "a_dn": float(a_dn),
+                        "b_dn": float(b_dn_a),
+                        "b_up": b_up_c,
+                        "q": float(q),
+                        "mode": 1.0,
+                    },
+                )
+            )
+        for _name, hat, spec in candidates:
+            if float(np.mean(hat < 0.0)) < 0.01:
+                continue
+            excess = _direction_excess(hat, y)
+            mae = float(np.mean(np.abs(hat - y)))
+            if not np.isfinite(excess):
+                continue
+            key = (excess, -mae)
+            if key > best_key:
+                best_key = key
+                best_spec = spec
+    return best_spec
+
+
+def apply_drift_veto(
+    pred_r: np.ndarray,
+    tau: float,
+    a_dn: float,
+    b_dn: float,
+    b_up: float,
+) -> np.ndarray:
+    p = np.asarray(pred_r, dtype=np.float64)
+    down = p <= float(tau)
+    out = np.full(p.shape, float(b_up), dtype=np.float64)
+    out[down] = float(a_dn) * p[down] + float(b_dn)
+    return out
+
+
+def fit_left_tail_l1(
+    pred_r: np.ndarray,
+    r_on: np.ndarray,
+    *,
+    quantiles: Sequence[float] = (0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50),
+) -> dict[str, float]:
+    """``r_hat = b_up + a_neg * min(pred_r - tau, 0)``. Grid tau on train L1."""
+    p = np.asarray(pred_r, dtype=np.float64)
+    y = np.asarray(r_on, dtype=np.float64)
+    ok = np.isfinite(p) & np.isfinite(y)
+    p, y = p[ok], y[ok]
+    b_up = float(np.median(y) if y.size else 0.0)
+    best = {"tau": 0.0, "a_neg": 0.0, "b_up": b_up}
+    if p.size < 16:
+        return best
+    best_mae = float(np.mean(np.abs(y - b_up)))
+    for q in quantiles:
+        tau = float(np.quantile(p, float(q)))
+        z = np.minimum(p - tau, 0.0)
+        if float(np.std(z)) < 1e-15:
+            continue
+        a_neg, b_extra = fit_affine_l1(z, y - b_up)
+        hat = b_up + apply_affine(z, a_neg, b_extra)
+        mae = float(np.mean(np.abs(hat - y)))
+        if mae < best_mae:
+            best_mae = mae
+            best = {
+                "tau": tau,
+                "a_neg": float(a_neg),
+                "b_up": float(b_up + b_extra),
+            }
+    return best
+
+
+def apply_left_tail_l1(
+    pred_r: np.ndarray,
+    tau: float,
+    a_neg: float,
+    b_up: float,
+) -> np.ndarray:
+    p = np.asarray(pred_r, dtype=np.float64)
+    z = np.minimum(p - float(tau), 0.0)
+    return float(b_up) + float(a_neg) * z
+
+
+def fit_confidence_blend(
+    pred_r: np.ndarray,
+    r_on: np.ndarray,
+    a: float,
+    b: float,
+    b_up: float,
+    *,
+    abs_quantiles: Sequence[float] = (0.50, 0.60, 0.70, 0.80, 0.90),
+) -> dict[str, float]:
+    """Use affine when |pred_r| is large, else the train-median drift."""
+    p = np.asarray(pred_r, dtype=np.float64)
+    y = np.asarray(r_on, dtype=np.float64)
+    ok = np.isfinite(p) & np.isfinite(y)
+    p, y = p[ok], y[ok]
+    mag = np.abs(p)
+    best = {"tau": float(np.quantile(mag, 0.70) if mag.size else 0.0), "a": float(a), "b": float(b), "b_up": float(b_up)}
+    if p.size < 16:
+        return best
+    best_key = (-1e9, 1e9)
+    for q in abs_quantiles:
+        tau = float(np.quantile(mag, float(q)))
+        hat = np.where(mag >= tau, apply_affine(p, a, b), b_up)
+        excess = _direction_excess(hat, y)
+        mae = float(np.mean(np.abs(hat - y)))
+        if not np.isfinite(excess):
+            continue
+        key = (excess, -mae)
+        if key > best_key:
+            best_key = key
+            best = {"tau": tau, "a": float(a), "b": float(b), "b_up": float(b_up), "q": float(q)}
+    return best
+
+
+def apply_confidence_blend(
+    pred_r: np.ndarray,
+    tau: float,
+    a: float,
+    b: float,
+    b_up: float,
+) -> np.ndarray:
+    p = np.asarray(pred_r, dtype=np.float64)
+    affine = apply_affine(p, a, b)
+    return np.where(np.abs(p) >= float(tau), affine, float(b_up))
+
+
+def _table_to_jsonable(table: dict[int, float]) -> dict[str, float]:
+    return {str(int(k)): float(v) for k, v in table.items()}
+
+
+def _table_from_spec(table: Any) -> dict[int, float]:
+    if not table:
+        return {}
+    out: dict[int, float] = {}
+    if isinstance(table, dict):
+        for k, v in table.items():
+            try:
+                out[int(k)] = float(v)
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def apply_calibrate_spec(
+    pred_r: np.ndarray,
+    spec: Mapping[str, Any] | None,
+    *,
+    dates: np.ndarray | None = None,
+    vol_level: np.ndarray | None = None,
+) -> np.ndarray:
+    """Apply a VAL-gated overnight readout spec to ``pred*sigma``.
+
+    Affine ``{a,b}`` stays the PR #9 generate.py contract. Other kinds are
+    train-only maps (veto, bins, weekday, piecewise) stored in calibrate JSON.
+    """
+    p = np.asarray(pred_r, dtype=np.float64)
+    if not spec:
+        return p
+    params = dict(spec)
+    nested = params.get("params")
+    if isinstance(nested, dict):
+        for k, v in nested.items():
+            params.setdefault(k, v)
+    kind = str(params.get("kind") or params.get("name") or "").strip().lower()
+    if kind in ("", "affine", "affine_l1", "affine_ols", "huber_affine", "residual_sigma"):
+        if params.get("a") is None and params.get("b") is None and kind != "residual_sigma":
+            return p
+        a = 1.0 if params.get("a") is None else float(params["a"])
+        b = 0.0 if params.get("b") is None else float(params["b"])
+        if kind == "residual_sigma":
+            a, b = 1.0, 0.0
+        return apply_affine(p, a, b)
+    if kind in ("zero_move",):
+        return np.zeros_like(p)
+    if kind in ("train_median_gap", "train_mean_gap", "recency_median"):
+        b = float(params.get("b") or params.get("default") or 0.0)
+        return np.full_like(p, b)
+    if kind in ("piecewise_l1", "piecewise"):
+        return apply_piecewise_l1(
+            p,
+            float(params.get("a_pos") or 0.0),
+            float(params.get("b_pos") or 0.0),
+            float(params.get("a_neg") or 0.0),
+            float(params.get("b_neg") or 0.0),
+        )
+    if kind in ("bin_calibrate", "vol_regime_gap"):
+        src = vol_level if kind == "vol_regime_gap" and vol_level is not None else p
+        edges = np.asarray(params.get("edges") or [-np.inf, np.inf], dtype=np.float64)
+        values = np.asarray(params.get("values") or [0.0], dtype=np.float64)
+        return apply_bin_constants(np.asarray(src, dtype=np.float64), edges, values)
+    if kind in ("drift_veto",):
+        return apply_drift_veto(
+            p,
+            float(params.get("tau") or 0.0),
+            float(params.get("a_dn") or 0.0),
+            float(params.get("b_dn") or 0.0),
+            float(params.get("b_up") or 0.0),
+        )
+    if kind in ("left_tail_l1",):
+        return apply_left_tail_l1(
+            p,
+            float(params.get("tau") or 0.0),
+            float(params.get("a_neg") or 0.0),
+            float(params.get("b_up") or 0.0),
+        )
+    if kind in ("confidence_blend",):
+        return apply_confidence_blend(
+            p,
+            float(params.get("tau") or 0.0),
+            float(params.get("a") or 0.0),
+            float(params.get("b") or 0.0),
+            float(params.get("b_up") or 0.0),
+        )
+    if kind in ("dow_gap", "dow_plus_residual"):
+        if dates is None:
+            b = float(params.get("default") or params.get("b") or 0.0)
+            dow = np.full_like(p, b)
+        else:
+            table = _table_from_spec(params.get("by_dow") or params.get("table"))
+            default = float(params.get("default") or 0.0)
+            dow = apply_group_median(weekday_of_dates(dates), table, default)
+        if kind == "dow_gap":
+            return dow
+        a = 0.0 if params.get("a") is None else float(params["a"])
+        b = 0.0 if params.get("b") is None else float(params["b"])
+        return dow + apply_affine(p, a, b)
+    if params.get("a") is not None or params.get("b") is not None:
+        a = 1.0 if params.get("a") is None else float(params["a"])
+        b = 0.0 if params.get("b") is None else float(params["b"])
+        return apply_affine(p, a, b)
+    return p
 
 
 def _restrict_aligned(
@@ -904,22 +1548,37 @@ def slim_accuracy(stats: dict[str, Any]) -> dict[str, float]:
             "cs_ic": float("nan"),
             "long_only_pct": float("nan"),
             "up_pct": float("nan"),
+            "excess_pp": float("nan"),
+            "z_vs_drift": float("nan"),
+            "lo_top20_up_pct": float("nan"),
+            "lo_top20_excess_pp": float("nan"),
         }
     direction = stats.get("direction") or {}
     overall = direction.get("overall") or {}
     pe = stats.get("price_error") or {}
     cs = stats.get("cs_ic") or {}
     long_only = direction.get("long_only_pred_positive") or {}
+    vs_drift = direction.get("overall_vs_drift") or {}
+    book = (stats.get("book") or {}).get("long_only_top20") or {}
+    dir_pct = _as_float(overall.get("hit_rate_pct"))
+    up_pct = _as_float(direction.get("realized_overnight_up_pct"))
+    excess = _as_float(vs_drift.get("excess_pp"))
+    if not np.isfinite(excess) and np.isfinite(dir_pct) and np.isfinite(up_pct):
+        excess = dir_pct - up_pct
     return {
         "n": _as_float(stats.get("n_samples"), 0.0),
-        "dir_pct": _as_float(overall.get("hit_rate_pct")),
+        "dir_pct": dir_pct,
         "dir_z": _as_float(overall.get("z_vs_half")),
         "mae_usd": _as_float((pe.get("dollars") or {}).get("mae")),
         "mae_pct": _as_float((pe.get("pct_of_prior_close") or {}).get("mae")),
         "zero_mae_pct": _as_float((pe.get("zero_pred_baseline_pct") or {}).get("mae")),
         "cs_ic": _as_float(cs.get("cs_ic")),
         "long_only_pct": _as_float(long_only.get("hit_rate_pct")),
-        "up_pct": _as_float(direction.get("realized_overnight_up_pct")),
+        "up_pct": up_pct,
+        "excess_pp": excess,
+        "z_vs_drift": _as_float(vs_drift.get("z_vs_p0")),
+        "lo_top20_up_pct": _as_float(book.get("up_pct")),
+        "lo_top20_excess_pp": _as_float(book.get("excess_pp")),
     }
 
 
@@ -1054,8 +1713,9 @@ def _pick_promoted(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "note": (
             "CS skip stays the ranking book. Accuracy default is a readout "
             "selected on locked VAL (direction lift vs residual*sigma AND vs "
-            "train-median drift, or % MAE below residual/zero/median). "
-            "TEST is report-only."
+            "train-median overnight-up drift, or % MAE below residual/zero/median). "
+            "TEST is report-only. Excess hit rate vs the unconditional up-rate is "
+            "the direction skill object — always-up is ~54.3% on liquid TEST."
         ),
         "cs_skip_unchanged": True,
         "val_dir_lift": DIR_LIFT,
@@ -1077,8 +1737,15 @@ def _year_direction(df: pd.DataFrame) -> list[dict[str, Any]]:
             sub["r_on"].to_numpy(dtype=np.float64),
         )
         inf = hit_rate_inference(hits)
+        r = sub["r_on"].to_numpy(dtype=np.float64)
+        moved = np.isfinite(r) & (r != 0.0)
+        up = float((r[moved] > 0).mean()) if int(moved.sum()) else float("nan")
+        vs = hit_rate_vs_p0(hits, up)
         inf["year"] = float(year)
         inf["n_dates"] = float(sub["date"].nunique())
+        inf["up_pct"] = float(100.0 * up) if np.isfinite(up) else float("nan")
+        inf["excess_pp"] = _as_float(vs.get("excess_pp"))
+        inf["z_vs_drift"] = _as_float(vs.get("z_vs_p0"))
         rows.append(inf)
     return rows
 
@@ -1116,8 +1783,8 @@ def format_ablation_table(ablate: dict[str, Any], promotion: dict[str, Any]) -> 
         f"promote_dir={promotion.get('direction')!r}  "
         f"promote_mae={promotion.get('price')!r}",
         f"  {promotion.get('note')}",
-        "  variant                         val dir%   val MAE%   test dir%  "
-        "test MAE%  test MAE$  vs PR8  gate",
+        "  variant                         val dir%  val xs pp  val MAE%  "
+        "test dir% test xs pp test MAE%  test MAE$  gate",
     ]
     for row in rows:
         name = str(row.get("name") or "")
@@ -1131,18 +1798,23 @@ def format_ablation_table(ablate: dict[str, Any], promotion: dict[str, Any]) -> 
         if row.get("promote"):
             gate.append("DEFAULT")
         mark = ",".join(gate) if gate else "no"
-        vs = ""
         lines.append(
             f"  {name:<30} {_as_float(v.get('dir_pct')):8.2f} "
+            f"{_as_float(v.get('excess_pp')):9.2f} "
             f"{100.0 * _as_float(v.get('mae_pct')):9.4f} "
             f"{_as_float(t.get('dir_pct')):9.2f} "
+            f"{_as_float(t.get('excess_pp')):9.2f} "
             f"{100.0 * _as_float(t.get('mae_pct')):9.4f} "
             f"{_as_float(t.get('mae_usd')):9.4f}  "
             f"{mark}"
         )
     lines.append(
-        "  PR#8 locked TEST reference: 51.1% dir / $1.17 / 0.686% MAE "
-        "(same window; residual*sigma)."
+        "  xs pp = direction excess vs that split's overnight-up rate (always-up). "
+        "PR#8 locked TEST residual*sigma: 51.1% dir / $1.17 / 0.686% MAE."
+    )
+    lines.append(
+        "  Honest drift baseline is train_median_gap (~54.3% on liquid TEST). "
+        "Promote dir only if VAL beats that by ≥0.2 pp."
     )
     return "\n".join(lines)
 
@@ -1160,6 +1832,7 @@ def format_confidence_block(conf: dict[str, Any]) -> str:
             f"  |pred_r|>={key} thr={float(row.get('threshold') or float('nan')):.6f}  "
             f"cover={100.0 * float(row.get('coverage') or float('nan')):.1f}%  "
             f"dir={float(row.get('dir_pct') or float('nan')):.1f}%  "
+            f"excess={float(row.get('excess_pp') or float('nan')):+.2f}pp  "
             f"MAE%={100.0 * float(row.get('mae_pct') or float('nan')):.4f}"
         )
     return "\n".join(lines)
@@ -1173,7 +1846,10 @@ def format_year_slices(years: list[dict[str, Any]], title: str | None = None) ->
     for row in years:
         lines.append(
             f"  {int(row.get('year', 0))}: dir={float(row.get('hit_rate_pct') or float('nan')):.1f}% "
-            f"n={int(row.get('n') or 0)} z={float(row.get('z_vs_half') or float('nan')):.2f}"
+            f"up={float(row.get('up_pct') or float('nan')):.1f}% "
+            f"excess={float(row.get('excess_pp') or float('nan')):+.2f}pp "
+            f"n={int(row.get('n') or 0)} z50={float(row.get('z_vs_half') or float('nan')):.2f} "
+            f"z_drift={float(row.get('z_vs_drift') or float('nan')):.2f}"
         )
     return "\n".join(lines)
 
@@ -1277,6 +1953,71 @@ def evaluate_overnight_accuracy(
     a_sgn, b_sgn_aff = fit_affine_l1(_sgn(xtr), train_r)
     date_tr = predict_date_level(xtr, tr["date"].to_numpy(dtype=np.int64), w_date, b_date)
     a_hy, b_hy = fit_affine_l1(date_tr + train_pred_r, train_r)
+    a_huber, b_huber = fit_affine_huber(train_pred_r, train_r)
+    a_pos, b_pos, a_neg, b_neg = fit_piecewise_l1(train_pred_r, train_r)
+    bin_edges, bin_vals = fit_bin_constants(train_pred_r, train_r, n_bins=7)
+    veto = fit_drift_veto(train_pred_r, train_r)
+    left_tail = fit_left_tail_l1(train_pred_r, train_r)
+    blend = fit_confidence_blend(train_pred_r, train_r, a_l1, b_l1, mu_med)
+    dow_table, dow_default = fit_group_median(
+        train_r, weekday_of_dates(tr["date"].to_numpy(dtype=np.int64))
+    )
+    train_dow = apply_group_median(
+        weekday_of_dates(tr["date"].to_numpy(dtype=np.int64)), dow_table, dow_default
+    )
+    a_dow, b_dow = fit_affine_l1(train_pred_r, train_r - train_dow)
+    rec_w = recency_weights(tr["date"].to_numpy(dtype=np.int64), halflife_years=6.0)
+    rec_med = weighted_median(train_r, rec_w)
+    a_rec, b_rec = fit_affine_l1(train_pred_r, train_r, weights=rec_w)
+    vol_tr = tr["vol_level"].to_numpy(dtype=np.float64) if "vol_level" in tr.columns else train_pred_r
+    vol_edges, vol_vals = fit_bin_constants(vol_tr, train_r, n_bins=3)
+
+    def _dow_mu(frame: pd.DataFrame) -> np.ndarray:
+        if "weekday" in frame.columns:
+            wd = frame["weekday"].to_numpy(dtype=np.int64)
+        else:
+            wd = weekday_of_dates(frame["date"].to_numpy(dtype=np.int64))
+        return apply_group_median(wd, dow_table, dow_default)
+
+    def _vol_mu(frame: pd.DataFrame) -> np.ndarray:
+        if "vol_level" in frame.columns:
+            return apply_bin_constants(
+                frame["vol_level"].to_numpy(dtype=np.float64), vol_edges, vol_vals
+            )
+        return np.full(len(frame), mu_med, dtype=np.float64)
+
+    piecewise_spec = {
+        "kind": "piecewise_l1",
+        "a_pos": a_pos,
+        "b_pos": b_pos,
+        "a_neg": a_neg,
+        "b_neg": b_neg,
+    }
+    bin_spec = {
+        "kind": "bin_calibrate",
+        "edges": bin_edges.tolist(),
+        "values": bin_vals.tolist(),
+    }
+    veto_spec = {"kind": "drift_veto", **veto}
+    left_spec = {"kind": "left_tail_l1", **left_tail}
+    blend_spec = {"kind": "confidence_blend", **blend}
+    dow_spec = {
+        "kind": "dow_gap",
+        "by_dow": _table_to_jsonable(dow_table),
+        "default": dow_default,
+    }
+    dow_res_spec = {
+        "kind": "dow_plus_residual",
+        "by_dow": _table_to_jsonable(dow_table),
+        "default": dow_default,
+        "a": a_dow,
+        "b": b_dow,
+    }
+    vol_spec = {
+        "kind": "vol_regime_gap",
+        "edges": vol_edges.tolist(),
+        "values": vol_vals.tolist(),
+    }
 
     variants: list[tuple[str, str, dict[str, Any], Any, Any]] = [
         (
@@ -1374,6 +2115,143 @@ def evaluate_overnight_accuracy(
                 bb,
             ),
         ),
+        (
+            "huber_affine",
+            "calibrate",
+            {"kind": "huber_affine", "a": a_huber, "b": b_huber},
+            lambda d, x, a=a_huber, bb=b_huber: apply_affine(
+                d["pred_r"].to_numpy(dtype=np.float64), a, bb
+            ),
+            lambda d, x, a=a_huber, bb=b_huber: apply_affine(
+                d["pred_r"].to_numpy(dtype=np.float64), a, bb
+            ),
+        ),
+        (
+            "piecewise_l1",
+            "calibrate",
+            piecewise_spec,
+            lambda d, x, spec=piecewise_spec: apply_piecewise_l1(
+                d["pred_r"].to_numpy(dtype=np.float64),
+                spec["a_pos"],
+                spec["b_pos"],
+                spec["a_neg"],
+                spec["b_neg"],
+            ),
+            lambda d, x, spec=piecewise_spec: apply_piecewise_l1(
+                d["pred_r"].to_numpy(dtype=np.float64),
+                spec["a_pos"],
+                spec["b_pos"],
+                spec["a_neg"],
+                spec["b_neg"],
+            ),
+        ),
+        (
+            "bin_calibrate",
+            "calibrate",
+            bin_spec,
+            lambda d, x, e=bin_edges, v=bin_vals: apply_bin_constants(
+                d["pred_r"].to_numpy(dtype=np.float64), e, v
+            ),
+            lambda d, x, e=bin_edges, v=bin_vals: apply_bin_constants(
+                d["pred_r"].to_numpy(dtype=np.float64), e, v
+            ),
+        ),
+        (
+            "drift_veto",
+            "direction",
+            veto_spec,
+            lambda d, x, spec=veto: apply_drift_veto(
+                d["pred_r"].to_numpy(dtype=np.float64),
+                spec["tau"],
+                spec["a_dn"],
+                spec["b_dn"],
+                spec["b_up"],
+            ),
+            lambda d, x, spec=veto: apply_drift_veto(
+                d["pred_r"].to_numpy(dtype=np.float64),
+                spec["tau"],
+                spec["a_dn"],
+                spec["b_dn"],
+                spec["b_up"],
+            ),
+        ),
+        (
+            "left_tail_l1",
+            "calibrate",
+            left_spec,
+            lambda d, x, spec=left_tail: apply_left_tail_l1(
+                d["pred_r"].to_numpy(dtype=np.float64),
+                spec["tau"],
+                spec["a_neg"],
+                spec["b_up"],
+            ),
+            lambda d, x, spec=left_tail: apply_left_tail_l1(
+                d["pred_r"].to_numpy(dtype=np.float64),
+                spec["tau"],
+                spec["a_neg"],
+                spec["b_up"],
+            ),
+        ),
+        (
+            "confidence_blend",
+            "direction",
+            blend_spec,
+            lambda d, x, spec=blend: apply_confidence_blend(
+                d["pred_r"].to_numpy(dtype=np.float64),
+                spec["tau"],
+                spec["a"],
+                spec["b"],
+                spec["b_up"],
+            ),
+            lambda d, x, spec=blend: apply_confidence_blend(
+                d["pred_r"].to_numpy(dtype=np.float64),
+                spec["tau"],
+                spec["a"],
+                spec["b"],
+                spec["b_up"],
+            ),
+        ),
+        (
+            "dow_gap",
+            "calendar",
+            dow_spec,
+            lambda d, x: _dow_mu(d),
+            lambda d, x: _dow_mu(d),
+        ),
+        (
+            "dow_plus_residual",
+            "hybrid",
+            dow_res_spec,
+            lambda d, x, a=a_dow, bb=b_dow: _dow_mu(d)
+            + apply_affine(d["pred_r"].to_numpy(dtype=np.float64), a, bb),
+            lambda d, x, a=a_dow, bb=b_dow: _dow_mu(d)
+            + apply_affine(d["pred_r"].to_numpy(dtype=np.float64), a, bb),
+        ),
+        (
+            "vol_regime_gap",
+            "regime",
+            vol_spec,
+            lambda d, x: _vol_mu(d),
+            lambda d, x: _vol_mu(d),
+        ),
+        (
+            "recency_median",
+            "regime",
+            {"kind": "recency_median", "b": rec_med, "halflife_years": 6.0},
+            lambda d, x, m=rec_med: np.full(len(d), m, dtype=np.float64),
+            lambda d, x, m=rec_med: np.full(len(d), m, dtype=np.float64),
+        ),
+        (
+            "recency_affine_l1",
+            "calibrate",
+            {"kind": "affine", "a": a_rec, "b": b_rec, "halflife_years": 6.0},
+            lambda d, x, a=a_rec, bb=b_rec: apply_affine(
+                d["pred_r"].to_numpy(dtype=np.float64), a, bb
+            ),
+            lambda d, x, a=a_rec, bb=b_rec: apply_affine(
+                d["pred_r"].to_numpy(dtype=np.float64), a, bb
+            ),
+        ),
     ]
 
     val_base = slim_accuracy(score_eval_frame(va, min_names=min_names))
@@ -1441,12 +2319,20 @@ def evaluate_overnight_accuracy(
         "calibrators": {
             "affine_ols": {"a": a_ols, "b": b_ols},
             "affine_l1": {"a": a_l1, "b": b_l1},
+            "huber_affine": {"a": a_huber, "b": b_huber},
             "train_median_gap": mu_med,
             "train_mean_gap": mu_mean,
             "hedge_mean": hedge_mu,
             "sign_affine": {"a": a_sgn, "b": b_sgn_aff},
             "hybrid_affine": {"a": a_hy, "b": b_hy},
             "ts_ridge_train_ic": float(ic_ts),
+            "drift_veto": veto,
+            "left_tail_l1": left_tail,
+            "confidence_blend": blend,
+            "piecewise_l1": piecewise_spec,
+            "bin_calibrate": bin_spec,
+            "dow_gap": dow_spec,
+            "recency_median": rec_med,
         },
     }
     payload["promotion"] = promotion
@@ -1457,14 +2343,20 @@ def evaluate_overnight_accuracy(
         "train_mean_gap": (0.0, mu_mean),
         "affine_ols": (a_ols, b_ols),
         "affine_l1": (a_l1, b_l1),
+        "huber_affine": (a_huber, b_huber),
         "residual_plus_hedge_mean": (1.0, hedge_mu),
+        "recency_median": (0.0, rec_med),
+        "recency_affine_l1": (a_rec, b_rec),
     }.get(default_name)
+    default_params = next((r["params"] for r in rows if r["name"] == default_name), {})
     payload["calibrate"] = {
         "name": default_name,
+        "kind": str(default_params.get("kind") or default_name),
         "a": None if residual_affine is None else residual_affine[0],
         "b": None if residual_affine is None else residual_affine[1],
         "applies_to": "pred*sigma residual overnight log-return (generate.py --calibrate-json)",
-        "params": next((r["params"] for r in rows if r["name"] == default_name), {}),
+        "params": default_params,
+        **({k: v for k, v in default_params.items() if k != "params"}),
     }
     # Train quantiles of the chosen readout. Thresholds are not fit on test.
     train_default = {
@@ -1479,6 +2371,23 @@ def evaluate_overnight_accuracy(
         "ts_ridge_no_long_ts": _ts_cs(xtr),
         "sign_ridge_calibrated": apply_affine(_sgn(xtr), a_sgn, b_sgn_aff),
         "date_plus_residual": apply_affine(date_tr + train_pred_r, a_hy, b_hy),
+        "huber_affine": apply_affine(train_pred_r, a_huber, b_huber),
+        "piecewise_l1": apply_piecewise_l1(train_pred_r, a_pos, b_pos, a_neg, b_neg),
+        "bin_calibrate": apply_bin_constants(train_pred_r, bin_edges, bin_vals),
+        "drift_veto": apply_drift_veto(
+            train_pred_r, veto["tau"], veto["a_dn"], veto["b_dn"], veto["b_up"]
+        ),
+        "left_tail_l1": apply_left_tail_l1(
+            train_pred_r, left_tail["tau"], left_tail["a_neg"], left_tail["b_up"]
+        ),
+        "confidence_blend": apply_confidence_blend(
+            train_pred_r, blend["tau"], blend["a"], blend["b"], blend["b_up"]
+        ),
+        "dow_gap": train_dow,
+        "dow_plus_residual": train_dow + apply_affine(train_pred_r, a_dow, b_dow),
+        "vol_regime_gap": apply_bin_constants(vol_tr, vol_edges, vol_vals),
+        "recency_median": np.full_like(train_pred_r, rec_med),
+        "recency_affine_l1": apply_affine(train_pred_r, a_rec, b_rec),
     }.get(default_name, train_pred_r)
     payload["confidence"] = _confidence_block(
         te, default_pr_test, train_abs=train_default, min_names=min_names

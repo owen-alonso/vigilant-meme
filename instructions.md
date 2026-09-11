@@ -72,7 +72,8 @@ python -m forecast.training --universe liquid --interval daily --skip-only \
 python scripts/overnight_accuracy.py --data-dir data --universe liquid \
     --json checkpoints/forecast_ridge_overnight/accuracy.json \
     --calibrate-json checkpoints/forecast_ridge_overnight/overnight_calibrate.json
-# optional: apply VAL-gated affine to generate.py prices
+# optional: apply VAL-gated overnight readout to generate.py prices
+# (affine {a,b} or drift_veto / bin / weekday spec from overnight_calibrate.json)
 python -m forecast.generate --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
     --calibrate-json checkpoints/forecast_ridge_overnight/overnight_calibrate.json
 

@@ -85,13 +85,18 @@ def forecast_panel(
     pred_norm = np.asarray(preds, dtype=np.float64)
     pred_log_return = pred_norm * scale
     cal = state.get("overnight_calibrate") or {}
-    if cal.get("a") is not None or cal.get("b") is not None:
-        from forecast.accuracy import apply_affine
+    if cal:
+        from forecast.accuracy import apply_calibrate_spec
+        from forecast.data import _date_keys
 
-        pred_log_return = apply_affine(
-            pred_log_return,
-            1.0 if cal.get("a") is None else float(cal["a"]),
-            0.0 if cal.get("b") is None else float(cal["b"]),
+        dates = None
+        vol = None
+        if "datetime" in rows.columns:
+            dates = _date_keys(pd.DataFrame({"datetime": rows["datetime"]}))
+        if "vol_level" in rows.columns:
+            vol = rows["vol_level"].to_numpy(dtype=np.float64)
+        pred_log_return = apply_calibrate_spec(
+            pred_log_return, cal, dates=dates, vol_level=vol
         )
     close = rows["close"].to_numpy(dtype=np.float64)
 
@@ -431,8 +436,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument(
         "--calibrate-json",
         default="",
-        help="optional overnight affine {a,b} from scripts/overnight_accuracy.py "
-        "(r_on_hat = a * pred*sigma + b). Empty keeps residual*sigma.",
+        help="optional overnight readout spec from scripts/overnight_accuracy.py "
+        "(affine {a,b} or drift_veto/bin/dow kinds). Empty keeps residual*sigma.",
     )
     args = p.parse_args(argv)
 
