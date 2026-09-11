@@ -32,6 +32,7 @@ from forecast.overnight import (
     LIVE_BUNDLE,
     LIVE_LOCATE_BUNDLE,
     LIVE_LONG_ONLY_BUNDLE,
+    LS_HAIRCUT_EXPERIMENT,
     OVERNIGHT_FORMULA,
     PAPER_BUNDLE,
     formula_log_line,
@@ -41,6 +42,9 @@ from forecast.overnight import (
 SHORT_EXCESS_LIFT_PP = 100.0 * float(DIR_LIFT)  # 0.2 pp
 # Unlevered net IR: LS must beat long-only by this much on VAL.
 IR_LIFT = 0.05
+# Long-only book: VAL IR lift vs live_long_only q20, and max-DD not much worse.
+LO_IR_LIFT = 0.05
+LO_DD_TOL = 0.05
 
 _BOOK_COST_KEYS = (
     "round_trip_bps",
@@ -89,9 +93,12 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/be
 # unconstrained shorts (old live; not the honest default)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --cost-bundle live --compare-long-only
-# long-only live (no locate, borrow=0)
+# long-only live (no locate, borrow=0) — this is the default live book
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only
+# VAL-gated LS haircut experiment (NOT default): HTB shorts at half size, short NAV 0.30
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
+  --holding overnight --live-costs --ls-haircut-experiment
 """
 
 
@@ -158,11 +165,14 @@ def _run_overnight_book(
     locate_haircut: float = 1.0,
     locate_frac: float = 1.0,
     max_short_gross: float = 0.5,
+    weighting: str = "quantile",
+    adv_floor_pctile: float = 0.0,
 ) -> dict[str, Any]:
     stats = book_pnl(
         pred,
         y,
         quantile=float(quantile),
+        weighting=str(weighting),
         holding="overnight",
         hold_halflife=0.0,
         vol_target=float(vol_target),
@@ -173,6 +183,7 @@ def _run_overnight_book(
         locate_haircut=float(locate_haircut),
         locate_frac=float(locate_frac),
         max_short_gross=float(max_short_gross),
+        adv_floor_pctile=float(adv_floor_pctile),
         overnight_r=overnight_r,
         turnover_z=turnover_z,
         vol_level=vol_level,
@@ -270,6 +281,194 @@ def val_knob_grid(
         "best": dict(rows[0]) if rows else {},
         "best_ls": dict(ls_rows[0]) if ls_rows else {},
         "lo_best": dict(lo_rows[0]) if lo_rows else {},
+        "experiment": dict(LS_HAIRCUT_EXPERIMENT),
+    }
+
+
+def _lo_row_name(weighting: str, quantile: float, adv_floor: float) -> str:
+    if str(weighting) == "rank":
+        return f"lo_rank_adv{int(100 * adv_floor)}"
+    return f"lo_q{int(100 * quantile)}_adv{int(100 * adv_floor)}"
+
+
+def val_long_only_grid(
+    df: pd.DataFrame,
+    *,
+    min_names: int,
+    vol_target: float = 0.15,
+) -> dict[str, Any]:
+    """VAL-only live_long_only grid: quantile, rank, ADV floor. TEST never enters."""
+    empty = {"rows": [], "best": {}, "baseline": {}, "spec": {}}
+    if df.empty:
+        return empty
+    pred = frame_to_wide(df, "pred")
+    y = frame_to_wide(df, "y")
+    r_on = frame_to_wide(df, "r_on")
+    tz = frame_to_wide(df, "turnover_z") if "turnover_z" in df.columns else None
+    vol = frame_to_wide(df, "vol_level") if "vol_level" in df.columns else None
+    if pred.empty or pred.shape[1] < 2:
+        return empty
+    specs: list[tuple[str, float, float]] = []
+    for q in (0.10, 0.15, 0.20, 0.30):
+        for adv in (0.0, 0.33, 0.67):
+            specs.append(("quantile", q, adv))
+    for adv in (0.0, 0.33, 0.67):
+        specs.append(("rank", 0.2, adv))
+    rows: list[dict[str, Any]] = []
+    baseline: dict[str, Any] = {}
+    for weighting, q, adv in specs:
+        floor_min = int(min_names)
+        if adv > 0:
+            floor_min = max(5, min(int(min_names), 8))
+        stats = _run_overnight_book(
+            pred,
+            y,
+            bundle=LIVE_LONG_ONLY_BUNDLE,
+            long_only=True,
+            min_names=floor_min,
+            vol_target=vol_target,
+            overnight_r=r_on,
+            turnover_z=tz,
+            vol_level=vol,
+            quantile=q,
+            weighting=weighting,
+            adv_floor_pctile=adv,
+        )
+        row = {
+            "name": _lo_row_name(weighting, q, adv),
+            "kind": "long_only",
+            "weighting": weighting,
+            "quantile": q,
+            "adv_floor_pctile": adv,
+            "min_names": floor_min,
+            "unlevered_net_ir": stats.get("unlevered_net_ir"),
+            "unlevered_max_dd": stats.get("unlevered_max_dd"),
+            "mean_cost_unlev_bp": stats.get("mean_cost_unlev_bp"),
+            "mean_long_nav": stats.get("mean_long_nav"),
+            "n_dates": stats.get("n_dates"),
+        }
+        rows.append(row)
+        if weighting == "quantile" and abs(q - 0.2) < 1e-12 and adv == 0.0:
+            baseline = dict(row)
+    rows.sort(
+        key=lambda r: (
+            -_as_float(r.get("unlevered_net_ir"), default=-1e9),
+            _as_float(r.get("unlevered_max_dd"), default=-1e9),
+            str(r.get("name")),
+        )
+    )
+    return {
+        "rows": rows,
+        "best": dict(rows[0]) if rows else {},
+        "baseline": baseline,
+    }
+
+
+def decide_lo_promote(grid: dict[str, Any]) -> dict[str, Any]:
+    """VAL-only. Promote a long-only spec vs live_long_only q20 / adv0."""
+    baseline = dict(grid.get("baseline") or {})
+    best = dict(grid.get("best") or {})
+    ir_base = _as_float(baseline.get("unlevered_net_ir"))
+    ir_best = _as_float(best.get("unlevered_net_ir"))
+    dd_base = _as_float(baseline.get("unlevered_max_dd"))
+    dd_best = _as_float(best.get("unlevered_max_dd"))
+    ir_delta = (
+        float(ir_best - ir_base)
+        if np.isfinite(ir_best) and np.isfinite(ir_base)
+        else float("nan")
+    )
+    dd_delta = (
+        float(dd_best - dd_base)
+        if np.isfinite(dd_best) and np.isfinite(dd_base)
+        else float("nan")
+    )
+    same = str(best.get("name") or "") == str(baseline.get("name") or "")
+    ir_ok = bool(np.isfinite(ir_delta) and ir_delta >= LO_IR_LIFT)
+    dd_ok = bool(not np.isfinite(dd_delta) or dd_delta >= -LO_DD_TOL)
+    promote = bool(ir_ok and dd_ok and not same)
+    spec = {
+        "weighting": baseline.get("weighting", "quantile"),
+        "quantile": baseline.get("quantile", 0.2),
+        "adv_floor_pctile": baseline.get("adv_floor_pctile", 0.0),
+    }
+    if promote:
+        spec = {
+            "weighting": best.get("weighting", "quantile"),
+            "quantile": best.get("quantile", 0.2),
+            "adv_floor_pctile": best.get("adv_floor_pctile", 0.0),
+        }
+        reason = (
+            f"PROMOTE long-only {best.get('name')}: VAL unlev net IR "
+            f"{ir_best:+.3f} vs q20 {ir_base:+.3f} (delta {ir_delta:+.3f} >= "
+            f"{LO_IR_LIFT:.2f}) and max DD {dd_best:+.3f} vs {dd_base:+.3f}."
+        )
+    elif same or not ir_ok:
+        reason = (
+            "NO LIFT: no long-only VAL spec beats live_long_only q20 by "
+            f"{LO_IR_LIFT:.2f} unlev net IR "
+            f"(best {best.get('name')} {ir_best:+.3f} vs q20 {ir_base:+.3f}, "
+            f"delta {ir_delta:+.3f}). Keep q20 / adv0."
+        )
+    else:
+        reason = (
+            f"NO PROMOTE: {best.get('name')} IR lift {ir_delta:+.3f} but max DD "
+            f"{dd_best:+.3f} is worse than q20 {dd_base:+.3f} by more than "
+            f"{LO_DD_TOL:.2f}. Keep q20 / adv0."
+        )
+    return {
+        "promote_lo": promote,
+        "gated_on": "val",
+        "reason": reason,
+        "baseline": baseline,
+        "best": best,
+        "spec": spec,
+        "ir_delta": ir_delta,
+        "dd_delta": dd_delta,
+        "ir_lift": LO_IR_LIFT,
+        "dd_tol": LO_DD_TOL,
+    }
+
+
+def decide_ls_experiment(val: dict[str, Any], experiment_book: dict[str, Any]) -> dict[str, Any]:
+    """VAL-only haircut experiment. Never changes the default live book."""
+    lo = (val.get("books") or {}).get("live_long_only") or {}
+    ir_ls = _as_float(experiment_book.get("unlevered_net_ir"))
+    ir_lo = _as_float(lo.get("unlevered_net_ir"))
+    ir_delta = (
+        float(ir_ls - ir_lo)
+        if np.isfinite(ir_ls) and np.isfinite(ir_lo)
+        else float("nan")
+    )
+    short = (val.get("sleeves") or {}).get("short_bottom20") or {}
+    short_excess = _as_float(short.get("excess_pp"))
+    short_skill = bool(np.isfinite(short_excess) and short_excess >= SHORT_EXCESS_LIFT_PP)
+    beats = bool(short_skill and np.isfinite(ir_delta) and ir_delta >= IR_LIFT)
+    return {
+        "name": "ls_haircut_experiment",
+        "gated_on": "val",
+        "promote_as_default": False,
+        "would_beat_long_only_on_val": beats,
+        "reason": (
+            "EXPERIMENT ONLY (not default). "
+            + (
+                f"Haircut 0.5 / short NAV 0.30 beats long-only on VAL "
+                f"(unlev net IR {ir_ls:+.3f} vs {ir_lo:+.3f}, delta {ir_delta:+.3f}). "
+                "Keep live_locate skip as the honest default until liquid VAL agrees."
+                if beats
+                else (
+                    f"Haircut 0.5 / short NAV 0.30 does not beat long-only on VAL "
+                    f"(unlev net IR {ir_ls:+.3f} vs {ir_lo:+.3f}, delta {ir_delta:+.3f})."
+                )
+            )
+        ),
+        "spec": dict(LS_HAIRCUT_EXPERIMENT),
+        "unlevered_net_ir": ir_ls,
+        "ir_lo_unlev_net": ir_lo,
+        "ir_delta": ir_delta,
+        "unlevered_max_dd": experiment_book.get("unlevered_max_dd"),
+        "mean_cost_unlev_bp": experiment_book.get("mean_cost_unlev_bp"),
+        "mean_short_nav": experiment_book.get("mean_short_nav"),
+        "short_skill": short_skill,
     }
 
 
@@ -423,6 +622,62 @@ def evaluate_overnight_shorting(
     test = split_shorting_metrics(frames["test"], min_names=min_names, vol_target=vol_target)
     promo = decide_ls_promote(val)
     grid = val_knob_grid(frames["val"], min_names=min_names, vol_target=vol_target)
+    lo_grid = val_long_only_grid(frames["val"], min_names=min_names, vol_target=vol_target)
+    lo_promo = decide_lo_promote(lo_grid)
+    exp_book = {}
+    if not frames["val"].empty:
+        pred = frame_to_wide(frames["val"], "pred")
+        y = frame_to_wide(frames["val"], "y")
+        r_on = frame_to_wide(frames["val"], "r_on")
+        tz = frame_to_wide(frames["val"], "turnover_z") if "turnover_z" in frames["val"].columns else None
+        vol = frame_to_wide(frames["val"], "vol_level") if "vol_level" in frames["val"].columns else None
+        if len(pred) and pred.shape[1] >= 2:
+            exp_book = _run_overnight_book(
+                pred,
+                y,
+                bundle=LIVE_LOCATE_BUNDLE,
+                long_only=False,
+                min_names=min_names,
+                vol_target=vol_target,
+                overnight_r=r_on,
+                turnover_z=tz,
+                vol_level=vol,
+                quantile=float(LS_HAIRCUT_EXPERIMENT["quantile"]),
+                locate_haircut=float(LS_HAIRCUT_EXPERIMENT["locate_haircut"]),
+                max_short_gross=float(LS_HAIRCUT_EXPERIMENT["max_short_gross"]),
+            )
+    ls_exp = decide_ls_experiment(val, exp_book)
+    test_lo_promoted = {}
+    spec = lo_promo.get("spec") or {}
+    if frames["test"].empty is False and spec:
+        pred_t = frame_to_wide(frames["test"], "pred")
+        y_t = frame_to_wide(frames["test"], "y")
+        r_t = frame_to_wide(frames["test"], "r_on")
+        tz_t = (
+            frame_to_wide(frames["test"], "turnover_z")
+            if "turnover_z" in frames["test"].columns
+            else None
+        )
+        vol_t = (
+            frame_to_wide(frames["test"], "vol_level")
+            if "vol_level" in frames["test"].columns
+            else None
+        )
+        if len(pred_t) and pred_t.shape[1] >= 2:
+            test_lo_promoted = _run_overnight_book(
+                pred_t,
+                y_t,
+                bundle=LIVE_LONG_ONLY_BUNDLE,
+                long_only=True,
+                min_names=min_names,
+                vol_target=vol_target,
+                overnight_r=r_t,
+                turnover_z=tz_t,
+                vol_level=vol_t,
+                quantile=float(spec.get("quantile") or 0.2),
+                weighting=str(spec.get("weighting") or "quantile"),
+                adv_floor_pctile=float(spec.get("adv_floor_pctile") or 0.0),
+            )
     cuts: dict[str, Any] = {}
     if bundle.get("meta"):
         cuts = {
@@ -445,13 +700,19 @@ def evaluate_overnight_shorting(
         "val": val,
         "test": test,
         "val_grid": grid,
+        "val_long_only_grid": lo_grid,
         "promotion": promo,
+        "lo_promotion": lo_promo,
+        "ls_experiment": ls_exp,
+        "test_long_only_promoted": test_lo_promoted,
         "desktop_commands": DESKTOP_COMMANDS,
     }
 
 
 def format_shorting_report(payload: dict[str, Any]) -> str:
     promo = payload.get("promotion") or {}
+    lo_promo = payload.get("lo_promotion") or {}
+    ls_exp = payload.get("ls_experiment") or {}
     lines = [
         "OVERNIGHT LONG-SHORT vs LONG-ONLY (VAL gate, TEST report-only)",
         f"  recipe: {payload.get('recipe')}  {payload.get('levers')}",
@@ -460,17 +721,78 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
         "",
         _split_block("LOCKED VAL (gate)", payload.get("val") or {}),
         "",
-        f"PROMOTE? {'YES' if promo.get('promote_ls') else 'NO'}",
+        f"PROMOTE LS? {'YES' if promo.get('promote_ls') else 'NO'}",
         f"  default live book = {promo.get('default_book')}",
         f"  {promo.get('reason')}",
+        "",
+        f"PROMOTE LONG-ONLY KNOBS? {'YES' if lo_promo.get('promote_lo') else 'NO'}",
+        f"  spec = {lo_promo.get('spec')}",
+        f"  {lo_promo.get('reason')}",
+        "",
+        _lo_grid_block(payload.get("val_long_only_grid") or {}),
+        "",
+        f"LS HAIRCUT EXPERIMENT (not default)  would_beat_LO_on_VAL="
+        f"{ls_exp.get('would_beat_long_only_on_val')}",
+        f"  spec = {ls_exp.get('spec')}  "
+        f"IR {_fmt(ls_exp.get('unlevered_net_ir'), '+.3f')}  "
+        f"vs LO {_fmt(ls_exp.get('ir_lo_unlev_net'), '+.3f')}  "
+        f"delta {_fmt(ls_exp.get('ir_delta'), '+.3f')}  "
+        f"maxDD {_fmt(ls_exp.get('unlevered_max_dd'), '+.3f')}  "
+        f"cost {_fmt(ls_exp.get('mean_cost_unlev_bp'), '.1f')} bp  "
+        f"short NAV {_fmt(ls_exp.get('mean_short_nav'), '.3f')}",
+        f"  {ls_exp.get('reason')}",
         "",
         _grid_block(payload.get("val_grid") or {}),
         "",
         _split_block("LOCKED TEST (report-only; not a gate)", payload.get("test") or {}),
-        "",
-        "DESKTOP (Yahoo liquid tape — cloud VM has none):",
-        DESKTOP_COMMANDS.rstrip(),
     ]
+    test_lo = payload.get("test_long_only_promoted") or {}
+    if test_lo:
+        lines.extend(
+            [
+                "",
+                "TEST long-only promoted spec (report-only)",
+                f"  unlev net IR {_fmt(test_lo.get('unlevered_net_ir'), '+.3f')}  "
+                f"maxDD {_fmt(test_lo.get('unlevered_max_dd'), '+.3f')}  "
+                f"cost {_fmt(test_lo.get('mean_cost_unlev_bp'), '.1f')} bp  "
+                f"q={test_lo.get('quantile')}  weighting={test_lo.get('weighting')}  "
+                f"adv_floor={test_lo.get('adv_floor_pctile')}",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "DESKTOP (Yahoo liquid tape — cloud VM has none):",
+            DESKTOP_COMMANDS.rstrip(),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _lo_grid_block(grid: dict[str, Any]) -> str:
+    rows = list(grid.get("rows") or [])
+    best = grid.get("best") or {}
+    base = grid.get("baseline") or {}
+    lines = [
+        "VAL LONG-ONLY GRID (live_long_only; quantile/rank/ADV floor; not a TEST look)",
+        f"  baseline q20 adv0 = {base.get('name')}  "
+        f"IR {_fmt(base.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(base.get('unlevered_max_dd'), '+.3f')}  "
+        f"cost {_fmt(base.get('mean_cost_unlev_bp'), '.1f')} bp",
+        f"  best = {best.get('name')}  "
+        f"IR {_fmt(best.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(best.get('unlevered_max_dd'), '+.3f')}",
+        "  name                    IR      maxDD   cost bp",
+    ]
+    for row in rows[:8]:
+        lines.append(
+            f"  {str(row.get('name')):<22}  "
+            f"{_fmt(row.get('unlevered_net_ir'), '+.3f'):>7}  "
+            f"{_fmt(row.get('unlevered_max_dd'), '+.3f'):>7}  "
+            f"{_fmt(row.get('mean_cost_unlev_bp'), '.1f'):>7}"
+        )
+    if len(rows) > 8:
+        lines.append(f"  ... {len(rows) - 8} more rows in JSON")
     return "\n".join(lines)
 
 

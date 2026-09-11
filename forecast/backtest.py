@@ -34,6 +34,7 @@ from forecast.overnight import (
     overnight_cost_breakdown,
     overnight_one_way_turnover,
     resolve_cost_bundle,
+    LS_HAIRCUT_EXPERIMENT,
 )
 from forecast.generate import (
     forecast_panel,
@@ -879,6 +880,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="cap short NAV after locate (default 0.5 = dollar-neutral short leg)",
     )
     p.add_argument(
+        "--ls-haircut-experiment",
+        action="store_true",
+        help="VAL-gated experiment (NOT default): locate_haircut=0.5 and "
+        "max_short_gross=0.3 on live_locate. Ignored with --long-only. "
+        "Default remains skip HTB shorts (haircut=1, short NAV 0.5).",
+    )
+    p.add_argument(
         "--ex-post-gap-k",
         type=float,
         default=None,
@@ -1036,6 +1044,18 @@ def main(argv: list[str] | None = None) -> int:
         else None
     )
     ppy = 252.0 if data_cfg.is_daily() else (52.0 if data_cfg.interval == "weekly" else 12.0)
+    haircut = float(args.locate_haircut) if args.locate_haircut is not None else 1.0
+    short_cap = float(args.max_short_gross) if args.max_short_gross is not None else 0.5
+    if bool(getattr(args, "ls_haircut_experiment", False)) and not args.long_only:
+        if args.locate_haircut is None:
+            haircut = float(LS_HAIRCUT_EXPERIMENT["locate_haircut"])
+        if args.max_short_gross is None:
+            short_cap = float(LS_HAIRCUT_EXPERIMENT["max_short_gross"])
+        print(
+            "NOTE: --ls-haircut-experiment is NOT the default live_locate skip "
+            f"(haircut={haircut:.2f}, max_short={short_cap:.2f}).",
+            file=sys.stderr,
+        )
     book_kw = dict(
         quantile=args.quantile,
         round_trip_bps=float(costs["round_trip_bps"]),
@@ -1057,13 +1077,9 @@ def main(argv: list[str] | None = None) -> int:
         thin_mult=float(costs["thin_mult"]),
         thin_pctile=float(costs["thin_pctile"]),
         locate_pctile=float(costs["locate_pctile"]),
-        locate_haircut=(
-            float(args.locate_haircut) if args.locate_haircut is not None else 1.0
-        ),
+        locate_haircut=haircut,
         locate_frac=float(args.locate_frac) if args.locate_frac is not None else 1.0,
-        max_short_gross=(
-            float(args.max_short_gross) if args.max_short_gross is not None else 0.5
-        ),
+        max_short_gross=short_cap,
         ex_post_gap_k=float(costs["ex_post_gap_k"]),
         turnover_z=tz,
         vol_level=vol,

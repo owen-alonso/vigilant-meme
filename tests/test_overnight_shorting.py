@@ -13,12 +13,14 @@ from forecast.backtest import book_pnl, sleeve_direction_from_weights
 from forecast.shorting import (
     IR_LIFT,
     SHORT_EXCESS_LIFT_PP,
+    decide_lo_promote,
     decide_ls_promote,
     evaluate_overnight_shorting,
     format_shorting_report,
     frame_to_wide,
     split_shorting_metrics,
     val_knob_grid,
+    val_long_only_grid,
 )
 from forecast.synthetic import write_cs_overnight_universe
 
@@ -147,6 +149,53 @@ def test_decide_ls_promote_ignores_test_and_requires_short_skill():
     assert yes["default_book"] == "live_locate"
 
 
+def test_decide_lo_promote_requires_ir_lift_not_worse_dd():
+    base = {
+        "name": "lo_q20_adv0",
+        "unlevered_net_ir": 1.0,
+        "unlevered_max_dd": -0.20,
+        "weighting": "quantile",
+        "quantile": 0.2,
+        "adv_floor_pctile": 0.0,
+    }
+    no_lift = decide_lo_promote({"baseline": base, "best": dict(base)})
+    assert no_lift["promote_lo"] is False
+    assert no_lift["gated_on"] == "val"
+    assert no_lift["spec"]["quantile"] == 0.2
+
+    yes = decide_lo_promote(
+        {
+            "baseline": base,
+            "best": {
+                "name": "lo_q15_adv0",
+                "unlevered_net_ir": 1.20,
+                "unlevered_max_dd": -0.21,
+                "weighting": "quantile",
+                "quantile": 0.15,
+                "adv_floor_pctile": 0.0,
+            },
+        }
+    )
+    assert yes["promote_lo"] is True
+    assert yes["spec"]["quantile"] == 0.15
+
+    dd_worse = decide_lo_promote(
+        {
+            "baseline": base,
+            "best": {
+                "name": "lo_q10_adv0",
+                "unlevered_net_ir": 1.20,
+                "unlevered_max_dd": -0.40,
+                "weighting": "quantile",
+                "quantile": 0.10,
+                "adv_floor_pctile": 0.0,
+            },
+        }
+    )
+    assert dd_worse["promote_lo"] is False
+    assert dd_worse["spec"]["quantile"] == 0.2
+
+
 def test_frame_to_wide_uses_calendar_index():
     df = pd.DataFrame(
         {
@@ -201,6 +250,10 @@ def test_split_shorting_metrics_ls_has_borrow_and_short_nav():
     kinds = {r["kind"] for r in grid["rows"]}
     assert "long_only" in kinds and "live_locate" in kinds
     assert grid["lo_best"]["kind"] == "long_only"
+    lo_grid = val_long_only_grid(df, min_names=6, vol_target=0.0)
+    assert lo_grid["baseline"]["name"] == "lo_q20_adv0"
+    assert lo_grid["rows"]
+    assert all(r["kind"] == "long_only" for r in lo_grid["rows"])
 
 
 def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
@@ -226,3 +279,7 @@ def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
     assert "DESKTOP" in text
     # TEST juiciness must not flip a no-skill VAL.
     assert payload["promotion"]["short_excess_pp"] == pytest.approx(val_xs)
+    assert payload["lo_promotion"]["gated_on"] == "val"
+    assert payload["ls_experiment"]["promote_as_default"] is False
+    assert "VAL LONG-ONLY GRID" in text
+    assert "LS HAIRCUT EXPERIMENT" in text

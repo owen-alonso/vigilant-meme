@@ -132,6 +132,13 @@ LIVE_LOCATE_BUNDLE: dict[str, Any] = {
     "locate_pctile": 0.30,
 }
 
+# VAL-gated experiment only — not the default live_locate skip.
+LS_HAIRCUT_EXPERIMENT: dict[str, Any] = {
+    "quantile": 0.2,
+    "locate_haircut": 0.5,
+    "max_short_gross": 0.3,
+}
+
 LIVE_LONG_ONLY_BUNDLE: dict[str, Any] = {
     **LIVE_BUNDLE,
     "name": "live_long_only",

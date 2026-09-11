@@ -725,6 +725,16 @@ def test_backtest_live_costs_cli():
     hcosts = cost_kwargs_from_args(harsh)
     assert hcosts["moo_bps"] == pytest.approx(30.0)
     assert hcosts["ex_post_gap_k"] == pytest.approx(0.0)
+    exp = build_arg_parser().parse_args(
+        ["--live-costs", "--holding", "overnight", "--ls-haircut-experiment"]
+    )
+    assert exp.ls_haircut_experiment
+    assert exp.long_only is False
+    lo_exp = build_arg_parser().parse_args(
+        ["--live-costs", "--long-only", "--ls-haircut-experiment"]
+    )
+    assert lo_exp.long_only is True
+    assert lo_exp.ls_haircut_experiment
 
 
 def test_adv_floor_drops_thin_names_before_weights():

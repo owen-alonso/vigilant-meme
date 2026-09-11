@@ -96,12 +96,15 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/be
 # unconstrained shorts (old live; not the honest default)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --cost-bundle live --compare-long-only
-# long-only, no locate, borrow=0
+# long-only, no locate, borrow=0 — default live book after LS failed VAL
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --live-costs --long-only
 # optional liquid sleeve (top CS turnover tercile; same skip w; use a lower min-names)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
-  --holding overnight --live-costs --adv-floor-pctile 0.67 --min-names 8
+  --holding overnight --live-costs --long-only --adv-floor-pctile 0.67 --min-names 8
+# LS haircut experiment (NOT default): HTB shorts at half size, short NAV 0.30
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --ls-haircut-experiment
 # harsh auction stress
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --cost-bundle harsh
