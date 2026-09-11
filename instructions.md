@@ -2,63 +2,82 @@
 
 This file is the operating manual for the **equity forecast** model in `forecast/`. It is not the language-model path (`main.py`, Shakespeare, Dynamic A LM). Those share a Mamba backbone; they do not share data, targets, or `generate.py`.
 
+The **estimand** is last-bar **cross-sectional** Pearson/Spearman on **next-day market-residual** returns, over a train-era-locked liquid universe (50–200 names). It is **not** time-series Pearson on weekly AAPL+MSFT.
+
+Success band (honest, locked test window): mean CS IC **0.04–0.08** with t-stat **> 3**, and long-short **net IR ~1** after costs. A single-date CS IC print near 0.14 can happen; report the **mean and the CS IC time series**. Do not retarget after seeing test. Dynamic A / bigger Mamba / more IC-loss weight are **not** the path.
+
 Run commands from the **repo root**.
 
 ```bash
 python -m forecast.training -h
 python -m forecast.generate -h
+python -m forecast.backtest -h
 ```
 
 ---
 
 ## What the model actually does
 
-Given daily OHLCV for one equity (Alpha Vantage), it predicts the **expected log return over the next trading day**.
+Given **daily** OHLCV for a liquid universe (Yahoo/Stooq split-adjusted, plus SPY), it predicts each name's **next-session residual log return** vs trailing-beta SPY, in vol units.
 
 It does **not**:
 
 - Pull the live tape unless you ran `forecast.download` first. `generate.py` reads a **local parquet**. `LATEST as of …` is the last timestamp **in that file**, not wall-clock now.
-- Forecast overnight gaps as a special case: the target is the next **session close**, so weekends are just a longer calendar span between two bars.
-- Output a trade, size, or “buy/sell”. It outputs a number in **basis points** and an implied price.
+- Forecast overnight gaps as a special case: the target is the next **session close**.
+- Output a trade, size, or “buy/sell”. It outputs a number in **basis points** (and a residual score used by the backtest).
 - See the future day it is predicting. Features are causal (bars `<= t` only). **Realized** is scored afterwards when that future already exists in the file.
+- Use next-bar **open** as a feature. Do not disable the calendar embargo.
 
-The network does not predict dollars. It predicts a **volatility-normalized** return. `generate.py` multiplies by the vol known at bar `t` and reports basis points.
+The network predicts a **volatility-normalized residual**. `generate.py` multiplies by the vol known at bar `t` and reports basis points.
 
 \[
-y_t = \frac{\log C_{t+60} - \log C_t}{\sigma_t \sqrt{60}}
+y_t = \frac{r_{t+1} - \beta_t r^{\mathrm{SPY}}_{t+1}}{\sigma_t}
 \]
 
-\(\sigma_t\) is EWM realized vol using only bars **up to \(t-1\)**. **1 bp = 0.01%**. **+10 bp** means the model expects the price about **0.10% higher** in one hour.
+\(\beta_t\) uses same-bar returns **through \(t\) only**. \(\sigma_t\) is EWM realized vol using only bars **up to \(t-1\)**. **1 bp = 0.01%**.
 
-The same weights apply to any ticker: features are scale-free (no per-symbol embedding). That does **not** mean every name is in-sample; see [Out of sample](#out-of-sample-and-vendors).
+The same weights apply to any ticker: features are scale-free (no per-symbol embedding). Trading names are the train-era-locked list in `forecast/universe.py`; SPY is a **benchmark**, not a book name.
 
 ---
 
-## Quick start
+## Quick start (CS residual protocol)
 
-1. Pull daily bars from Alpha Vantage into `data/<SYMBOL>_daily.parquet`:
-
-```bash
-python -m forecast.download --symbols AAPL,MSFT
-```
-2. Train (use `best.pt`, not `last.pt`):
+1. Wipe mixed weekly caches if you still have them, then pull **adjusted daily** history for the locked universe:
 
 ```bash
-python -m forecast.training
+python -m forecast.diagnostics --data-dir data --interval weekly --delete-mixed
+python -m forecast.download --universe liquid --source yahoo --replace --interval daily
 ```
 
-3. Forecast every symbol parquet (one **column per ticker**, cells = predicted move in bp):
+2. Ridge-only baseline first (`best.pt` is selected by **mean CS IC**, not pooled Pearson):
 
 ```bash
-python -m forecast.generate --checkpoint checkpoints/forecast/best.pt
-python -m forecast.generate --checkpoint checkpoints/forecast/best.pt --symbols AAPL,MSFT
-python -m forecast.generate --checkpoint checkpoints/forecast/best.pt --data data/AAPL_1min.parquet
+python -m forecast.training --universe liquid --interval daily --skip-only --checkpoint-dir checkpoints/forecast_ridge
 ```
 
-4. Before trusting a test IC, check whether train and test used the same vendor:
+3. Optional tiny frozen-skip encoder (do **not** scale Mamba / Dynamic A / IC-loss weight to chase 0.14):
 
 ```bash
-python scripts/split_report.py
+python -m forecast.training --universe liquid --interval daily --checkpoint-dir checkpoints/forecast
+```
+
+4. Locked-window quantile long-short with costs:
+
+```bash
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge/best.pt --cost-bps 10 --quantile 0.2 --json checkpoints/forecast_ridge/backtest.json --cs-csv checkpoints/forecast_ridge/cs_ic.csv
+```
+
+5. Ablations (synthetic CS universe on CPU, or your `data/` on GPU):
+
+```bash
+python scripts/ablate_cs.py
+python scripts/ablate_cs.py --data-dir data --universe liquid --skip-only-only
+```
+
+6. Vendor / split sanity:
+
+```bash
+python scripts/split_report.py data/AAPL_daily.parquet
 ```
 
 ---
@@ -104,7 +123,7 @@ Default loss is **Huber on the mean only**. Read **`val_ic`**, not `val_loss`. O
 | Flag | Default | Meaning |
 |---|---|---|
 | `--data-dir` | `data` | Folder of symbol parquets. |
-| `--horizon` | `60` | Label lookahead in **1-minute bars** (`60` = one hour, same session). Changing this changes what the model *is*. |
+| `--horizon` | `1` | Label lookahead in **bars** (`1` = next session on daily data). Scoring horizon>1 on every overlapping bar fakes Pearson — leave this at 1 for the CS protocol. |
 | `--seq-len` | `256` | Minutes of history in each training window. |
 | `--stride` | `64` | How far the window slides. Smaller → more overlapping samples, more compute. |
 | `--min-context` | `64` | First this many bars of every window are **unsupervised**. The SSM is still warming up. |
@@ -198,7 +217,10 @@ TEST (best step 250): loss=... ic=... r2=... dir=... pred_std=...bps n=...
 | Field | How to read it |
 |---|---|
 | `loss` | Same objective as train, on val/test labelled bars. **Not** the selection metric. |
-| `ic` | **Information coefficient**: Pearson correlation of prediction vs realized return (in vol units). **This is the number that matters.** `+1` lockstep, `0` no linear relationship, `-1` backwards. On noisy 1h returns, even a real edge is often a few hundredths. |
+| `ic` / `ic_raw` | **Pooled** last-bar Pearson. Useful as a diagnostic. **Not** the Phase-3 estimand and **not** “test IC 0.14”. |
+| `cs_ic` | **Mean cross-sectional Pearson** over dates with enough names. **This is the selection metric** when it is finite (`best.pt`). Target band 0.04–0.08 with `cs_t` > 3. |
+| `cs_sp` | Mean CS Spearman. Report it; do **not** blend it with Pearson and call the blend test IC. |
+| `cs_t` / `cs_dates` | t-stat of daily CS ICs, and how many dates went into the mean. |
 | `r2` | Skill vs the honest baseline **predict zero**. Negative r2 = worse than predicting no move. Tiny positive r2 can still pair with useful IC. |
 | `dir` | Fraction of **non-zero** outcomes where `sign(pred) == sign(realized)`. 0.50 = coin flip. |
 | `pred_std` | Std of predicted moves in **bp**. If this collapses toward 0 while IC is ~0, the model is shrinking to the mean, not forecasting. |

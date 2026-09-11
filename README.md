@@ -136,63 +136,42 @@ Checkpoints store `config` next to weights. A **baseline** checkpoint still load
 
 Training logs periodic Dynamic A scale stats (`mean/std/min/max`) so you can see collapse (\(s \approx 1\)), saturation (\(s\) stuck at the tanh bounds), or useful variation.
 
-## Next-hour return forecasting
+## Next-day residual CS forecasting
 
-`forecast/` reuses the Mamba backbone for a regression task: given daily
-OHLCV bars for an equity, predict its **log return over the next trading day**.
+`forecast/` predicts **next-day SPY-residual** returns for a train-era-locked
+liquid universe. The estimand is last-bar **mean CS IC**, not weekly AAPL+MSFT
+time-series Pearson. Dynamic A is optional and off by default.
 
 ```
 forecast/
-  alphavantage.py  # Alpha Vantage client + parquet cache
-  download.py      # python -m forecast.download --symbols AAPL
-  config.py        # DataConfig / ForecastModelConfig / ForecastTrainConfig
-  data.py          # daily (or 1-min) grid, causal features, target, windowing
-  model.py         # ReturnForecaster: continuous features -> scalar per bar
-  training.py      # masked loss, IC / directional metrics, checkpoints
-  generate.py      # forecasts for any symbol's parquet
+  universe.py      # 2018-era liquid names + SPY benchmark
+  data.py          # causal features, residual label, CS z-scores, CS ridge
+  training.py      # skip-only ridge, CS IC / RankNet, checkpoints
+  backtest.py      # last-bar quantile long-short with costs
+  diagnostics.py   # mixed adjusted/raw weekly gate
+  synthetic.py     # planted CS-momentum universe for CPU ablations
 ```
 
 ```bash
-python -m forecast.download --symbols AAPL
-python -m forecast.training --epochs 3
-python -m forecast.generate --checkpoint checkpoints/forecast/best.pt --last 10
-python scripts/split_report.py
+python -m forecast.download --universe liquid --source yahoo --replace --interval daily
+python -m forecast.training --universe liquid --skip-only
+python -m forecast.backtest --checkpoint checkpoints/forecast/best.pt --cost-bps 10
+python scripts/ablate_cs.py
+python scripts/split_report.py data/AAPL_daily.parquet
 ```
 
-### Data contract
-
-Pull daily bars with `python -m forecast.download --symbols AAPL`. Each
-symbol is cached as `data/<SYMBOL>_daily.parquet` with columns
-`datetime, open, high, low, close, volume, source, interval`. Daily bars are
-unadjusted by default (free `TIME_SERIES_DAILY`). Split-adjusted daily and
-1-minute history are premium Alpha Vantage endpoints. Set
-`ALPHA_VANTAGE_API_KEY` in `.env` (see `.env.example`).
-
-### Target
+Yahoo/Stooq daily caches are split-adjusted (`adjclose` is written into
+`close`). Alpha Vantage compact daily is unadjusted and too short for this
+protocol. Target:
 
 \[
-y_t = \frac{\log C_{t+h} - \log C_t}{\sigma_t \sqrt{h}}
+y_t = \frac{r_{t+1} - \beta_t r^{\mathrm{SPY}}_{t+1}}{\sigma_t}
 \]
 
-Default \(h = 1\) (next trading day). \(\sigma_t\) is an EWM realized-volatility
-estimate using only bars up to \(t-1\). `generate.py` multiplies by
-\(\sigma_t\sqrt{h}\) to report basis points. A bar is labelled only when the
-horizon bar exists in the file.
-
-Default training uses Huber on the mean only. Pass `--loss gaussian
---heteroscedastic` if you want a trained residual-uncertainty head;
-`generate.py` will otherwise omit the uncertainty column.
-
-Features are scale-free (vol-normalized returns, ranges, standardized volume,
-staleness, time-of-day), so the model carries no per-symbol parameters and the
-same weights apply to any equity.
-
-### Reading the metrics
-
-`val_ic` (correlation between prediction and realized return) is the metric
-that matters, not `val_loss`. One-hour return noise dominates the loss, so a
-model can reduce MSE by shrinking toward zero while learning nothing. `r2` is
-measured against the honest baseline of predicting zero.
+`best.pt` is selected by mean CS IC when a cross-section exists. `backtest.py`
+builds a dollar-neutral (or `--long-only`) quantile book on the locked test
+window, with round-trip costs. Report mean CS IC + t-stat + net IR; do not
+call a Spearman/Pearson blend or a val number "test IC 0.14".
 
 ## Tests
 

@@ -33,6 +33,35 @@ def test_parse_yahoo_chart_canonical():
     assert float(bars["close"].iloc[-1]) == 76.5
 
 
+def test_parse_yahoo_chart_uses_adjclose():
+    payload = {
+        "chart": {
+            "result": [
+                {
+                    "timestamp": [1577923200],
+                    "indicators": {
+                        "quote": [
+                            {
+                                "open": [100.0],
+                                "high": [110.0],
+                                "low": [90.0],
+                                "close": [100.0],
+                                "volume": [1000],
+                            }
+                        ],
+                        "adjclose": [{"adjclose": [50.0]}],
+                    },
+                }
+            ],
+            "error": None,
+        }
+    }
+    bars = parse_yahoo_chart(payload, interval="daily")
+    assert float(bars["close"].iloc[0]) == 50.0
+    assert float(bars["open"].iloc[0]) == 50.0
+    assert float(bars["high"].iloc[0]) == 55.0
+
+
 def test_liquid_universe_is_train_era_locked():
     from forecast.universe import LIQUID_NAMES, BENCHMARK_SYMBOL, download_symbols
 

@@ -343,7 +343,26 @@ def test_linear_skip_is_the_init_readout():
     assert not torch.allclose(model.skip.weight, torch.zeros_like(model.skip.weight))
 
 
-def test_correlation_loss_rewards_alignment():
+def test_cs_center_loss_changes_huber_when_dates_disagree():
+    import torch
+
+    mean = torch.tensor([[2.0, 4.0], [10.0, 12.0]])
+    target = torch.tensor([[1.0, 3.0], [9.0, 11.0]])
+    mask = torch.ones_like(mean)
+    dates = torch.tensor([[1, 1], [2, 2]])
+    cfg = ForecastTrainConfig(
+        loss="huber",
+        location_loss_weight=1.0,
+        ic_loss_weight=0.0,
+        sign_loss_weight=0.0,
+        rank_loss_weight=0.0,
+        pred_std_weight=0.0,
+        cs_center_loss=True,
+    )
+    centered = float(masked_loss(mean, torch.zeros_like(mean), target, mask, cfg, date_ids=dates))
+    cfg.cs_center_loss = False
+    raw = float(masked_loss(mean, torch.zeros_like(mean), target, mask, cfg, date_ids=dates))
+    assert centered < raw
     import torch
 
     mean = torch.tensor([[0.2, 0.4, -0.1, 0.3]])
@@ -487,13 +506,19 @@ def test_weekly_cli_uses_week_scale_context():
     assert model_cfg.linear_skip is True
     assert model_cfg.dt_min == pytest.approx(0.05)
     assert train_cfg.ic_loss_weight == pytest.approx(2.0)
+    assert train_cfg.rank_loss_weight == pytest.approx(1.0)
     assert train_cfg.early_stop_evals == 24
     assert train_cfg.ridge_skip == pytest.approx(1.0)
     assert train_cfg.freeze_skip is True
+    assert train_cfg.ridge_cs_demean is True
+    assert train_cfg.cs_center_loss is True
     assert train_cfg.skip_only is False
     assert data_cfg.eval_last_bar is True
     assert data_cfg.global_calendar_split is True
     assert data_cfg.residual_target is True
+    assert data_cfg.cs_zscore is True
+    assert data_cfg.cross_section_min_names == 30
+    assert data_cfg.universe == ""
 
 
 def test_sequence_dataset_last_bar_is_six_tuple():
@@ -721,3 +746,113 @@ def test_cross_section_dataset_when_enough_names(tmp_path: Path):
     assert int(mask[0].sum()) == 1
     assert bool(mask[0, -1])
     assert int(dates.unique().numel()) == 1
+
+
+def test_cs_zscore_is_same_day_and_excludes_spy():
+    cfg = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+        benchmark_symbol="SPY",
+        cs_zscore=True,
+    )
+    a = compute_features(_daily_grid(40), cfg)
+    b_grid = _daily_grid(40)
+    b_grid["close"] = b_grid["close"] * 1.2 + np.linspace(0, 1.0, 40)
+    b = compute_features(b_grid, cfg)
+    spy = compute_features(_daily_grid(40), cfg)
+    a["symbol"], b["symbol"], spy["symbol"] = "AAPL", "MSFT", "SPY"
+    out = attach_cross_section_features({"AAPL": a, "MSFT": b, "SPY": spy}, cfg)
+    mid = 20
+    z_a = float(out["AAPL"]["cs_ret_1"].iloc[mid])
+    z_b = float(out["MSFT"]["cs_ret_1"].iloc[mid])
+    assert z_a == pytest.approx(-z_b, abs=1e-5)
+    assert abs(z_a + z_b) < 1e-5
+    spiked = b.copy()
+    spiked.loc[spiked.index[-1], "ret_1"] = 9.0
+    alt = attach_cross_section_features({"AAPL": a.copy(), "MSFT": spiked, "SPY": spy.copy()}, cfg)
+    assert out["AAPL"]["cs_ret_1"].iloc[mid] == pytest.approx(
+        float(alt["AAPL"]["cs_ret_1"].iloc[mid]), abs=1e-8
+    )
+
+
+def test_cs_ridge_recovers_within_date_signal_pooled_ridge_misses():
+    """Market-dominated pooled OLS vs date-demeaned CS ridge."""
+    n_dates, n_names, f = 30, 10, 4
+    dates = np.repeat(np.arange(n_dates, dtype=np.int64), n_names)
+    mkt = np.repeat(np.linspace(-2, 2, n_dates), n_names)
+    rng = np.random.default_rng(1)
+    cs = rng.normal(size=n_dates * n_names)
+    # Feature 0 = market + a bit of CS; the CS target is in feature 1.
+    x = rng.normal(size=(n_dates * n_names, f)).astype(np.float32)
+    x[:, 0] = (mkt + 0.05 * cs).astype(np.float32)
+    x[:, 1] = cs.astype(np.float32)
+    y = (2.0 * mkt + 1.0 * cs).astype(np.float32)
+    symbols = []
+    for j in range(n_names):
+        idx = np.arange(n_dates) * n_names + j
+        symbols.append(
+            SymbolArrays(
+                symbol=f"S{j}",
+                features=x[idx],
+                target=y[idx],
+                scale=np.ones(n_dates, dtype=np.float32),
+                valid=np.ones(n_dates, dtype=bool),
+                dates=np.arange(n_dates, dtype=np.int64),
+            )
+        )
+    mean = np.zeros(f, dtype=np.float32)
+    std = np.ones(f, dtype=np.float32)
+    w_cs, _b, ic_cs = fit_ridge_readout(
+        symbols, mean, std, ridge=1e-3, cs_demean=True, min_names=8
+    )
+    w_pool, _b2, ic_pool = fit_ridge_readout(
+        symbols, mean, std, ridge=1e-3, cs_demean=False, min_names=8
+    )
+    assert abs(w_cs[1]) > abs(w_cs[0])
+    assert ic_cs > 0.7
+    # Pooled fit is allowed to grab the market; it must not beat CS on CS IC.
+    assert abs(w_pool[0]) > abs(w_cs[0]) or ic_pool < ic_cs
+
+
+def test_universe_liquid_drops_non_members(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_daily_parquet(data_dir / "AAPL_daily.parquet", "AAPL", 120, "2018-01-02")
+    _write_daily_parquet(data_dir / "ZZZZ_daily.parquet", "ZZZZ", 120, "2018-01-02")
+    cfg = DataConfig(
+        data_dir=str(data_dir),
+        interval="daily",
+        horizon=1,
+        seq_len=16,
+        stride=1,
+        min_context=4,
+        warmup_bars=8,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=5,
+        universe="liquid",
+        residual_target=False,
+        eval_last_bar=True,
+        cross_section_min_names=99,
+        allow_mixed_prices=True,
+    )
+    bundle = build_datasets(cfg, log_fn=None)
+    names = {m["symbol"] for m in bundle["meta"]}
+    assert names == {"AAPL"}
+    assert "ZZZZ" not in names
+
+
+def test_mean_cs_stats_reports_tstat_and_spearman():
+    from forecast.training import mean_cs_stats
+
+    pred = np.array([1.0, 2.0, 3.0, 1.0, 2.0, 3.0], dtype=np.float64)
+    target = np.array([1.0, 2.0, 3.0, 1.0, 2.0, 3.0], dtype=np.float64)
+    dates = np.array([1, 1, 1, 2, 2, 2], dtype=np.int64)
+    stats = mean_cs_stats(pred, target, dates, min_names=3)
+    assert stats["cs_ic"] == pytest.approx(1.0)
+    assert stats["cs_ic_spearman"] == pytest.approx(1.0)
+    assert stats["cs_n_dates"] == pytest.approx(2.0)

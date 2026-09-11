@@ -129,3 +129,22 @@ def download_symbols(*, include_benchmark: bool = True) -> list[str]:
     if include_benchmark and BENCHMARK_SYMBOL not in names:
         names = [BENCHMARK_SYMBOL, *names]
     return names
+
+
+def allowed_symbols(
+    universe: str,
+    *,
+    include_benchmark: bool = True,
+) -> frozenset[str] | None:
+    """Membership set for a named universe, or None to keep every parquet."""
+    raw = (universe or "").strip().lower()
+    if not raw:
+        return None
+    if raw != "liquid":
+        raise ValueError(
+            f"unknown universe {universe!r}; expected '' or 'liquid'"
+        )
+    names = set(LIQUID_NAMES)
+    if include_benchmark:
+        names.add(BENCHMARK_SYMBOL)
+    return frozenset(names)

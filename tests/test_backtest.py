@@ -24,6 +24,26 @@ def test_quantile_weights_long_short_equal_notional():
     assert w[w < 0].sum() == pytest.approx(-0.5)
 
 
+def test_quantile_weights_long_only_sums_to_one():
+    rng = np.random.default_rng(0)
+    s = pd.Series(rng.normal(size=20), index=[f"S{i}" for i in range(20)])
+    w = quantile_weights(s, quantile=0.2, long_only=True)
+    assert w[w > 0].sum() == pytest.approx(1.0)
+    assert float((w < 0).sum()) == 0
+
+
+def test_book_pnl_skips_thin_dates():
+    dates = pd.bdate_range("2022-01-03", periods=20)
+    names = [f"S{i}" for i in range(10)]
+    pred = pd.DataFrame(
+        np.tile(np.linspace(-1, 1, 10), (20, 1)), index=dates, columns=names
+    )
+    pred.iloc[:5, 3:] = np.nan
+    realized = pred.copy()
+    stats = book_pnl(pred, realized, quantile=0.2, min_names=8, round_trip_bps=0.0)
+    assert stats["n_dates"] == 15
+
+
 def test_book_pnl_perfect_ranks_has_positive_net_ir():
     dates = pd.bdate_range("2022-01-03", periods=80)
     names = [f"S{i}" for i in range(10)]

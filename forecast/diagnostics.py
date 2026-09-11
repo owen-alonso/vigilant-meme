@@ -100,6 +100,11 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Mix-jump / scale-toggle diagnostics for price caches.")
     p.add_argument("--data-dir", default=DataConfig().data_dir)
     p.add_argument("--interval", default="weekly")
+    p.add_argument(
+        "--delete-mixed",
+        action="store_true",
+        help="delete weekly parquets that fail the lag-1 mix-toggle gate",
+    )
     args = p.parse_args(argv)
     cfg = DataConfig(interval=args.interval, allow_mixed_prices=True)
     try:
@@ -123,7 +128,10 @@ def main(argv: list[str] | None = None) -> int:
                 "      fail: weekly lag-1 autocorr < -0.2 is the mixed adjusted/raw signature",
                 file=sys.stderr,
             )
-    return 1 if mixed_any and str(args.interval) == "weekly" else 0
+            if args.delete_mixed:
+                Path(path).unlink()
+                print(f"      deleted {path}", file=sys.stderr)
+    return 1 if mixed_any and str(args.interval) == "weekly" and not args.delete_mixed else 0
 
 
 if __name__ == "__main__":

@@ -83,9 +83,14 @@ class DataConfig:
     residual_target: bool = True
     beta_halflife: int = 63
     # Cross-section batches when at least this many names print on a date.
-    cross_section_min_names: int = 8
+    # 30 keeps the ridge off sparse 1970s panels; 8 is the absolute floor in tests.
+    cross_section_min_names: int = 30
     # Weekly mixed adjusted/raw files have lag-1 autocorr << 0. Set True to skip.
     allow_mixed_prices: bool = False
+    # Restrict loaded parquets to a train-era-locked list (``liquid``) or all.
+    universe: str = ""
+    # Same-day cross-sectional z-scores of momentum / volume (known at close).
+    cs_zscore: bool = True
 
     def is_daily(self) -> bool:
         return self.interval == "daily"
@@ -198,7 +203,7 @@ def interval_model_kwargs(interval: str) -> dict[str, Any]:
 class ForecastModelConfig:
     """Mamba backbone sized for continuous financial features."""
 
-    n_features: int = 25
+    n_features: int = 31
     d_model: int = 96
     n_layer: int = 4
     d_state: int = 16
@@ -267,12 +272,17 @@ class ForecastTrainConfig:
     sign_loss_weight: float = 0.4
     sign_min_abs: float = 0.25
     # Pairwise RankNet on labelled bars in the batch (Spearman-like).
-    rank_loss_weight: float = 0.4
+    # Default matches the CS ranking objective; do not raise ic_loss_weight.
+    rank_loss_weight: float = 1.0
     # Match pred std to target std so Pearson cannot explode |pred|.
     pred_std_weight: float = 0.5
     # Closed-form ridge readout copied into the linear skip at step 0.
     # 0 keeps Xavier init.
     ridge_skip: float = 1.0
+    # Date-demean features/targets before ridge (the CS linear baseline).
+    ridge_cs_demean: bool = True
+    # Huber/MSE/NLL on within-date demeaned pred/target when a date has breadth.
+    cs_center_loss: bool = True
     # After ridge, freeze the skip so AdamW cannot decay the linear baseline.
     skip_lr_mult: float = 0.0
     freeze_skip: bool = True

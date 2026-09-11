@@ -68,6 +68,30 @@ from mamba_lm.training_utils import (
 # --------------------------------------------------------------------------
 
 
+def _center_by_date(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    date_ids: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Subtract the labelled within-date mean. No-op without date breadth."""
+    dates = _expand_date_ids(date_ids, mask)
+    if dates is None:
+        return pred, target
+    sel = mask.bool()
+    if int(sel.sum()) < 2:
+        return pred, target
+    pred_c = pred.clone()
+    tgt_c = target.clone()
+    for key in dates[sel].unique():
+        m = sel & (dates == key)
+        if int(m.sum()) < 2:
+            continue
+        pred_c[m] = pred[m] - pred[m].mean()
+        tgt_c[m] = target[m] - target[m].mean()
+    return pred_c, tgt_c
+
+
 def masked_loss(
     mean: torch.Tensor,
     log_sigma: torch.Tensor,
@@ -82,22 +106,26 @@ def masked_loss(
     if float(denom) <= 0:
         return mean.new_tensor(float("nan"))
 
+    loc_mean, loc_target = mean, target
+    if cfg.cs_center_loss:
+        loc_mean, loc_target = _center_by_date(mean, target, mask, date_ids)
+
     if cfg.loss == "mse":
-        per_bar = (mean - target).pow(2)
+        per_bar = (loc_mean - loc_target).pow(2)
     elif cfg.loss == "huber":
         per_bar = F.huber_loss(
-            mean, target, reduction="none", delta=cfg.huber_delta
+            loc_mean, loc_target, reduction="none", delta=cfg.huber_delta
         )
     elif cfg.loss == "gaussian":
         # Heteroscedastic NLL, constants dropped.
         inv_var = torch.exp(-2.0 * log_sigma)
-        per_bar = 0.5 * (inv_var * (mean - target).pow(2)) + log_sigma
+        per_bar = 0.5 * (inv_var * (loc_mean - loc_target).pow(2)) + log_sigma
     else:
         raise ValueError(f"unknown loss {cfg.loss!r}")
     if cfg.loss != "gaussian" and cfg.sigma_aux_weight > 0:
         # Mean is detached so Huber/MSE still own the location; sigma learns
         # residual scale, which generate.py turns into a confidence score.
-        resid_sq = (mean.detach() - target).pow(2)
+        resid_sq = (loc_mean.detach() - loc_target).pow(2)
         inv_var = torch.exp(-2.0 * log_sigma)
         aux = 0.5 * (inv_var * resid_sq) + log_sigma
         per_bar = per_bar + cfg.sigma_aux_weight * aux
@@ -355,19 +383,57 @@ def mean_cs_ic(
     min_names: int = 3,
 ) -> float:
     """Mean Pearson IC across names on each date (the industry CS IC)."""
+    return float(mean_cs_stats(pred, target, dates, min_names=min_names)["cs_ic"])
+
+
+def mean_cs_stats(
+    pred: np.ndarray,
+    target: np.ndarray,
+    dates: np.ndarray,
+    *,
+    min_names: int = 3,
+) -> dict[str, float]:
+    """Mean CS Pearson / Spearman, t-stat, and coverage over dates."""
+    empty = {
+        "cs_ic": float("nan"),
+        "cs_ic_spearman": float("nan"),
+        "cs_ic_tstat": float("nan"),
+        "cs_n_dates": 0.0,
+        "cs_mean_n": float("nan"),
+    }
     if pred.size == 0 or dates.size != pred.size:
-        return float("nan")
+        return empty
     ics: list[float] = []
+    spears: list[float] = []
+    ns: list[float] = []
     for key in np.unique(dates):
         sel = dates == key
-        if int(sel.sum()) < min_names:
+        n = int(sel.sum())
+        if n < min_names:
             continue
         rho = _pearson(pred[sel], target[sel])
+        sp = _spearman(pred[sel], target[sel])
         if np.isfinite(rho):
             ics.append(rho)
+            spears.append(sp if np.isfinite(sp) else float("nan"))
+            ns.append(float(n))
     if not ics:
-        return float("nan")
-    return float(np.mean(ics))
+        return empty
+    arr = np.asarray(ics, dtype=np.float64)
+    tstat = float("nan")
+    if arr.size > 2:
+        s = float(arr.std(ddof=1))
+        if s > 1e-12:
+            tstat = float(arr.mean() / (s / math.sqrt(arr.size)))
+    spear = np.asarray(spears, dtype=np.float64)
+    spear = spear[np.isfinite(spear)]
+    return {
+        "cs_ic": float(arr.mean()),
+        "cs_ic_spearman": float(spear.mean()) if spear.size else float("nan"),
+        "cs_ic_tstat": tstat,
+        "cs_n_dates": float(arr.size),
+        "cs_mean_n": float(np.mean(ns)),
+    }
 
 
 def selection_score(metrics: dict[str, float]) -> float:
@@ -441,6 +507,8 @@ def evaluate(
     device: torch.device,
     train_cfg: ForecastTrainConfig,
     max_batches: int | None = None,
+    *,
+    cs_min_names: int = 3,
 ) -> dict[str, float]:
     model.eval()
     preds: list[np.ndarray] = []
@@ -487,7 +555,9 @@ def evaluate(
     metrics = compute_metrics(pred_np, tgt_np, scale_np, winsor=train_cfg.ic_winsor)
     if date_list:
         dates_np = np.concatenate(date_list)
-        metrics["cs_ic"] = mean_cs_ic(pred_np, tgt_np, dates_np)
+        metrics.update(
+            mean_cs_stats(pred_np, tgt_np, dates_np, min_names=int(cs_min_names))
+        )
     metrics["select"] = selection_score(metrics)
     metrics["loss"] = weighted_loss / total_weight if total_weight > 0 else float("nan")
     return metrics
@@ -526,6 +596,8 @@ def apply_ridge_skip(
         bundle["feature_mean"],
         bundle["feature_std"],
         ridge=float(train_cfg.ridge_skip),
+        cs_demean=bool(train_cfg.ridge_cs_demean),
+        min_names=int(bundle.get("cs_min_names", 8)),
     )
     with torch.no_grad():
         model.skip.weight.copy_(
@@ -543,10 +615,14 @@ def apply_ridge_skip(
 def _fmt(metrics: dict[str, float]) -> str:
     spearman = metrics.get("ic_spearman", float("nan"))
     raw = metrics.get("ic_raw", metrics.get("ic", float("nan")))
+    cs_sp = metrics.get("cs_ic_spearman", float("nan"))
+    cs_t = metrics.get("cs_ic_tstat", float("nan"))
+    cs_n = metrics.get("cs_n_dates", float("nan"))
     return (
         f"loss={metrics['loss']:.5f} ic={metrics['ic']:+.4f} "
         f"spearman={spearman:+.4f} raw={raw:+.4f} "
         f"cs_ic={metrics.get('cs_ic', float('nan')):+.4f} "
+        f"cs_sp={cs_sp:+.4f} cs_t={cs_t:+.2f} cs_dates={int(cs_n) if np.isfinite(cs_n) else 0} "
         f"r2={metrics['r2']:+.5f} dir={metrics['direction']:.4f} "
         f"pred_std={metrics['pred_std_bps']:.2f}bps n={int(metrics['n'])}"
     )
@@ -607,7 +683,16 @@ def _train(
 
     skip_ic = apply_ridge_skip(model, bundle, train_cfg, device)
     if log_fn and np.isfinite(skip_ic):
-        log_fn(f"ridge skip in-sample IC={skip_ic:+.4f} (train labelled bars)")
+        kind = "CS" if train_cfg.ridge_cs_demean else "pooled"
+        log_fn(f"ridge skip in-sample {kind} IC={skip_ic:+.4f} (train labelled bars)")
+    if log_fn and not bundle.get("cross_section"):
+        log_fn(
+            "NOTE: cross-section dataset is off "
+            f"(need >= {data_cfg.cross_section_min_names} trading names). "
+            "Pooled last-bar Pearson is not the CS residual estimand."
+        )
+
+    cs_eval = {"cs_min_names": int(data_cfg.cross_section_min_names)}
 
     loader_kwargs = {
         **dataloader_kwargs(device, train_cfg.num_workers),
@@ -672,9 +757,9 @@ def _train(
     t0 = time.perf_counter()
     if log_fn:
         log_fn(f"steps/epoch={steps_per_epoch} total_steps={total_steps}")
-    skip_only_train = evaluate(model, train_eval_loader, device, train_cfg)
-    skip_only_val = evaluate(model, val_loader, device, train_cfg)
-    skip_only_test = evaluate(model, test_loader, device, train_cfg)
+    skip_only_train = evaluate(model, train_eval_loader, device, train_cfg, **cs_eval)
+    skip_only_val = evaluate(model, val_loader, device, train_cfg, **cs_eval)
+    skip_only_test = evaluate(model, test_loader, device, train_cfg, **cs_eval)
     if log_fn:
         log_fn(f"  skip-only train: {_fmt(skip_only_train)}")
         log_fn(f"  skip-only val: {_fmt(skip_only_val)}")
@@ -684,7 +769,8 @@ def _train(
         save(ckpt_dir / "best.pt", 0, skip_only_val)
         save(ckpt_dir / "last.pt", 0, skip_only_val)
         summary = {
-            "best_val_ic": skip_only_val.get("ic", float("nan")),
+            "best_val_ic": selection_score(skip_only_val),
+            "best_val_cs_ic": skip_only_val.get("cs_ic", float("nan")),
             "best_step": 0,
             "history": [],
             "test": skip_only_test,
@@ -719,6 +805,7 @@ def _train(
     history: list[dict[str, Any]] = []
     best_ic = -float("inf")
     best_step = -1
+    best_val_metrics: dict[str, float] = {}
     evals_without_gain = 0
     lr_scale = 1.0
     data_iter = cycle_loader(train_loader)
@@ -782,7 +869,7 @@ def _train(
                     log_fn(msg)
 
             if (step + 1) % train_cfg.eval_interval == 0 or step + 1 == total_steps:
-                val = evaluate(model, val_loader, device, train_cfg)
+                val = evaluate(model, val_loader, device, train_cfg, **cs_eval)
                 val["step"] = float(step + 1)
                 history.append(val)
                 if log_fn:
@@ -793,6 +880,7 @@ def _train(
                         device,
                         train_cfg,
                         max_batches=8,
+                        **cs_eval,
                     )
                     log_fn(f"  train sample: {_fmt(train_snap)}")
                 save(ckpt_dir / "last.pt", step + 1, val)
@@ -801,6 +889,11 @@ def _train(
                 improved = bool(np.isfinite(ic) and ic > best_ic)
                 if improved:
                     best_ic, best_step = ic, step + 1
+                    best_val_metrics = {
+                        k: float(v)
+                        for k, v in val.items()
+                        if isinstance(v, (int, float))
+                    }
                     save(ckpt_dir / "best.pt", step + 1, val)
                     if log_fn:
                         label = "val_cs_ic" if np.isfinite(val.get("cs_ic", float("nan"))) else "val_ic"
@@ -869,7 +962,7 @@ def _train(
                 log_fn("warning: no best.pt saved; TEST uses last.pt weights")
         elif log_fn:
             log_fn("warning: no checkpoint saved; TEST uses final in-memory weights")
-        test = evaluate(model, test_loader, device, train_cfg)
+        test = evaluate(model, test_loader, device, train_cfg, **cs_eval)
         if log_fn:
             if best_path.exists():
                 log_fn(f"TEST (best step {best_step}): {_fmt(test)}")
@@ -881,6 +974,7 @@ def _train(
 
     summary = {
         "best_val_ic": best_ic,
+        "best_val_cs_ic": best_val_metrics.get("cs_ic", float("nan")),
         "best_step": best_step,
         "history": history,
         "test": test,
@@ -964,6 +1058,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="split each symbol on its own session count (legacy)",
     )
+    g.add_argument(
+        "--universe",
+        default="",
+        choices=("", "liquid"),
+        help="restrict parquets to the train-era-locked liquid list (+ SPY)",
+    )
+    g.add_argument(
+        "--no-cs-zscore",
+        action="store_true",
+        help="leave cs_* features at 0 (ablation)",
+    )
+    g.add_argument(
+        "--cs-min-names",
+        type=int,
+        default=None,
+        help="min names per date for CS batches / CS IC (default: 30)",
+    )
 
     g = p.add_argument_group("model")
     g.add_argument("--d-model", type=int, default=None)
@@ -1030,6 +1141,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-freeze-skip",
         action="store_true",
         help="let AdamW keep updating the ridge skip (default: freeze after init)",
+    )
+    g.add_argument(
+        "--no-ridge-cs-demean",
+        action="store_true",
+        help="fit pooled time-series ridge instead of date-demeaned CS ridge",
+    )
+    g.add_argument(
+        "--no-cs-center",
+        action="store_true",
+        help="do not subtract within-date means in the location loss",
     )
     g.add_argument(
         "--skip-only",
@@ -1101,6 +1222,13 @@ def configs_from_cli(
         global_calendar_split=not args.no_global_split,
         residual_target=not args.no_residual_target,
         allow_mixed_prices=args.allow_mixed_prices,
+        universe=args.universe,
+        cs_zscore=not args.no_cs_zscore,
+        cross_section_min_names=(
+            DataConfig().cross_section_min_names
+            if args.cs_min_names is None
+            else args.cs_min_names
+        ),
     )
     model_cfg = ForecastModelConfig(
         n_features=len(FEATURE_NAMES),
@@ -1129,6 +1257,8 @@ def configs_from_cli(
         rank_loss_weight=args.rank_loss_weight,
         ridge_skip=args.ridge_skip,
         freeze_skip=not args.no_freeze_skip,
+        ridge_cs_demean=not args.no_ridge_cs_demean,
+        cs_center_loss=not args.no_cs_center,
         skip_only=args.skip_only,
         sigma_aux_weight=(
             0.0

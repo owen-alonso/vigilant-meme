@@ -27,6 +27,7 @@ import torch
 from torch.utils.data import Dataset
 
 from forecast.config import BARS_PER_SESSION, SESSION_START_MINUTE, DataConfig
+from forecast.universe import allowed_symbols
 from mamba_lm.paths import REPO_ROOT, resolve_path
 
 
@@ -49,6 +50,12 @@ FEATURE_NAMES: tuple[str, ...] = (
     "peer_ret_1",
     "mkt_ret_1",
     "idio_ret_1",
+    "cs_ret_1",
+    "cs_ret_5",
+    "cs_ret_15",
+    "cs_ret_60",
+    "cs_volume",
+    "cs_vol",
     "traded",
     "staleness",
     "new_session",
@@ -58,7 +65,27 @@ FEATURE_NAMES: tuple[str, ...] = (
     "dow_frac",
 )
 
-CROSS_SECTION_FEATURES: tuple[str, ...] = ("peer_ret_1", "mkt_ret_1", "idio_ret_1")
+CROSS_SECTION_FEATURES: tuple[str, ...] = (
+    "peer_ret_1",
+    "mkt_ret_1",
+    "idio_ret_1",
+    "cs_ret_1",
+    "cs_ret_5",
+    "cs_ret_15",
+    "cs_ret_60",
+    "cs_volume",
+    "cs_vol",
+)
+
+# Same-bar CS z-scores (source column -> feature name). Known at close; not labels.
+CS_ZSCORE_SOURCES: tuple[tuple[str, str], ...] = (
+    ("ret_1", "cs_ret_1"),
+    ("ret_5", "cs_ret_5"),
+    ("ret_15", "cs_ret_15"),
+    ("ret_60", "cs_ret_60"),
+    ("volume_z", "cs_volume"),
+    ("vol_level", "cs_vol"),
+)
 
 OHLCV_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 
@@ -333,6 +360,8 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     out["peer_ret_1"] = 0.0
     out["mkt_ret_1"] = 0.0
     out["idio_ret_1"] = 0.0
+    for _src, dest in CS_ZSCORE_SOURCES:
+        out[dest] = 0.0
 
     # Bars elapsed since the last real print, so stale prices are discountable.
     position = np.arange(len(out), dtype=np.float64)
@@ -400,16 +429,55 @@ def _cross_section_key(panel: pd.DataFrame, cfg: DataConfig) -> pd.Series:
     return pd.to_datetime(panel["datetime"])
 
 
+def _traded_wide(
+    panels: dict[str, pd.DataFrame],
+    symbols: list[str],
+    cfg: DataConfig,
+    column: str,
+) -> pd.DataFrame | None:
+    """Date x symbol matrix of a feature on real prints only."""
+    parts: list[pd.DataFrame] = []
+    for sym in symbols:
+        panel = panels[sym]
+        if column not in panel.columns:
+            continue
+        traded = panel["traded"].to_numpy(dtype=np.float64) > 0
+        if not bool(traded.any()):
+            continue
+        parts.append(
+            pd.DataFrame(
+                {
+                    "key": _cross_section_key(panel, cfg).to_numpy()[traded],
+                    "symbol": sym,
+                    "val": panel[column].to_numpy(dtype=np.float64)[traded],
+                }
+            )
+        )
+    if len(parts) < 2:
+        return None
+    long = pd.concat(parts, ignore_index=True)
+    return long.pivot_table(index="key", columns="symbol", values="val", aggfunc="mean")
+
+
+def _cs_zscore_wide(wide: pd.DataFrame) -> pd.DataFrame:
+    """Z-score each date across names. Constant rows become 0."""
+    mean = wide.mean(axis=1, skipna=True)
+    std = wide.std(axis=1, skipna=True)
+    std = std.where(std >= 1e-8, np.nan)
+    return wide.sub(mean, axis=0).div(std, axis=0)
+
+
 def attach_cross_section_features(
     panels: dict[str, pd.DataFrame],
     cfg: DataConfig,
 ) -> dict[str, pd.DataFrame]:
-    """Peer / market return known at bar ``t``. Strictly causal.
+    """Peer / market / CS-z features known at bar ``t``. Strictly causal.
 
     ``mkt_ret_1`` is the benchmark ticker's ``ret_1`` when that parquet is in
     ``panels``, otherwise the equal-weight mean of trading names.
     ``peer_ret_1`` averages the other *trading* names (benchmark excluded).
     ``idio_ret_1`` is own ``ret_1`` minus ``mkt_ret_1``.
+    ``cs_*`` columns are same-day z-scores across trading names (not SPY).
     """
     if not panels:
         return panels
@@ -425,52 +493,22 @@ def attach_cross_section_features(
             index=pd.Index(_cross_section_key(bpanel, cfg).to_numpy()),
         ).groupby(level=0).mean()
     elif len(trade_syms) >= 2:
-        parts: list[pd.DataFrame] = []
-        for sym in trade_syms:
-            panel = panels[sym]
-            traded = panel["traded"].to_numpy(dtype=np.float64) > 0
-            if not bool(traded.any()):
-                continue
-            parts.append(
-                pd.DataFrame(
-                    {
-                        "key": _cross_section_key(panel, cfg).to_numpy()[traded],
-                        "symbol": sym,
-                        "ret_1": panel["ret_1"].to_numpy(dtype=np.float64)[traded],
-                    }
-                )
-            )
-        if len(parts) >= 2:
-            long = pd.concat(parts, ignore_index=True)
-            wide = long.pivot_table(
-                index="key", columns="symbol", values="ret_1", aggfunc="mean"
-            )
-            mkt = wide.mean(axis=1, skipna=True)
+        wide_mkt = _traded_wide(panels, trade_syms, cfg, "ret_1")
+        if wide_mkt is not None:
+            mkt = wide_mkt.mean(axis=1, skipna=True)
 
-    peer_wide: pd.DataFrame | None = None
-    if len(trade_syms) >= 2:
-        parts = []
-        for sym in trade_syms:
-            panel = panels[sym]
-            traded = panel["traded"].to_numpy(dtype=np.float64) > 0
-            if not bool(traded.any()):
+    peer_wide = _traded_wide(panels, trade_syms, cfg, "ret_1") if len(trade_syms) >= 2 else None
+    cs_wides: dict[str, pd.DataFrame] = {}
+    if bool(cfg.cs_zscore) and peer_wide is not None:
+        for src, dest in CS_ZSCORE_SOURCES:
+            src_wide = peer_wide if src == "ret_1" else _traded_wide(
+                panels, trade_syms, cfg, src
+            )
+            if src_wide is None:
                 continue
-            parts.append(
-                pd.DataFrame(
-                    {
-                        "key": _cross_section_key(panel, cfg).to_numpy()[traded],
-                        "symbol": sym,
-                        "ret_1": panel["ret_1"].to_numpy(dtype=np.float64)[traded],
-                    }
-                )
-            )
-        if len(parts) >= 2:
-            long = pd.concat(parts, ignore_index=True)
-            peer_wide = long.pivot_table(
-                index="key", columns="symbol", values="ret_1", aggfunc="mean"
-            )
+            cs_wides[dest] = _cs_zscore_wide(src_wide)
 
-    if mkt is None and peer_wide is None:
+    if mkt is None and peer_wide is None and not cs_wides:
         return panels
 
     out: dict[str, pd.DataFrame] = {}
@@ -493,6 +531,15 @@ def attach_cross_section_features(
         p["peer_ret_1"] = np.clip(peer, -clip, clip)
         p["mkt_ret_1"] = np.clip(mkt_vals, -clip, clip)
         p["idio_ret_1"] = np.clip(own - mkt_vals, -clip, clip)
+        for _src, dest in CS_ZSCORE_SOURCES:
+            if dest not in p.columns:
+                p[dest] = 0.0
+            wide = cs_wides.get(dest)
+            if wide is None or sym not in getattr(wide, "columns", []):
+                p[dest] = 0.0
+                continue
+            vals = keys.map(wide[sym]).to_numpy(dtype=np.float64)
+            p[dest] = np.clip(np.where(np.isfinite(vals), vals, 0.0), -clip, clip)
         out[sym] = p
     return out
 
@@ -910,6 +957,22 @@ def build_datasets(
     paths = list(paths) if paths is not None else discover_symbol_files(
         cfg.data_dir, interval=cfg.interval
     )
+    allowed = allowed_symbols(cfg.universe)
+    if allowed is not None:
+        kept = [p for p in paths if symbol_from_path(p) in allowed]
+        skipped = len(paths) - len(kept)
+        if log_fn:
+            log_fn(
+                f"universe={cfg.universe!r}: {len(kept)} parquet(s) "
+                f"(dropped {skipped} non-members)"
+            )
+        paths = kept
+        if not paths:
+            raise FileNotFoundError(
+                f"no parquets in {cfg.data_dir} match universe={cfg.universe!r}. "
+                "Download with: python -m forecast.download --universe liquid "
+                "--source yahoo --replace --interval daily"
+            )
 
     raw_panels: dict[str, pd.DataFrame] = {}
     path_by_symbol: dict[str, Path] = {}
@@ -1101,6 +1164,8 @@ def build_datasets(
         "feature_names": list(FEATURE_NAMES),
         "meta": meta,
         "cross_section": use_cs,
+        "cs_min_names": int(cfg.cross_section_min_names),
+        "universe": cfg.universe,
     }
 
 
@@ -1123,24 +1188,56 @@ def fit_ridge_readout(
     feature_std: np.ndarray,
     *,
     ridge: float = 1.0,
+    cs_demean: bool = False,
+    min_names: int = 8,
 ) -> tuple[np.ndarray, float, float]:
-    """Train-only ridge of target on normalized features. Returns weight, bias, IC."""
+    """Train-only ridge of target on normalized features. Returns weight, bias, IC.
+
+    ``cs_demean=True`` date-demeans X and y (the CS linear baseline). Inference
+    still applies ``w·x + b`` without demeaning: within-date Pearson is invariant
+    to a per-date additive shift, so CS IC matches the demeaned fit.
+    """
     n_features = int(np.asarray(feature_mean).shape[0])
-    chunks_x: list[np.ndarray] = []
-    chunks_y: list[np.ndarray] = []
     mean = np.asarray(feature_mean, dtype=np.float64)
     std = np.asarray(feature_std, dtype=np.float64)
+    rows_x: list[np.ndarray] = []
+    rows_y: list[np.ndarray] = []
+    rows_d: list[np.ndarray] = []
+    have_dates = True
     for sym in symbols:
         if not bool(sym.valid.any()):
             continue
         raw = sym.features[sym.valid].astype(np.float64, copy=False)
-        chunks_x.append((raw - mean) / std)
-        chunks_y.append(sym.target[sym.valid].astype(np.float64, copy=False))
-    if not chunks_x:
+        rows_x.append((raw - mean) / std)
+        rows_y.append(sym.target[sym.valid].astype(np.float64, copy=False))
+        if sym.dates is None:
+            have_dates = False
+            rows_d.append(np.full(int(sym.valid.sum()), -1, dtype=np.int64))
+        else:
+            rows_d.append(sym.dates[sym.valid].astype(np.int64, copy=False))
+    if not rows_x:
         return np.zeros(n_features, dtype=np.float32), 0.0, float("nan")
 
-    x = np.concatenate(chunks_x, axis=0)
-    y = np.concatenate(chunks_y, axis=0)
+    x_all = np.concatenate(rows_x, axis=0)
+    y_all = np.concatenate(rows_y, axis=0)
+    d_all = np.concatenate(rows_d, axis=0)
+    x, y = x_all, y_all
+    used_cs = False
+    if cs_demean and have_dates:
+        xs: list[np.ndarray] = []
+        ys: list[np.ndarray] = []
+        for key in np.unique(d_all):
+            sel = d_all == key
+            if int(sel.sum()) < int(min_names):
+                continue
+            xd = x_all[sel]
+            yd = y_all[sel]
+            xs.append(xd - xd.mean(axis=0, keepdims=True))
+            ys.append(yd - yd.mean())
+        if xs:
+            x = np.concatenate(xs, axis=0)
+            y = np.concatenate(ys, axis=0)
+            used_cs = True
     design = np.concatenate([x, np.ones((x.shape[0], 1), dtype=np.float64)], axis=1)
     lam = max(0.0, float(ridge))
     xtx = design.T @ design
@@ -1151,20 +1248,49 @@ def fit_ridge_readout(
         coef = np.linalg.lstsq(xtx, design.T @ y, rcond=None)[0]
     weights = coef[:-1].astype(np.float32)
     bias = float(coef[-1])
-    pred = x @ coef[:-1] + coef[-1]
+    pred_fit = x @ coef[:-1] + coef[-1]
     ic = float("nan")
-    if pred.size >= 2:
-        pc = pred - pred.mean()
+    if pred_fit.size >= 2:
+        pc = pred_fit - pred_fit.mean()
         yc = y - y.mean()
         denom = float(np.sqrt((pc * pc).sum() * (yc * yc).sum()))
         if denom > 1e-12:
             ic = float((pc * yc).sum() / denom)
-    # OLS can match correlation with huge |w|. Scale to the MSE-optimal
-    # amplitude rho * sigma_y so the skip does not start 2x too volatile.
-    pred_std = float(pred.std())
+    pred_std = float(pred_fit.std())
     y_std = float(y.std())
     if pred_std > 1e-8 and y_std > 1e-8 and np.isfinite(ic):
         amp = abs(ic) * y_std / pred_std
         weights = (weights * amp).astype(np.float32)
         bias = float(bias * amp)
+    if used_cs and have_dates:
+        pred_raw = x_all @ weights.astype(np.float64) + bias
+        cs_ics: list[float] = []
+        demeaned_p: list[np.ndarray] = []
+        demeaned_y: list[np.ndarray] = []
+        for key in np.unique(d_all):
+            sel = d_all == key
+            if int(sel.sum()) < int(min_names):
+                continue
+            a = pred_raw[sel]
+            b = y_all[sel]
+            a_c = a - a.mean()
+            b_c = b - b.mean()
+            demeaned_p.append(a_c)
+            demeaned_y.append(b_c)
+            denom = float(np.sqrt((a_c * a_c).sum() * (b_c * b_c).sum()))
+            if denom > 1e-12:
+                cs_ics.append(float((a_c * b_c).sum() / denom))
+        if cs_ics:
+            ic = float(np.mean(cs_ics))
+        if demeaned_p:
+            p_cat = np.concatenate(demeaned_p)
+            y_cat = np.concatenate(demeaned_y)
+            p_std = float(p_cat.std())
+            y_std_cs = float(y_cat.std())
+            if p_std > 1e-8 and y_std_cs > 1e-8 and np.isfinite(ic):
+                amp = abs(ic) * y_std_cs / p_std
+                weights = (weights * amp).astype(np.float32)
+                bias = float(bias * amp)
+        # Drop the global intercept: CS scores are relative.
+        bias = 0.0
     return weights, bias, ic
