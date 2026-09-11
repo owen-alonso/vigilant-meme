@@ -9,9 +9,10 @@
 Fits the PR #5 overnight skip on TRAIN. Scores residual*sigma on locked TEST
 (the PR #8 baseline). Additional readouts (affine, drift-veto vs always-up,
 piecewise/bin calibration, weekday intercepts, TS overnight ridge, sign ridge,
-ADV sleeve, confidence slices, long-only book up-rate) are fit on TRAIN and
-gated on locked VAL — never on TEST. Direction skill is excess vs the
-unconditional overnight-up rate (~54.3% on liquid TEST), not vs a coin flip.
+ADV sleeve, confidence slices, conditional high-|pred| left-tail/confidence
+blend, long-only book up-rate) are fit on TRAIN and gated on locked VAL —
+never on TEST. Direction skill is excess vs the unconditional overnight-up
+rate (~54.3% on liquid TEST), not vs a coin flip.
 """
 
 from __future__ import annotations

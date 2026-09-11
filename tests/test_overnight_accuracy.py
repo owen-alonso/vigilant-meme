@@ -12,8 +12,13 @@ from forecast.accuracy import (
     apply_affine,
     apply_bin_constants,
     apply_calibrate_spec,
+    apply_cond_dir_blend,
     apply_drift_veto,
     apply_readout,
+    cond_abs_mask,
+    fit_cond_dir_blend,
+    fit_confidence_blend,
+    fit_left_tail_l1,
     direction_hits,
     evaluate_overnight_accuracy,
     evaluate_overnight_skip,
@@ -236,6 +241,7 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert "dow_gap" in names
     assert "confidence_blend" in names
     assert "left_tail_l1" in names
+    assert "cond_dir_blend" in names
     promo = payload["promotion"]
     assert promo["cs_skip_unchanged"] is True
     # Promotion is VAL-only; test keys exist for the report but are not the gate.
@@ -275,6 +281,16 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert "up_pct" in year0
     assert payload["calibrate"]["name"] == promo["accuracy_default"]
     assert "kind" in payload["calibrate"]
+    cond_row = by_name["cond_dir_blend"]
+    assert cond_row["fit"] == "train"
+    assert "cond_val" in cond_row and "cond_test" in cond_row
+    assert "cond_gate" in cond_row
+    assert np.isfinite(float((cond_row["params"] or {}).get("tau_abs") or float("nan")))
+    # TEST juiciness must not be the VAL gate.
+    juicy = float((cond_row["cond_test"].get("blend") or {}).get("dir_pct") or 0.0)
+    gate_dir = float((cond_row["cond_gate"] or {}).get("val_cond_dir_pct") or float("nan"))
+    assert np.isfinite(gate_dir)
+    del juicy
 
 
 def test_zero_move_direction_is_zero_not_nan():
@@ -365,6 +381,48 @@ def test_bin_edges_come_from_train_only():
     hat = apply_bin_constants(later_p, e0, v0)
     assert hat.shape == later_p.shape
     assert np.isfinite(hat).all()
+
+
+def test_cond_dir_blend_is_train_only_and_masks_low_abs():
+    rng = np.random.default_rng(5)
+    train_p = rng.normal(scale=0.01, size=500)
+    train_y = np.where(train_p < np.quantile(train_p, 0.20), -0.005, 0.003)
+    train_y = train_y + rng.normal(scale=0.0004, size=500)
+    left = fit_left_tail_l1(train_p, train_y)
+    a, b = fit_affine_l1(train_p, train_y)
+    b_up = float(np.median(train_y))
+    blend = fit_confidence_blend(train_p, train_y, a, b, b_up)
+    spec = fit_cond_dir_blend(train_p, train_y, left, blend, b_up)
+    later_p = rng.normal(loc=0.03, scale=0.02, size=200)
+    later_y = -np.sign(later_p) * 0.01
+    leaked = fit_cond_dir_blend(
+        np.concatenate([train_p, later_p]),
+        np.concatenate([train_y, later_y]),
+        fit_left_tail_l1(np.concatenate([train_p, later_p]), np.concatenate([train_y, later_y])),
+        fit_confidence_blend(
+            np.concatenate([train_p, later_p]),
+            np.concatenate([train_y, later_y]),
+            *fit_affine_l1(np.concatenate([train_p, later_p]), np.concatenate([train_y, later_y])),
+            float(np.median(np.concatenate([train_y, later_y]))),
+        ),
+        float(np.median(np.concatenate([train_y, later_y]))),
+    )
+    assert spec["q"] in (0.50, 0.60, 0.70, 0.80, 0.90)
+    assert spec["lam"] in (0.0, 0.25, 0.50, 0.75, 1.0)
+    assert (
+        abs(float(leaked["tau_abs"]) - float(spec["tau_abs"])) > 1e-12
+        or abs(float(leaked["lam"]) - float(spec["lam"])) > 1e-12
+        or abs(float(leaked["q"]) - float(spec["q"])) > 1e-12
+    )
+    hat = apply_cond_dir_blend(train_p, **{k: spec[k] for k in (
+        "tau_abs", "lam", "left_tau", "left_a_neg", "left_b_up",
+        "conf_tau", "conf_a", "conf_b", "conf_b_up", "b_up",
+    )})
+    low = ~cond_abs_mask(train_p, spec["tau_abs"])
+    if int(low.sum()) >= 4:
+        assert np.allclose(hat[low], spec["b_up"])
+    cal = apply_calibrate_spec(train_p, {"kind": "cond_dir_blend", **spec})
+    assert np.allclose(cal, hat)
 
 
 def test_apply_calibrate_spec_affine_and_veto():

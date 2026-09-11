@@ -15,8 +15,9 @@ PR #7 levers stay off unless a checkpoint documents them.
 
 Train-only accuracy readouts (affine residual→raw overnight, drift-veto,
 piecewise/bin calibration, weekday intercepts, TS overnight ridge, sign ridge,
-ADV sleeve, confidence slices) are fit on TRAIN and gated on locked VAL. They
-do not replace the residual CS skip. Next open is never a feature.
+ADV sleeve, confidence slices, conditional high-|pred| left-tail/confidence
+blend) are fit on TRAIN and gated on locked VAL. They do not replace the
+residual CS skip. Next open is never a feature.
 """
 
 from __future__ import annotations
@@ -859,6 +860,9 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
     ablate = payload.get("ablation")
     if ablate:
         lines.extend(["", format_ablation_table(ablate, payload.get("promotion") or {})])
+        cond_txt = format_cond_dir_block(ablate, payload.get("promotion") or {})
+        if cond_txt:
+            lines.extend(["", cond_txt])
     conf = payload.get("confidence")
     if conf:
         lines.extend(["", format_confidence_block(conf)])
@@ -1322,6 +1326,110 @@ def apply_confidence_blend(
     return np.where(np.abs(p) >= float(tau), affine, float(b_up))
 
 
+COND_DIR_ABS_QS = (0.50, 0.60, 0.70, 0.80, 0.90)
+COND_DIR_LAMBDAS = (0.0, 0.25, 0.50, 0.75, 1.0)
+
+
+def apply_cond_dir_blend(
+    pred_r: np.ndarray,
+    *,
+    tau_abs: float,
+    lam: float,
+    left_tau: float,
+    left_a_neg: float,
+    left_b_up: float,
+    conf_tau: float,
+    conf_a: float,
+    conf_b: float,
+    conf_b_up: float,
+    b_up: float,
+) -> np.ndarray:
+    """High-|pred| mix of left-tail L1 and confidence affine; else train-median.
+
+    Low-|pred| stays the MAE-optimal always-up constant. Next open is never used.
+    """
+    p = np.asarray(pred_r, dtype=np.float64)
+    left = apply_left_tail_l1(p, left_tau, left_a_neg, left_b_up)
+    conf = apply_confidence_blend(p, conf_tau, conf_a, conf_b, conf_b_up)
+    w = float(np.clip(lam, 0.0, 1.0))
+    mix = w * left + (1.0 - w) * conf
+    return np.where(np.abs(p) >= float(tau_abs), mix, float(b_up))
+
+
+def fit_cond_dir_blend(
+    pred_r: np.ndarray,
+    r_on: np.ndarray,
+    left: Mapping[str, Any],
+    blend: Mapping[str, Any],
+    b_up: float,
+    *,
+    abs_quantiles: Sequence[float] = COND_DIR_ABS_QS,
+    lambdas: Sequence[float] = COND_DIR_LAMBDAS,
+) -> dict[str, float]:
+    """TRAIN-only (q, λ) for the conditional left-tail / confidence mix.
+
+    Picks the pair with the best direction excess vs always-up, then MAE.
+    Thresholds and λ never see VAL/TEST.
+    """
+    p = np.asarray(pred_r, dtype=np.float64)
+    y = np.asarray(r_on, dtype=np.float64)
+    ok = np.isfinite(p) & np.isfinite(y)
+    p, y = p[ok], y[ok]
+    mag = np.abs(p)
+    fallback = {
+        "tau_abs": float(np.quantile(mag, 0.70) if mag.size else 0.0),
+        "q": 0.70,
+        "lam": 0.50,
+        "left_tau": float(left.get("tau") or 0.0),
+        "left_a_neg": float(left.get("a_neg") or 0.0),
+        "left_b_up": float(left.get("b_up") or b_up),
+        "conf_tau": float(blend.get("tau") or 0.0),
+        "conf_a": float(blend.get("a") or 0.0),
+        "conf_b": float(blend.get("b") or 0.0),
+        "conf_b_up": float(blend.get("b_up") or b_up),
+        "b_up": float(b_up),
+    }
+    if p.size < 32:
+        return fallback
+    best = dict(fallback)
+    best_key = (-1e9, 1e9)
+    for q in abs_quantiles:
+        tau_abs = float(np.quantile(mag, float(q)))
+        for lam in lambdas:
+            hat = apply_cond_dir_blend(
+                p,
+                tau_abs=tau_abs,
+                lam=float(lam),
+                left_tau=fallback["left_tau"],
+                left_a_neg=fallback["left_a_neg"],
+                left_b_up=fallback["left_b_up"],
+                conf_tau=fallback["conf_tau"],
+                conf_a=fallback["conf_a"],
+                conf_b=fallback["conf_b"],
+                conf_b_up=fallback["conf_b_up"],
+                b_up=float(b_up),
+            )
+            excess = _direction_excess(hat, y)
+            mae = float(np.mean(np.abs(hat - y)))
+            if not np.isfinite(excess):
+                continue
+            key = (excess, -mae)
+            if key > best_key:
+                best_key = key
+                best = {
+                    **fallback,
+                    "tau_abs": tau_abs,
+                    "q": float(q),
+                    "lam": float(lam),
+                }
+    return best
+
+
+def cond_abs_mask(pred_r: np.ndarray, tau_abs: float) -> np.ndarray:
+    p = np.asarray(pred_r, dtype=np.float64)
+    return np.isfinite(p) & (np.abs(p) >= float(tau_abs))
+
+
 def _table_to_jsonable(table: dict[int, float]) -> dict[str, float]:
     return {str(int(k)): float(v) for k, v in table.items()}
 
@@ -1408,6 +1516,20 @@ def apply_calibrate_spec(
             float(params.get("a") or 0.0),
             float(params.get("b") or 0.0),
             float(params.get("b_up") or 0.0),
+        )
+    if kind in ("cond_dir_blend",):
+        return apply_cond_dir_blend(
+            p,
+            tau_abs=float(params.get("tau_abs") or 0.0),
+            lam=float(params.get("lam") or 0.0),
+            left_tau=float(params.get("left_tau") or 0.0),
+            left_a_neg=float(params.get("left_a_neg") or 0.0),
+            left_b_up=float(params.get("left_b_up") or 0.0),
+            conf_tau=float(params.get("conf_tau") or 0.0),
+            conf_a=float(params.get("conf_a") or 0.0),
+            conf_b=float(params.get("conf_b") or 0.0),
+            conf_b_up=float(params.get("conf_b_up") or 0.0),
+            b_up=float(params.get("b_up") or 0.0),
         )
     if kind in ("dow_gap", "dow_plus_residual"):
         if dates is None:
@@ -1885,6 +2007,68 @@ def format_ablation_table(ablate: dict[str, Any], promotion: dict[str, Any]) -> 
     return "\n".join(lines)
 
 
+def format_cond_dir_block(ablate: dict[str, Any], promotion: dict[str, Any]) -> str:
+    """IDEA A: high-|pred| left-tail / confidence blend vs always-up + residual*σ."""
+    row = next(
+        (r for r in (ablate.get("rows") or []) if r.get("name") == "cond_dir_blend"),
+        None,
+    )
+    if not row:
+        return ""
+    params = row.get("params") or {}
+    gate = row.get("cond_gate") or {}
+    cv = row.get("cond_val") or {}
+    ct = row.get("cond_test") or {}
+    v = row.get("val") or {}
+    t = row.get("test") or {}
+    yes = bool(row.get("promote_dir"))
+    default = str(promotion.get("direction") or "") == "cond_dir_blend"
+
+    def _slim_line(label: str, slim: dict[str, Any]) -> str:
+        slim = slim or {}
+        return (
+            f"  {label:<22} dir {_as_float(slim.get('dir_pct')):6.2f}%  "
+            f"xs {_as_float(slim.get('excess_pp')):+6.2f}pp  "
+            f"MAE% {100.0 * _as_float(slim.get('mae_pct')):7.4f}  "
+            f"MAE$ {_as_float(slim.get('mae_usd')):7.4f}  "
+            f"cover {100.0 * _as_float(slim.get('coverage')):5.1f}%"
+        )
+
+    lines = [
+        f"PROMOTE COND-DIR BLEND? {'YES' if yes else 'NO'}"
+        + ("  (accuracy default)" if default else ""),
+        "  high-|pred_r| mix of train left_tail_l1 and confidence_blend; "
+        "else train-median always-up. Fit (q, λ) on TRAIN. "
+        "VAL gate: slice dir ≥ train-median floor +0.2pp AND ≥ residual*σ "
+        "on the same slice +0.2pp. CS skip / live book unchanged.",
+        f"  TRAIN q={_as_float(params.get('q')):.2f}  "
+        f"λ={_as_float(params.get('lam')):.2f}  "
+        f"τ_|pred|={_as_float(params.get('tau_abs')):.6f}  "
+        f"(fit_split=train)",
+        f"  VAL floor train-median {_as_float(gate.get('val_median_floor_dir_pct')):.2f}%  "
+        f"slice resid {_as_float(gate.get('val_resid_slice_dir_pct')):.2f}%  "
+        f"slice blend {_as_float(gate.get('val_cond_dir_pct')):.2f}%  "
+        f"cover {100.0 * _as_float(gate.get('val_cover')):.1f}%",
+        f"  full-frame VAL dir {_as_float(v.get('dir_pct')):.2f}%  "
+        f"xs {_as_float(v.get('excess_pp')):+.2f}pp  "
+        f"MAE {_as_float(v.get('mae_usd')):.4f}$ / "
+        f"{100.0 * _as_float(v.get('mae_pct')):.4f}%",
+        "  VAL high-|pred| slice (gate):",
+        _slim_line("blend", cv.get("blend") or {}),
+        _slim_line("residual*sigma", cv.get("residual_sigma") or {}),
+        _slim_line("train-median", cv.get("train_median") or {}),
+        f"  full-frame TEST dir {_as_float(t.get('dir_pct')):.2f}%  "
+        f"xs {_as_float(t.get('excess_pp')):+.2f}pp  "
+        f"MAE {_as_float(t.get('mae_usd')):.4f}$ / "
+        f"{100.0 * _as_float(t.get('mae_pct')):.4f}%  (report-only)",
+        "  TEST high-|pred| slice (report-only):",
+        _slim_line("blend", ct.get("blend") or {}),
+        _slim_line("residual*sigma", ct.get("residual_sigma") or {}),
+        _slim_line("train-median", ct.get("train_median") or {}),
+    ]
+    return "\n".join(lines)
+
+
 def format_confidence_block(conf: dict[str, Any]) -> str:
     lines = [
         "CONFIDENCE ( |pred_r| vs TRAIN quantiles; scored on locked TEST )",
@@ -2025,6 +2209,7 @@ def evaluate_overnight_accuracy(
     veto = fit_drift_veto(train_pred_r, train_r)
     left_tail = fit_left_tail_l1(train_pred_r, train_r)
     blend = fit_confidence_blend(train_pred_r, train_r, a_l1, b_l1, mu_med)
+    cond_blend = fit_cond_dir_blend(train_pred_r, train_r, left_tail, blend, mu_med)
     dow_table, dow_default = fit_group_median(
         train_r, weekday_of_dates(tr["date"].to_numpy(dtype=np.int64))
     )
@@ -2067,6 +2252,7 @@ def evaluate_overnight_accuracy(
     veto_spec = {"kind": "drift_veto", **veto}
     left_spec = {"kind": "left_tail_l1", **left_tail}
     blend_spec = {"kind": "confidence_blend", **blend}
+    cond_spec = {"kind": "cond_dir_blend", **cond_blend}
     dow_spec = {
         "kind": "dow_gap",
         "by_dow": _table_to_jsonable(dow_table),
@@ -2278,6 +2464,37 @@ def evaluate_overnight_accuracy(
             ),
         ),
         (
+            "cond_dir_blend",
+            "direction",
+            cond_spec,
+            lambda d, x, spec=cond_blend: apply_cond_dir_blend(
+                d["pred_r"].to_numpy(dtype=np.float64),
+                tau_abs=spec["tau_abs"],
+                lam=spec["lam"],
+                left_tau=spec["left_tau"],
+                left_a_neg=spec["left_a_neg"],
+                left_b_up=spec["left_b_up"],
+                conf_tau=spec["conf_tau"],
+                conf_a=spec["conf_a"],
+                conf_b=spec["conf_b"],
+                conf_b_up=spec["conf_b_up"],
+                b_up=spec["b_up"],
+            ),
+            lambda d, x, spec=cond_blend: apply_cond_dir_blend(
+                d["pred_r"].to_numpy(dtype=np.float64),
+                tau_abs=spec["tau_abs"],
+                lam=spec["lam"],
+                left_tau=spec["left_tau"],
+                left_a_neg=spec["left_a_neg"],
+                left_b_up=spec["left_b_up"],
+                conf_tau=spec["conf_tau"],
+                conf_a=spec["conf_a"],
+                conf_b=spec["conf_b"],
+                conf_b_up=spec["conf_b_up"],
+                b_up=spec["b_up"],
+            ),
+        ),
+        (
             "dow_gap",
             "calendar",
             dow_spec,
@@ -2345,6 +2562,76 @@ def evaluate_overnight_accuracy(
         )
         rows.append(row)
 
+    # IDEA A: conditional direction on high-|pred|. Gate vs always-up floor
+    # (train-median full-frame VAL) AND residual*sigma on the same TRAIN tau slice.
+    cond_row = next((r for r in rows if r.get("name") == "cond_dir_blend"), None)
+    if cond_row is not None:
+        tau_abs = float(cond_blend.get("tau_abs") or 0.0)
+        slice_min = max(2, min(3, min_names))
+
+        def _slice_slim(frame: pd.DataFrame, pred: np.ndarray) -> dict[str, Any]:
+            mask = cond_abs_mask(frame["pred_r"].to_numpy(dtype=np.float64), tau_abs)
+            cover = float(mask.mean()) if mask.size else float("nan")
+            if int(mask.sum()) < 8:
+                out = slim_accuracy({"empty": True})
+                out["coverage"] = cover
+                out["n_slice"] = float(int(mask.sum()))
+                return out
+            out = slim_accuracy(_score_pred_r(frame.loc[mask], pred[mask], slice_min))
+            out["coverage"] = cover
+            out["n_slice"] = float(int(mask.sum()))
+            return out
+
+        va_resid = va["pred_r"].to_numpy(dtype=np.float64)
+        te_resid = te["pred_r"].to_numpy(dtype=np.float64)
+        va_med = np.full(len(va), mu_med, dtype=np.float64)
+        te_med = np.full(len(te), mu_med, dtype=np.float64)
+        va_hat = pred_r_by_name["cond_dir_blend"]["val"]
+        te_hat = pred_r_by_name["cond_dir_blend"]["test"]
+        cond_val = {
+            "blend": _slice_slim(va, va_hat),
+            "residual_sigma": _slice_slim(va, va_resid),
+            "train_median": _slice_slim(va, va_med),
+        }
+        cond_test = {
+            "blend": _slice_slim(te, te_hat),
+            "residual_sigma": _slice_slim(te, te_resid),
+            "train_median": _slice_slim(te, te_med),
+        }
+        cond_row["cond_val"] = cond_val
+        cond_row["cond_test"] = cond_test
+        cond_row["params"] = {
+            **dict(cond_row.get("params") or {}),
+            "tau_abs": tau_abs,
+            "q": float(cond_blend.get("q") or 0.0),
+            "lam": float(cond_blend.get("lam") or 0.0),
+        }
+        blend_dir = _as_float((cond_val.get("blend") or {}).get("dir_pct"))
+        resid_dir = _as_float((cond_val.get("residual_sigma") or {}).get("dir_pct"))
+        floor_dir = _as_float(val_med.get("dir_pct"))
+        cover = _as_float((cond_val.get("blend") or {}).get("coverage"))
+        beats_floor = (
+            np.isfinite(blend_dir)
+            and np.isfinite(floor_dir)
+            and blend_dir >= floor_dir + 100.0 * DIR_LIFT
+        )
+        beats_resid = (
+            np.isfinite(blend_dir)
+            and np.isfinite(resid_dir)
+            and blend_dir >= resid_dir + 100.0 * DIR_LIFT
+        )
+        cover_ok = (not np.isfinite(cover)) or cover >= 0.05
+        cond_row["promote_dir"] = bool(beats_floor and beats_resid and cover_ok)
+        cond_row["cond_gate"] = {
+            "beats_train_median_floor": beats_floor,
+            "beats_residual_sigma_slice": beats_resid,
+            "cover_ok": cover_ok,
+            "val_cond_dir_pct": blend_dir,
+            "val_resid_slice_dir_pct": resid_dir,
+            "val_median_floor_dir_pct": floor_dir,
+            "val_cover": cover,
+        }
+
     # Liquid sleeve on the residual skip (eval filter, same w).
     if "turnover_z" in te.columns and not te.empty:
         for split_name, sdf, sx in (("val", va, xva), ("test", te, xte)):
@@ -2395,6 +2682,7 @@ def evaluate_overnight_accuracy(
             "drift_veto": veto,
             "left_tail_l1": left_tail,
             "confidence_blend": blend,
+            "cond_dir_blend": cond_blend,
             "piecewise_l1": piecewise_spec,
             "bin_calibrate": bin_spec,
             "dow_gap": dow_spec,
@@ -2448,6 +2736,19 @@ def evaluate_overnight_accuracy(
         ),
         "confidence_blend": apply_confidence_blend(
             train_pred_r, blend["tau"], blend["a"], blend["b"], blend["b_up"]
+        ),
+        "cond_dir_blend": apply_cond_dir_blend(
+            train_pred_r,
+            tau_abs=cond_blend["tau_abs"],
+            lam=cond_blend["lam"],
+            left_tau=cond_blend["left_tau"],
+            left_a_neg=cond_blend["left_a_neg"],
+            left_b_up=cond_blend["left_b_up"],
+            conf_tau=cond_blend["conf_tau"],
+            conf_a=cond_blend["conf_a"],
+            conf_b=cond_blend["conf_b"],
+            conf_b_up=cond_blend["conf_b_up"],
+            b_up=cond_blend["b_up"],
         ),
         "dow_gap": train_dow,
         "dow_plus_residual": train_dow + apply_affine(train_pred_r, a_dow, b_dow),

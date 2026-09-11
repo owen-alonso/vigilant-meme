@@ -69,6 +69,7 @@ python -m forecast.training --universe liquid --interval daily --skip-only \
 
 # locked TEST direction % + next-open MAE (PR #8 baseline + train-only readouts)
 # fit on TRAIN, promote on locked VAL, report locked TEST. Not live P&L.
+# cond_dir_blend = high-|pred| mix of left_tail_l1 ⊕ confidence_blend (TRAIN q,λ)
 python scripts/overnight_accuracy.py --data-dir data --universe liquid \
     --json checkpoints/forecast_ridge_overnight/accuracy.json \
     --calibrate-json checkpoints/forecast_ridge_overnight/overnight_calibrate.json
