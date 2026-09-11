@@ -300,8 +300,9 @@ def test_peer_residual_other_name_next_open_is_label():
 
 
 def test_thin_shorts_pay_more_borrow_under_micro():
-    w = np.array([[-0.5, 0.5]])
-    tz = np.array([[-2.0, 2.0]])
+    # row_cs_thin_mask needs ≥3 finite names on the date.
+    w = np.array([[-0.5, 0.25, 0.25, 0.0]])
+    tz = np.array([[-2.0, 1.0, 1.0, 0.5]])
     flat = overnight_cost_breakdown(
         weights=w, round_trip_bps=0.0, borrow_bps=5.0, turnover_z=tz
     )

@@ -721,9 +721,9 @@ def apply_ridge_skip(
 
         tz = x[:, list(FEATURE_NAMES).index("turnover_z")]
         keep_liq = sleeve_row_mask(tz, dates, floor=floor)
-        if bool(keep_liq.any()) and int(keep_liq.sum()) >= min_names:
+        if bool(keep_liq.any()):
             x, y, dates = x[keep_liq], y[keep_liq], dates[keep_liq]
-            min_names = max(8, int(round(min_names * max(0.05, 1.0 - floor))))
+            min_names = max(3, int(round(min_names * max(0.05, 1.0 - floor))))
     stable = str(getattr(train_cfg, "ridge_year_stable", "") or "")
     col_scale = None
     if stable in ("train", "train_val"):

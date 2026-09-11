@@ -166,21 +166,23 @@ def _fit(
     sleeve_floor: float = 0.0,
 ) -> tuple[np.ndarray, float, Any]:
     x, y, d = _train_xy(cache)
+    min_names = int(cache["cs_min_names"])
     mask = feature_mask(mask_mode or PROMOTED["mask_mode"])
     col_scale = None
     if sign_shrink:
-        col_scale = sign_consistency_weights(x, y, d, min_names=int(cache["cs_min_names"]))
+        col_scale = sign_consistency_weights(x, y, d, min_names=min_names)
     if sleeve_floor > 0 and "turnover_z" in FEATURE_NAMES:
         tz = x[:, list(FEATURE_NAMES).index("turnover_z")]
         keep = sleeve_row_mask(tz, d, floor=sleeve_floor)
         if bool(keep.any()):
             x, y, d = x[keep], y[keep], d[keep]
+            min_names = max(3, int(round(min_names * max(0.05, 1.0 - sleeve_floor))))
     w, b, ic = fit_ridge_xy(
         x,
         y,
         d,
         ridge=float(PROMOTED["ridge"]),
-        min_names=int(cache["cs_min_names"]),
+        min_names=min_names,
         cs_demean=True,
         rank_target=True,
         feat_winsor=float(PROMOTED["feat_winsor"]),
@@ -438,7 +440,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"  {bname}: unlev IR={books[bname]['unlevered_net_ir']:+.3f} "
             f"lev IR={books[bname]['levered_net_ir']:+.3f} "
-            f"maxDD={books[bname]['levered_max_dd']:+.3f}",
+            f"maxDD={books[bname]['levered_max_dd']:+.3f} "
+            f"csIC={books[bname]['mean_cs_ic']:+.4f}",
             flush=True,
         )
 
