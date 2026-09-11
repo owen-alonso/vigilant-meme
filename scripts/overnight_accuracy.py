@@ -19,6 +19,10 @@ sleeve as an optional live_long_only path on VAL unlev net IR / max DD.
 IDEA G fits residual→overnight MAE maps on the sector-overnight skip
 (affine_l1 / piecewise_l1 / huber_affine / bin_calibrate) and promotes a
 new MAE default only on a clear locked-VAL % MAE margin.
+IDEA H scores within-date sign(pred − CS median) vs sign(r_on − CS median)
+on the sector-overnight skip (hit vs 50%) and the absolute overnight-up of
+the long half (pred > CS median) vs the uncond floor / top-20%. Optional
+TRAIN |pred−median| floor. Live q20 unchanged.
 """
 
 from __future__ import annotations

@@ -9,6 +9,8 @@ converts that to an implied overnight log-return ``pred * sigma`` (same as
 - implied next-open vs actual next open
 - long-only book up-rate on the within-date top residual names
 - book-aligned sleeve overnight-up (TRAIN q / |pred| grid, VAL-gated)
+- within-date relative direction vs CS median (VAL-gated vs 50%)
+- long-half absolute overnight-up (pred > CS median) vs the up-floor
 - short-sleeve overnight down-rate on the within-date bottom residual names
 
 Default recipe is the PR #5 overnight skip (rank-target ridge, ``no_long_ts``).
@@ -61,6 +63,11 @@ BOOK_ALIGN_COVER = 0.05
 # IDEA G: clear VAL % MAE margin vs residual×σ / zero-move / train-median (0.5 bp).
 MAE_LIFT = 5e-5
 SECTOR_MAE_MAPS = ("affine_l1", "piecewise_l1", "huber_affine", "bin_calibrate")
+# IDEA H: within-date relative direction vs 50%, and long-half overnight-up.
+REL_DIR_LIFT_PP = 0.50
+REL_DIR_Z = 1.0
+REL_COVER = 0.05
+REL_ABS_QS = (0.0, 0.50, 0.70)
 TURNOVER_COL = FEATURE_NAMES.index("turnover_z") if "turnover_z" in FEATURE_NAMES else None
 VOL_LEVEL_COL = FEATURE_NAMES.index("vol_level") if "vol_level" in FEATURE_NAMES else None
 # PR #8 locked-TEST residual*sigma print (do not retarget; compare on the same window).
@@ -794,6 +801,304 @@ def decide_book_aligned_promote(
     }
 
 
+def cs_relative_blocks(
+    df: pd.DataFrame,
+    *,
+    score_col: str = "pred",
+    min_names: int = 3,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Within-date ``pred − CS median`` / ``r_on − CS median`` and long-half mask.
+
+    Dates with fewer than ``min_names`` are dropped. Next open is never used.
+    """
+    n = len(df)
+    pred_rel = np.full(n, np.nan, dtype=np.float64)
+    r_rel = np.full(n, np.nan, dtype=np.float64)
+    abs_dev = np.full(n, np.nan, dtype=np.float64)
+    long_half = np.zeros(n, dtype=bool)
+    date_ok = np.zeros(n, dtype=bool)
+    if df.empty or score_col not in df.columns or "r_on" not in df.columns:
+        return pred_rel, r_rel, abs_dev, long_half, date_ok
+    dates = df["date"].to_numpy(dtype=np.int64)
+    score = df[score_col].to_numpy(dtype=np.float64)
+    r = df["r_on"].to_numpy(dtype=np.float64)
+    for key in np.unique(dates):
+        sel = dates == key
+        row_p = score[sel]
+        row_r = r[sel]
+        finite_p = np.isfinite(row_p)
+        if int(finite_p.sum()) < int(min_names):
+            continue
+        date_ok[sel] = True
+        pmed = float(np.nanmedian(row_p))
+        rmed = float(np.nanmedian(row_r)) if np.isfinite(row_r).any() else float("nan")
+        pred_rel[sel] = row_p - pmed
+        r_rel[sel] = row_r - rmed
+        abs_dev[sel] = np.abs(row_p - pmed)
+        long_half[sel] = finite_p & (row_p > pmed)
+    return pred_rel, r_rel, abs_dev, long_half, date_ok
+
+
+def score_relative_direction(
+    df: pd.DataFrame,
+    *,
+    abs_tau: float = 0.0,
+    score_col: str = "pred",
+    min_names: int = 3,
+) -> dict[str, Any]:
+    """Relative CS-median sign hit vs 50%, plus long-half absolute overnight-up."""
+    empty = {
+        "abs_tau": float(abs_tau),
+        "rel_hit_pct": float("nan"),
+        "rel_excess_pp": float("nan"),
+        "rel_z": float("nan"),
+        "rel_p": float("nan"),
+        "rel_n": 0.0,
+        "rel_coverage": float("nan"),
+        "rel_n_dates": 0.0,
+        "long_up_pct": float("nan"),
+        "long_uncond_up_pct": float("nan"),
+        "long_excess_pp": float("nan"),
+        "long_n": 0.0,
+        "long_coverage": float("nan"),
+        "long_n_dates": 0.0,
+    }
+    if df.empty:
+        return empty
+    pred_rel, r_rel, abs_dev, long_half, date_ok = cs_relative_blocks(
+        df, score_col=score_col, min_names=min_names
+    )
+    rel_ok = (
+        date_ok
+        & np.isfinite(pred_rel)
+        & np.isfinite(r_rel)
+        & (pred_rel != 0.0)
+        & (r_rel != 0.0)
+    )
+    long_ok = date_ok & long_half
+    tau = float(abs_tau)
+    if tau > 0.0:
+        rel_ok = rel_ok & np.isfinite(abs_dev) & (abs_dev >= tau)
+        long_ok = long_ok & np.isfinite(abs_dev) & (abs_dev >= tau)
+    hits = (np.sign(pred_rel[rel_ok]) == np.sign(r_rel[rel_ok])).astype(np.float64)
+    inf = hit_rate_inference(hits)
+    dates = df["date"].to_numpy(dtype=np.int64)
+    r = df["r_on"].to_numpy(dtype=np.float64)
+    moved = np.isfinite(r) & (r != 0.0)
+    uncond = r[moved]
+    uncond_up = float((uncond > 0).mean()) if uncond.size else float("nan")
+    long_moved = long_ok & moved
+    up = float((r[long_moved] > 0).mean()) if int(long_moved.sum()) else float("nan")
+    rel_dates = float(pd.Series(dates[rel_ok]).nunique()) if int(rel_ok.sum()) else 0.0
+    long_dates = float(pd.Series(dates[long_ok]).nunique()) if int(long_ok.sum()) else 0.0
+    return {
+        **empty,
+        "rel_hit_pct": _as_float(inf.get("hit_rate_pct")),
+        "rel_excess_pp": (
+            _as_float(inf.get("hit_rate_pct")) - 50.0
+            if np.isfinite(_as_float(inf.get("hit_rate_pct")))
+            else float("nan")
+        ),
+        "rel_z": _as_float(inf.get("z_vs_half")),
+        "rel_p": _as_float(inf.get("p_vs_half")),
+        "rel_n": _as_float(inf.get("n"), default=0.0),
+        "rel_coverage": float(rel_ok.mean()) if rel_ok.size else float("nan"),
+        "rel_n_dates": rel_dates,
+        "long_up_pct": float(100.0 * up) if np.isfinite(up) else float("nan"),
+        "long_uncond_up_pct": (
+            float(100.0 * uncond_up) if np.isfinite(uncond_up) else float("nan")
+        ),
+        "long_excess_pp": (
+            float(100.0 * (up - uncond_up))
+            if np.isfinite(up) and np.isfinite(uncond_up)
+            else float("nan")
+        ),
+        "long_n": float(int(long_moved.sum())),
+        "long_coverage": float(long_ok.mean()) if long_ok.size else float("nan"),
+        "long_n_dates": long_dates,
+    }
+
+
+def fit_relative_dir_on_train(
+    df: pd.DataFrame,
+    *,
+    min_names: int,
+) -> dict[str, Any]:
+    """Select optional |pred−CS median| floor on TRAIN only."""
+    pred_rel, _r_rel, abs_dev, _lh, date_ok = cs_relative_blocks(
+        df, score_col="pred", min_names=min_names
+    )
+    del pred_rel
+    mag = abs_dev[date_ok & np.isfinite(abs_dev)]
+    rows: list[dict[str, Any]] = []
+    for aq in REL_ABS_QS:
+        tau = (
+            0.0
+            if float(aq) <= 0.0
+            else (float(np.quantile(mag, float(aq))) if mag.size else 0.0)
+        )
+        row = score_relative_direction(
+            df, abs_tau=tau, score_col="pred", min_names=min_names
+        )
+        row["abs_q"] = float(aq)
+        if not np.isfinite(_as_float(row.get("rel_hit_pct"))):
+            continue
+        cover = _as_float(row.get("rel_coverage"))
+        if np.isfinite(cover) and cover < REL_COVER:
+            continue
+        rows.append(row)
+    chosen: dict[str, Any] = {}
+    best_key = (-1e18, -1e18, -1.0)
+    for row in rows:
+        hit = _as_float(row.get("rel_hit_pct"))
+        xs = _as_float(row.get("rel_excess_pp"))
+        cover = _as_float(row.get("rel_coverage"))
+        if not np.isfinite(hit):
+            continue
+        key = (hit, xs, cover)
+        if key > best_key:
+            best_key = key
+            chosen = dict(row)
+    full = score_relative_direction(df, abs_tau=0.0, score_col="pred", min_names=min_names)
+    full["abs_q"] = 0.0
+    if not chosen:
+        chosen = dict(full)
+    return {
+        "rows": rows,
+        "chosen": chosen,
+        "full": full,
+        "fit_split": "train",
+        "abs_qs": list(REL_ABS_QS),
+        "score_col": "pred",
+        "note": (
+            "Within-date sign(pred − CS median) vs sign(r_on − CS median). "
+            "Optional TRAIN |pred−median| floor. Long-half = pred > CS median. "
+            "Pooled TS direction is report-only. Live q20 unchanged."
+        ),
+    }
+
+
+def decide_relative_dir_promote(
+    *,
+    val_chosen: dict[str, Any],
+    val_full: dict[str, Any],
+    val_top20: dict[str, Any],
+    chosen: dict[str, Any],
+) -> dict[str, Any]:
+    """VAL-only relative-dir vs 50% and long-half overnight-up vs floor/top-20%."""
+    rel = dict(val_chosen or {})
+    half = dict(val_full or {})
+    base = dict(val_top20 or {})
+    hit = _as_float(rel.get("rel_hit_pct"))
+    z = _as_float(rel.get("rel_z"))
+    cover = _as_float(rel.get("rel_coverage"))
+    abs_tau = _as_float((chosen or {}).get("abs_tau"), default=0.0)
+    abs_q = _as_float((chosen or {}).get("abs_q"), default=0.0)
+    hit_ok = bool(np.isfinite(hit) and hit >= 50.0 + REL_DIR_LIFT_PP)
+    z_ok = bool(np.isfinite(z) and z >= REL_DIR_Z)
+    cover_ok = bool(not np.isfinite(cover) or cover >= REL_COVER)
+    promote_rel = bool(hit_ok and z_ok and cover_ok)
+
+    long_up = _as_float(half.get("long_up_pct"))
+    long_floor = _as_float(half.get("long_uncond_up_pct"))
+    long_xs = _as_float(half.get("long_excess_pp"))
+    if not np.isfinite(long_xs) and np.isfinite(long_up) and np.isfinite(long_floor):
+        long_xs = float(long_up - long_floor)
+    up20 = _as_float(base.get("up_pct"))
+    long_cover = _as_float(half.get("long_coverage"))
+    floor_ok = bool(np.isfinite(long_xs) and long_xs >= BOOK_UP_FLOOR_PP)
+    vs_base = bool(
+        np.isfinite(long_up) and np.isfinite(up20) and long_up >= up20 + BOOK_UP_BASE_PP
+    )
+    long_cover_ok = bool(not np.isfinite(long_cover) or long_cover >= REL_COVER)
+    promote_long = bool(floor_ok and vs_base and long_cover_ok)
+    weaker_than_e = bool(np.isfinite(long_up) and np.isfinite(up20) and long_up < up20)
+
+    if not cover_ok:
+        rel_reason = (
+            f"NO PROMOTE relative-dir: VAL cover {100.0 * cover:.1f}% "
+            f"< {100.0 * REL_COVER:.0f}%."
+        )
+    elif not hit_ok:
+        rel_reason = (
+            f"NO PROMOTE relative-dir: VAL hit {hit:.2f}% "
+            f"< 50%+{REL_DIR_LIFT_PP:.1f}pp."
+        )
+    elif not z_ok:
+        rel_reason = (
+            f"NO PROMOTE relative-dir: VAL hit {hit:.2f}% but z={z:.2f} "
+            f"< {REL_DIR_Z:.1f} (not z-sensible)."
+        )
+    else:
+        rel_reason = (
+            f"PROMOTE relative-dir abs_q={abs_q:.2f}: VAL hit {hit:.2f}% "
+            f"(xs {hit - 50.0:+.2f} pp vs 50%, z={z:.2f})."
+        )
+
+    if not long_cover_ok:
+        long_reason = (
+            f"NO PROMOTE long-half up: VAL cover {100.0 * long_cover:.1f}% "
+            f"< {100.0 * REL_COVER:.0f}%."
+        )
+    elif not floor_ok:
+        long_reason = (
+            f"NO PROMOTE long-half up: VAL up {long_up:.2f}% vs floor "
+            f"{long_floor:.2f}% (xs {long_xs:+.2f} pp < +{BOOK_UP_FLOOR_PP:.1f} pp)."
+        )
+    elif not vs_base:
+        note = (
+            " weaker than top-20% / IDEA E book sleeve."
+            if weaker_than_e
+            else ""
+        )
+        long_reason = (
+            f"NO PROMOTE long-half up: VAL up {long_up:.2f}% vs top-20% "
+            f"{up20:.2f}% (delta {long_up - up20:+.2f} pp < +{BOOK_UP_BASE_PP:.1f} pp)."
+            + note
+        )
+    else:
+        long_reason = (
+            f"PROMOTE long-half up: VAL up {long_up:.2f}% vs floor "
+            f"{long_floor:.2f}% (xs {long_xs:+.2f} pp) and vs top-20% "
+            f"{up20:.2f}% (delta {long_up - up20:+.2f} pp)."
+        )
+    return {
+        "promote_relative_dir": promote_rel,
+        "promote_long_half": promote_long,
+        "gated_on": "val",
+        "rel_reason": rel_reason,
+        "long_reason": long_reason,
+        "reason": f"{rel_reason} {long_reason}",
+        "spec": (
+            {"abs_tau": float(abs_tau), "abs_q": float(abs_q), "score_col": "pred"}
+            if promote_rel
+            else {"abs_tau": 0.0, "abs_q": 0.0, "score_col": "pred"}
+        ),
+        "chosen": rel,
+        "full": half,
+        "baseline": base,
+        "train_abs_q": float(abs_q),
+        "train_abs_tau": float(abs_tau),
+        "val_rel_hit": hit,
+        "val_rel_z": z,
+        "val_rel_coverage": cover,
+        "val_long_up": long_up,
+        "val_long_floor": long_floor,
+        "val_long_excess_pp": long_xs,
+        "val_top20_up": up20,
+        "val_vs_top20_pp": (
+            float(long_up - up20)
+            if np.isfinite(long_up) and np.isfinite(up20)
+            else float("nan")
+        ),
+        "weaker_than_top20": weaker_than_e,
+        "rel_lift_pp": REL_DIR_LIFT_PP,
+        "rel_z_floor": REL_DIR_Z,
+        "cover_floor": REL_COVER,
+        "live_book_unchanged": True,
+    }
+
+
 def _restrict_cs_dates(df: pd.DataFrame, min_names: int) -> pd.DataFrame:
     if df.empty:
         return df
@@ -1177,6 +1482,9 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         mae_txt = format_sector_mae_block(payload)
         if mae_txt:
             lines.extend(["", mae_txt])
+        rel_txt = format_relative_dir_block(payload)
+        if rel_txt:
+            lines.extend(["", rel_txt])
     conf = payload.get("confidence")
     if conf:
         lines.extend(["", format_confidence_block(conf)])
@@ -3114,6 +3422,70 @@ def format_sector_mae_block(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _fmt_rel_row(label: str, row: Mapping[str, Any] | None) -> str:
+    r = dict(row or {})
+    return (
+        f"  {label:<16}  "
+        f"rel {_as_float(r.get('rel_hit_pct')):.2f}%  "
+        f"xs {_as_float(r.get('rel_excess_pp')):+.2f}pp vs 50%  "
+        f"z={_as_float(r.get('rel_z')):.2f}  "
+        f"cover {100.0 * _as_float(r.get('rel_coverage')):.1f}%  "
+        f"n={int(_as_float(r.get('rel_n'), 0.0))}  |  "
+        f"long-half up {_as_float(r.get('long_up_pct')):.2f}%  "
+        f"xs {_as_float(r.get('long_excess_pp')):+.2f}pp vs "
+        f"{_as_float(r.get('long_uncond_up_pct')):.2f}%  "
+        f"n={int(_as_float(r.get('long_n'), 0.0))}"
+    )
+
+
+def format_relative_dir_block(payload: dict[str, Any]) -> str:
+    promo = payload.get("relative_dir_promotion") or {}
+    fit = payload.get("relative_dir_fit") or {}
+    cmp = payload.get("relative_dir_compare") or {}
+    if not promo and not fit:
+        return ""
+    yes_rel = bool(promo.get("promote_relative_dir"))
+    yes_long = bool(promo.get("promote_long_half"))
+    chosen = fit.get("chosen") or {}
+    va_ch = (cmp.get("val") or {}).get("chosen") or {}
+    va_full = (cmp.get("val") or {}).get("full") or {}
+    va20 = (cmp.get("val") or {}).get("top20") or {}
+    te_ch = (cmp.get("test") or {}).get("chosen") or {}
+    te_full = (cmp.get("test") or {}).get("full") or {}
+    te20 = (cmp.get("test") or {}).get("top20") or {}
+    return "\n".join(
+        [
+            f"PROMOTE RELATIVE-DIR? {'YES' if yes_rel else 'NO'}  "
+            f"PROMOTE LONG-HALF UP? {'YES' if yes_long else 'NO'}",
+            "  Within-date sign(pred − CS median) vs sign(r_on − CS median) "
+            "on sector-overnight skip pred. Hit vs 50%. Long-half = pred > CS "
+            "median, absolute overnight-up vs uncond floor and vs top-20%. "
+            "Optional TRAIN |pred−median| floor. TEST report-only. "
+            "Live q20 unchanged.",
+            f"  TRAIN pick abs_q={_as_float(chosen.get('abs_q')):.2f}  "
+            f"|pred−med|>={_as_float(chosen.get('abs_tau')):.5f}  "
+            f"fit_split={fit.get('fit_split')!r}",
+            "  VAL (gate):",
+            _fmt_rel_row("full", va_full),
+            _fmt_rel_row("TRAIN sleeve", va_ch),
+            f"  VAL top-20% up {_as_float(va20.get('up_pct')):.2f}%  "
+            f"xs {_as_float(va20.get('excess_pp')):+.2f}pp",
+            f"  VAL rel vs 50% {_as_float(promo.get('val_rel_hit')):.2f}%  "
+            f"z={_as_float(promo.get('val_rel_z')):.2f}  "
+            f"(need ≥{50.0 + REL_DIR_LIFT_PP:.1f}% and z≥{REL_DIR_Z:.1f})  "
+            f"long-half vs floor {_as_float(promo.get('val_long_excess_pp')):+.2f}pp  "
+            f"vs top-20% {_as_float(promo.get('val_vs_top20_pp')):+.2f}pp",
+            "  TEST (report-only):",
+            _fmt_rel_row("full", te_full),
+            _fmt_rel_row("TRAIN sleeve", te_ch),
+            f"  TEST top-20% up {_as_float(te20.get('up_pct')):.2f}%  "
+            f"xs {_as_float(te20.get('excess_pp')):+.2f}pp",
+            f"  {promo.get('rel_reason') or 'no relative decision'}",
+            f"  {promo.get('long_reason') or 'no long-half decision'}",
+        ]
+    )
+
+
 def format_confidence_block(conf: dict[str, Any]) -> str:
     lines = [
         "CONFIDENCE ( |pred_r| vs TRAIN quantiles; scored on locked TEST )",
@@ -3264,6 +3636,7 @@ def evaluate_overnight_accuracy(
     )
     logit_up = fit_logistic_up(train_pred_r, train_r)
     book_aligned_fit = fit_book_aligned_on_train(tr, min_names=min_names)
+    relative_dir_fit = fit_relative_dir_on_train(tr, min_names=min_names)
     dow_table, dow_default = fit_group_median(
         train_r, weekday_of_dates(tr["date"].to_numpy(dtype=np.int64))
     )
@@ -3844,6 +4217,16 @@ def evaluate_overnight_accuracy(
                 ),
                 "fit_split": "train",
             },
+            "relative_dir": {
+                "abs_tau": float(
+                    (relative_dir_fit.get("chosen") or {}).get("abs_tau") or 0.0
+                ),
+                "abs_q": float(
+                    (relative_dir_fit.get("chosen") or {}).get("abs_q") or 0.0
+                ),
+                "score_col": "pred",
+                "fit_split": "train",
+            },
             "piecewise_l1": piecewise_spec,
             "bin_calibrate": bin_spec,
             "dow_gap": dow_spec,
@@ -3994,6 +4377,52 @@ def evaluate_overnight_accuracy(
         ),
     }
     payload["book_aligned_promotion"] = book_aligned_promotion
+    chosen_rel = relative_dir_fit.get("chosen") or {}
+    rtau = float(chosen_rel.get("abs_tau") or 0.0)
+    val_chosen_rel = score_relative_direction(
+        va, abs_tau=rtau, score_col="pred", min_names=min_names
+    )
+    test_chosen_rel = score_relative_direction(
+        te, abs_tau=rtau, score_col="pred", min_names=min_names
+    )
+    val_full_rel = score_relative_direction(
+        va, abs_tau=0.0, score_col="pred", min_names=min_names
+    )
+    test_full_rel = score_relative_direction(
+        te, abs_tau=0.0, score_col="pred", min_names=min_names
+    )
+    relative_dir_promotion = decide_relative_dir_promote(
+        val_chosen=val_chosen_rel,
+        val_full=val_full_rel,
+        val_top20=val_top20_ba,
+        chosen=chosen_rel,
+    )
+    payload["relative_dir_fit"] = relative_dir_fit
+    payload["relative_dir_compare"] = {
+        "train": {
+            "chosen": chosen_rel,
+            "full": relative_dir_fit.get("full"),
+            "top20": book_aligned_fit.get("baseline"),
+        },
+        "val": {
+            "chosen": val_chosen_rel,
+            "full": val_full_rel,
+            "top20": val_top20_ba,
+        },
+        "test": {
+            "chosen": test_chosen_rel,
+            "full": test_full_rel,
+            "top20": test_top20_ba,
+        },
+        "note": (
+            "Within-date sign(pred − CS median) vs sign(r_on − CS median) "
+            "on sector-overnight skip pred. Hit vs 50%. Long-half = pred > "
+            "CS median, absolute overnight-up vs uncond floor and vs top-20%. "
+            "Optional TRAIN |pred−median| floor. TEST is report-only. "
+            "Live q20 book unchanged. Pooled TS dir stays report-only."
+        ),
+    }
+    payload["relative_dir_promotion"] = relative_dir_promotion
     payload["sector_mae_fit"] = sector_mae_fit
     payload["sector_mae_compare"] = {
         "hedge": "sector_overnight",
@@ -4043,6 +4472,10 @@ def evaluate_overnight_accuracy(
             f"promote_conviction_live="
             f"{bool(conviction_live_promotion.get('promote_conviction_live'))}  "
             f"promote_sector_mae="
-            f"{bool(sector_mae_promotion.get('promote_sector_mae'))}"
+            f"{bool(sector_mae_promotion.get('promote_sector_mae'))}  "
+            f"promote_relative_dir="
+            f"{bool(relative_dir_promotion.get('promote_relative_dir'))}  "
+            f"promote_long_half="
+            f"{bool(relative_dir_promotion.get('promote_long_half'))}"
         )
     return payload

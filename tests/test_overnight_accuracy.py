@@ -19,10 +19,13 @@ from forecast.accuracy import (
     apply_drift_veto,
     apply_readout,
     cond_abs_mask,
+    cs_relative_blocks,
     cs_top_abs_mask,
     decide_book_aligned_promote,
+    decide_relative_dir_promote,
     decide_sector_mae_promote,
     fit_book_aligned_on_train,
+    fit_relative_dir_on_train,
     fit_residual_mae_maps,
     fit_cond_dir_blend,
     fit_confidence_blend,
@@ -43,6 +46,7 @@ from forecast.accuracy import (
     long_only_book_block,
     score_book_aligned_sleeve,
     score_eval_frame,
+    score_relative_direction,
     slim_accuracy,
     two_sided_normal_p,
     weekday_of_dates,
@@ -331,6 +335,19 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert payload["sector_mae_promotion"]["gated_on"] == "val"
     assert payload["sector_mae_promotion"]["live_book_unchanged"] is True
     assert "PROMOTE SECTOR-MAE" in report
+    rel_fit = payload["relative_dir_fit"]
+    assert rel_fit["fit_split"] == "train"
+    assert rel_fit["score_col"] == "pred"
+    rel_cmp = payload["relative_dir_compare"]
+    assert "chosen" in rel_cmp["val"] and "full" in rel_cmp["val"]
+    assert "top20" in rel_cmp["val"] and "chosen" in rel_cmp["test"]
+    rel_promo = payload["relative_dir_promotion"]
+    assert rel_promo["gated_on"] == "val"
+    assert "promote_relative_dir" in rel_promo
+    assert "promote_long_half" in rel_promo
+    assert rel_promo["live_book_unchanged"] is True
+    assert "PROMOTE RELATIVE-DIR" in report
+    assert "PROMOTE LONG-HALF UP" in report
 
 
 def test_zero_move_direction_is_zero_not_nan():
@@ -653,6 +670,131 @@ def test_fit_book_aligned_on_train_is_train_only():
     assert scored["n"] > 0
     assert np.isfinite(scored["up_pct"])
     assert np.isfinite(scored["excess_pp"])
+
+
+def test_cs_relative_blocks_aligned_ranks_hit_and_long_half():
+    import pandas as pd
+
+    dates = np.repeat(np.arange(6, dtype=np.int64), 4)
+    pred = np.tile(np.array([-2.0, -1.0, 1.0, 2.0]), 6)
+    r_on = pred / 100.0
+    df = pd.DataFrame({"date": dates, "pred": pred, "r_on": r_on})
+    pred_rel, r_rel, abs_dev, long_half, date_ok = cs_relative_blocks(
+        df, score_col="pred", min_names=3
+    )
+    assert bool(date_ok.all())
+    assert long_half.tolist() == ([False, False, True, True] * 6)
+    assert np.allclose(pred_rel, pred)
+    assert np.allclose(r_rel, r_on)
+    scored = score_relative_direction(df, abs_tau=0.0, min_names=3)
+    assert abs(scored["rel_hit_pct"] - 100.0) < 1e-9
+    assert scored["rel_z"] > 1.0
+    assert abs(scored["long_up_pct"] - 100.0) < 1e-9
+    assert abs(scored["long_uncond_up_pct"] - 50.0) < 1e-9
+    assert scored["long_n"] == 12.0
+    tight = score_relative_direction(df, abs_tau=1.5, min_names=3)
+    assert tight["rel_n"] == 12.0
+    assert tight["long_n"] == 6.0
+
+
+def test_fit_relative_dir_on_train_is_train_only():
+    import pandas as pd
+
+    rng = np.random.default_rng(0)
+    dates = np.repeat(np.arange(20, dtype=np.int64), 10)
+    pred = rng.normal(size=dates.size)
+    r_train = np.where(pred > 0.0, 0.02, -0.01)
+    r_later = np.where(pred > 0.0, -0.02, 0.01)
+    train = pd.DataFrame({"date": dates, "pred": pred, "r_on": r_train})
+    later = pd.DataFrame({"date": dates + 100, "pred": pred, "r_on": r_later})
+    spec = fit_relative_dir_on_train(train, min_names=3)
+    leaked = fit_relative_dir_on_train(later, min_names=3)
+    assert spec["fit_split"] == "train"
+    assert leaked["fit_split"] == "train"
+    assert spec["score_col"] == "pred"
+    assert (
+        spec["chosen"]["abs_q"] != leaked["chosen"]["abs_q"]
+        or spec["chosen"]["abs_tau"] != leaked["chosen"]["abs_tau"]
+        or spec["chosen"]["rel_hit_pct"] != leaked["chosen"]["rel_hit_pct"]
+    )
+
+
+def test_decide_relative_dir_promote_is_val_only():
+    chosen = {"abs_tau": 0.0, "abs_q": 0.0}
+    val_rel_ok = {
+        "rel_hit_pct": 56.0,
+        "rel_z": 2.0,
+        "rel_coverage": 0.20,
+    }
+    val_full_ok = {
+        "long_up_pct": 56.5,
+        "long_uncond_up_pct": 54.0,
+        "long_excess_pp": 2.5,
+        "long_coverage": 0.40,
+    }
+    d = decide_relative_dir_promote(
+        val_chosen=val_rel_ok,
+        val_full=val_full_ok,
+        val_top20={"up_pct": 56.0},
+        chosen=chosen,
+    )
+    assert d["promote_relative_dir"] is True
+    assert d["promote_long_half"] is True
+    assert d["gated_on"] == "val"
+    val_rel_fail = {
+        "rel_hit_pct": 50.20,
+        "rel_z": 2.0,
+        "rel_coverage": 0.20,
+    }
+    d2 = decide_relative_dir_promote(
+        val_chosen=val_rel_fail,
+        val_full=val_full_ok,
+        val_top20={"up_pct": 56.0},
+        chosen=chosen,
+    )
+    assert d2["promote_relative_dir"] is False
+    assert d2["gated_on"] == "val"
+    val_z_fail = {
+        "rel_hit_pct": 51.0,
+        "rel_z": 0.4,
+        "rel_coverage": 0.20,
+    }
+    d3 = decide_relative_dir_promote(
+        val_chosen=val_z_fail,
+        val_full=val_full_ok,
+        val_top20={"up_pct": 56.0},
+        chosen=chosen,
+    )
+    assert d3["promote_relative_dir"] is False
+    weaker = {
+        "long_up_pct": 55.5,
+        "long_uncond_up_pct": 54.0,
+        "long_excess_pp": 1.5,
+        "long_coverage": 0.40,
+    }
+    d4 = decide_relative_dir_promote(
+        val_chosen=val_rel_ok,
+        val_full=weaker,
+        val_top20={"up_pct": 56.0},
+        chosen=chosen,
+    )
+    assert d4["promote_long_half"] is False
+    assert d4["weaker_than_top20"] is True
+    juicy_test = {
+        "rel_hit_pct": 80.0,
+        "rel_z": 8.0,
+        "rel_coverage": 0.50,
+    }
+    d5 = decide_relative_dir_promote(
+        val_chosen=val_rel_fail,
+        val_full=weaker,
+        val_top20={"up_pct": 56.0},
+        chosen=chosen,
+    )
+    del juicy_test
+    assert d5["promote_relative_dir"] is False
+    assert d5["promote_long_half"] is False
+    assert d5["gated_on"] == "val"
 
 
 def test_decide_book_aligned_promote_is_val_only():
