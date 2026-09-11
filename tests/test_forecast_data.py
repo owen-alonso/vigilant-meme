@@ -549,6 +549,11 @@ def test_weekly_cli_uses_week_scale_context():
     assert data_cfg.sector_residual is True
     assert data_cfg.equities_only is True
     assert data_cfg.train_from == "1999-01-01"
+    assert data_cfg.double_residual is False
+    assert data_cfg.residualize_features is False
+    assert data_cfg.industry_residual is False
+    assert train_cfg.ridge_year_balance is False
+    assert train_cfg.ridge_year_stable == ""
 
 
 def test_sequence_dataset_last_bar_is_six_tuple():
@@ -963,6 +968,80 @@ def test_sector_residual_uses_future_xlk_in_label_not_features():
     for col in ("ret_1", "mkt_ret_1", "sector_ret_1", "idio_sector", "cs_rank_1"):
         assert base["AAPL"][col].iloc[t] == pytest.approx(float(alt["AAPL"][col].iloc[t]))
     assert base["AAPL"]["target"].iloc[t] != pytest.approx(float(alt["AAPL"]["target"].iloc[t]))
+
+
+def test_double_residual_uses_spy_and_sector_forward():
+    cfg = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+        residual_target=True,
+        sector_residual=True,
+        double_residual=True,
+        beta_halflife=5,
+        benchmark_symbol="SPY",
+    )
+    a = compute_features(_daily_grid(50), cfg)
+    spy = compute_features(_daily_grid(50), cfg)
+    xlk = compute_features(_daily_grid(50), cfg)
+    a["symbol"], spy["symbol"], xlk["symbol"] = "AAPL", "SPY", "XLK"
+    base_panels = attach_cross_section_features(
+        {"AAPL": a.copy(), "SPY": spy.copy(), "XLK": xlk.copy()}, cfg
+    )
+    base = attach_residual_target(base_panels, cfg)
+    spiked_grid = _daily_grid(50)
+    spiked_grid.loc[spiked_grid.index[-1], "close"] = (
+        float(spiked_grid["close"].iloc[-1]) * 1.08
+    )
+    spiked = compute_features(spiked_grid, cfg)
+    spiked["symbol"] = "SPY"
+    alt_panels = attach_cross_section_features(
+        {"AAPL": a.copy(), "SPY": spiked, "XLK": xlk.copy()}, cfg
+    )
+    alt = attach_residual_target(alt_panels, cfg)
+    t = 48
+    assert base["AAPL"]["ret_1"].iloc[t] == pytest.approx(float(alt["AAPL"]["ret_1"].iloc[t]))
+    assert base["AAPL"]["target"].iloc[t] != pytest.approx(float(alt["AAPL"]["target"].iloc[t]))
+
+
+def test_residualize_features_uses_same_bar_hedge():
+    cfg = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+        residual_target=True,
+        sector_residual=True,
+        double_residual=True,
+        residualize_features=True,
+        beta_halflife=5,
+        benchmark_symbol="SPY",
+    )
+    a = compute_features(_daily_grid(50), cfg)
+    spy = compute_features(_daily_grid(50), cfg)
+    xlk = compute_features(_daily_grid(50), cfg)
+    a["symbol"], spy["symbol"], xlk["symbol"] = "AAPL", "SPY", "XLK"
+    base_panels = attach_cross_section_features(
+        {"AAPL": a.copy(), "SPY": spy.copy(), "XLK": xlk.copy()}, cfg
+    )
+    base = attach_residual_target(base_panels, cfg)
+    spiked_grid = _daily_grid(50)
+    spiked_grid.loc[spiked_grid.index[40], "close"] = (
+        float(spiked_grid["close"].iloc[40]) * 1.06
+    )
+    spiked = compute_features(spiked_grid, cfg)
+    spiked["symbol"] = "SPY"
+    alt_panels = attach_cross_section_features(
+        {"AAPL": a.copy(), "SPY": spiked, "XLK": xlk.copy()}, cfg
+    )
+    alt = attach_residual_target(alt_panels, cfg)
+    t = 40
+    assert base["AAPL"]["ret_1"].iloc[t] != pytest.approx(float(alt["AAPL"]["ret_1"].iloc[t]))
 
 
 def test_equities_only_drops_etfs_from_the_book(tmp_path: Path):

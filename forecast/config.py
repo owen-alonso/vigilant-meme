@@ -87,7 +87,7 @@ class DataConfig:
     cross_section_min_names: int = 30
     # Weekly mixed adjusted/raw files have lag-1 autocorr << 0. Set True to skip.
     allow_mixed_prices: bool = False
-    # Restrict loaded parquets to a train-era-locked list (``liquid``) or all.
+    # Restrict loaded parquets to a train-era-locked list or all.
     universe: str = ""
     # Same-day cross-sectional z-scores of momentum / volume (known at close).
     cs_zscore: bool = True
@@ -100,6 +100,12 @@ class DataConfig:
     # Drop *train* labels before this date. Empty = keep every train session.
     # Val/test calendar cuts are unchanged (locked test window).
     train_from: str = "1999-01-01"
+    # y = r - b_mkt * SPY_fwd - b_sec * sector_fwd (two-factor, causal betas).
+    double_residual: bool = False
+    # Also residualize ret_* features vs same-bar hedges (not labels).
+    residualize_features: bool = False
+    # Optional third factor vs a mapped industry ETF when that parquet exists.
+    industry_residual: bool = False
 
     def is_daily(self) -> bool:
         return self.interval == "daily"
@@ -127,6 +133,12 @@ class DataConfig:
             payload["equities_only"] = False
         if "train_from" not in payload:
             payload["train_from"] = ""
+        if "double_residual" not in payload:
+            payload["double_residual"] = False
+        if "residualize_features" not in payload:
+            payload["residualize_features"] = False
+        if "industry_residual" not in payload:
+            payload["industry_residual"] = False
         return cls(**filter_dataclass_fields(cls, payload))
 
 
@@ -330,6 +342,10 @@ class ForecastTrainConfig:
     ridge_drop_crashes: bool = False
     # ``ridge`` / ``listnet`` / ``ranknet`` skip objective.
     ridge_objective: str = "ridge"
+    # Equalize per-year total weight in the frozen skip (train only).
+    ridge_year_balance: bool = False
+    # Year-sign stability mask: ``train`` or ``train_val`` (empty = off).
+    ridge_year_stable: str = ""
     # ListNet (softmax CE) within date. 0 keeps RankNet-only ranking.
     listnet_loss_weight: float = 0.0
     # Residual-std head. Trained by gaussian NLL, or by sigma_aux_weight when

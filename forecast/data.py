@@ -27,7 +27,12 @@ import torch
 from torch.utils.data import Dataset
 
 from forecast.config import BARS_PER_SESSION, SESSION_START_MINUTE, DataConfig
-from forecast.universe import allowed_symbols, hedge_symbol_for, is_equity_name
+from forecast.universe import (
+    allowed_symbols,
+    hedge_symbol_for,
+    industry_symbol_for,
+    is_equity_name,
+)
 from mamba_lm.paths import REPO_ROOT, resolve_path
 
 
@@ -651,15 +656,61 @@ def attach_cross_section_features(
     return out
 
 
+def _ewm_beta(y: np.ndarray, x: np.ndarray, hl: int) -> np.ndarray:
+    frame = pd.DataFrame({"y": y, "x": x})
+    cov = frame["y"].ewm(halflife=hl, min_periods=hl).cov(frame["x"])
+    var = frame["x"].ewm(halflife=hl, min_periods=hl).var()
+    return (cov / var.replace(0.0, np.nan)).fillna(0.0).clip(-5.0, 5.0).to_numpy()
+
+
+def _ewm_multi_beta(y: np.ndarray, xs: list[np.ndarray], hl: int) -> list[np.ndarray]:
+    """Causal EWM betas of ``y`` on one or more ``xs``. Falls back if singular."""
+    if len(xs) == 1:
+        return [_ewm_beta(y, xs[0], hl)]
+    cols = {f"x{i}": xs[i] for i in range(len(xs))}
+    cols["y"] = y
+    df = pd.DataFrame(cols)
+    y_s = df["y"]
+    k = len(xs)
+    cov_yx = [
+        y_s.ewm(halflife=hl, min_periods=hl).cov(df[f"x{i}"]).to_numpy()
+        for i in range(k)
+    ]
+    cov_xx = np.zeros((len(df), k, k), dtype=np.float64)
+    for i in range(k):
+        for j in range(i, k):
+            if i == j:
+                v = df[f"x{i}"].ewm(halflife=hl, min_periods=hl).var().to_numpy()
+                cov_xx[:, i, j] = v
+            else:
+                c = df[f"x{i}"].ewm(halflife=hl, min_periods=hl).cov(df[f"x{j}"]).to_numpy()
+                cov_xx[:, i, j] = c
+                cov_xx[:, j, i] = c
+    rhs = np.stack(cov_yx, axis=1)
+    betas = np.zeros((len(df), k), dtype=np.float64)
+    eye = 1e-8 * np.eye(k)
+    for t in range(len(df)):
+        a = cov_xx[t] + eye
+        try:
+            betas[t] = np.linalg.solve(a, rhs[t])
+        except np.linalg.LinAlgError:
+            betas[t] = 0.0
+    return [np.clip(betas[:, i], -5.0, 5.0) for i in range(k)]
+
+
 def attach_residual_target(
     panels: dict[str, pd.DataFrame],
     cfg: DataConfig,
 ) -> dict[str, pd.DataFrame]:
-    """Replace the label with trailing-beta residual vs a hedge forward return.
+    """Replace the label with trailing-beta residual vs hedge forward return(s).
 
-    ``beta_t`` uses same-bar returns through ``t`` only. The hedge's *forward*
-    return enters the label, never ``FEATURE_NAMES``. Default hedge is SPY;
+    ``beta_t`` uses same-bar returns through ``t`` only. Hedge *forward* return
+    enters the label, never ``FEATURE_NAMES``. Default hedge is SPY;
     ``sector_residual`` uses the mapped sector ETF when that parquet exists.
+    ``double_residual`` adds SPY as a second factor next to the sector hedge.
+    ``industry_residual`` adds a mapped industry ETF when present.
+    ``residualize_features`` subtracts the same causal betas times same-bar
+    hedge ``ret_*`` from the name's own ``ret_*`` (not a label leak).
     """
     bench = str(cfg.benchmark_symbol or "").upper()
     if not cfg.residual_target:
@@ -677,6 +728,7 @@ def attach_residual_target(
 
     cache_fwd: dict[str, pd.Series] = {}
     cache_r: dict[str, pd.Series] = {}
+    cache_ret: dict[tuple[str, str], pd.Series] = {}
 
     def _hedge_series(name: str) -> tuple[pd.Series, pd.Series] | None:
         if name not in panels:
@@ -686,37 +738,84 @@ def attach_residual_target(
             cache_r[name] = _indexed_col(panels[name], cfg, "ret_raw")
         return cache_fwd[name], cache_r[name]
 
+    def _hedge_ret(name: str, col: str) -> pd.Series | None:
+        if name not in panels or col not in panels[name].columns:
+            return None
+        key = (name, col)
+        if key not in cache_ret:
+            cache_ret[key] = _indexed_col(panels[name], cfg, col)
+        return cache_ret[key]
+
     hl = max(2, int(cfg.beta_halflife))
+    double = bool(getattr(cfg, "double_residual", False))
+    industry = bool(getattr(cfg, "industry_residual", False))
+    resid_feat = bool(getattr(cfg, "residualize_features", False))
+    feat_cols = ("ret_1", "ret_5", "ret_15", "ret_60", "ret_390")
     out: dict[str, pd.DataFrame] = {}
     for sym, panel in panels.items():
         p = panel.copy()
         if sym == bench:
             out[sym] = p
             continue
-        hedge = hedge_symbol_for(
+        names: list[str] = []
+        sector = hedge_symbol_for(
             sym,
             sector_residual=bool(getattr(cfg, "sector_residual", False)),
             benchmark=bench,
         )
-        series = _hedge_series(hedge) or _hedge_series(bench)
-        if series is None:
+        if double:
+            if bench in panels:
+                names.append(bench)
+            if sector != bench and sector in panels:
+                names.append(sector)
+        else:
+            if sector in panels:
+                names.append(sector)
+            elif bench in panels:
+                names.append(bench)
+        if industry:
+            ind = industry_symbol_for(sym)
+            if ind and ind in panels and ind not in names:
+                names.append(ind)
+        series = [_hedge_series(n) for n in names]
+        series = [s for s in series if s is not None]
+        if not series:
             out[sym] = p
             continue
-        hedge_fwd, hedge_r = series
         keys = _cross_section_key(p, cfg)
-        x = keys.map(hedge_r).to_numpy(dtype=np.float64)
-        fwd = keys.map(hedge_fwd).to_numpy(dtype=np.float64)
         own_r = p["ret_raw"].to_numpy(dtype=np.float64)
-        frame = pd.DataFrame({"y": own_r, "x": x})
-        cov = frame["y"].ewm(halflife=hl, min_periods=hl).cov(frame["x"])
-        var = frame["x"].ewm(halflife=hl, min_periods=hl).var()
-        beta = (cov / var.replace(0.0, np.nan)).fillna(0.0).clip(-5.0, 5.0).to_numpy()
+        xs = []
+        fwds = []
+        for hedge_fwd, hedge_r in series:
+            xs.append(keys.map(hedge_r).to_numpy(dtype=np.float64))
+            fwd = keys.map(hedge_fwd).to_numpy(dtype=np.float64)
+            fwds.append(np.where(np.isfinite(fwd), fwd, 0.0))
+        betas = _ewm_multi_beta(own_r, xs, hl) if len(xs) > 1 else [_ewm_beta(own_r, xs[0], hl)]
         own_fwd = p["target_raw"].to_numpy(dtype=np.float64)
-        fwd = np.where(np.isfinite(fwd), fwd, 0.0)
-        resid = own_fwd - beta * fwd
+        resid = own_fwd.astype(np.float64, copy=True)
+        for b, fwd in zip(betas, fwds):
+            resid = resid - b * fwd
         scale = p["scale"].to_numpy(dtype=np.float64)
         p["target_raw"] = resid
         p["target"] = np.divide(resid, scale, out=np.zeros_like(resid), where=scale > 0)
+        if resid_feat:
+            for col in feat_cols:
+                if col not in p.columns:
+                    continue
+                own = p[col].to_numpy(dtype=np.float64)
+                adj = own.copy()
+                for b, hedge_name in zip(betas, names):
+                    hs = _hedge_ret(hedge_name, col)
+                    if hs is None:
+                        continue
+                    hx = keys.map(hs).to_numpy(dtype=np.float64)
+                    hx = np.where(np.isfinite(hx), hx, 0.0)
+                    adj = adj - b * hx
+                p[col] = adj
+            if "idio_ret_1" in p.columns and "ret_1" in p.columns and "mkt_ret_1" in p.columns:
+                p["idio_ret_1"] = p["ret_1"] - p["mkt_ret_1"]
+            if "idio_sector" in p.columns and "ret_1" in p.columns and "sector_ret_1" in p.columns:
+                p["idio_sector"] = p["ret_1"] - p["sector_ret_1"]
         valid = p["valid"].to_numpy(dtype=bool).copy()
         if cfg.max_abs_log_return > 0:
             valid &= np.abs(resid) <= cfg.max_abs_log_return

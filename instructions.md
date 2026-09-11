@@ -34,7 +34,7 @@ The network predicts a **volatility-normalized residual**. `generate.py` multipl
 y_t = \frac{r_{t+1} - \beta_t r^{\mathrm{hedge}}_{t+1}}{\sigma_t}
 \]
 
-\(\beta_t\) uses same-bar returns **through \(t\) only**. The hedge is the mapped sector ETF when `--sector-residual` (default) and that parquet exists, otherwise SPY. \(\sigma_t\) is EWM realized vol using only bars **up to \(t-1\)**. **1 bp = 0.01%**. Sector *forward* return is a **label** term, never a feature.
+\(\beta_t\) uses same-bar returns **through \(t\) only**. The hedge is the mapped sector ETF when `--sector-residual` (default) and that parquet exists, otherwise SPY. `--double-residual` fits causal betas vs SPY **and** sector; `--industry-residual` adds a mapped industry ETF when that parquet exists. `--residualize-features` subtracts the same betas times same-bar hedge `ret_*` (not a label leak). \(\sigma_t\) is EWM realized vol using only bars **up to \(t-1\)**. **1 bp = 0.01%**. Hedge *forward* return is a **label** term, never a feature.
 
 The same weights apply to any ticker: features are scale-free (no per-symbol embedding). Trading names are equities on the train-era-locked list in `forecast/universe.py`; SPY and sector/macro ETFs are **hedges**, not book names.
 
@@ -57,6 +57,20 @@ python -m forecast.training --universe liquid --interval daily --skip-only --che
 ```
 
 The skip defaults to **within-date rank-target ridge** with ``ridge=10``, feature winsor 3, and ``--ridge-features no_long_ts``, plus same-bar CS product features (val-selected). Do **not** enable walk-forward / later ``train_from`` / ListNet-skip / crash-date drop from test: those lost on locked val.
+
+Optional next levers (val-gate; do not promote from test):
+
+```bash
+# ~170-equity 2018-era book (Yahoo extras; --skip-existing reuses the 85-name cache)
+python -m forecast.download --universe liquid_wide --source yahoo --interval daily --skip-existing
+python -m forecast.training --universe liquid_wide --interval daily --skip-only
+# year-balance / year-stable mask / expanding WF diagnostic
+python scripts/cs_year_ablate.py --data-dir data --universe liquid
+# two-factor market+sector residual (labels); optional feature residualization
+python -m forecast.training --universe liquid --skip-only --double-residual
+python -m forecast.training --universe liquid --skip-only --residualize-features
+python -m forecast.training --universe liquid --skip-only --industry-residual
+```
 
 ```bash
 python scripts/cs_collapse_ablate.py --data-dir data --universe liquid

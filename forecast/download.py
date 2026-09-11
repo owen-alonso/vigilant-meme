@@ -46,8 +46,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--universe",
         default=None,
-        choices=("liquid",),
-        help="train-era-locked liquid names (+ SPY). Use instead of --symbols.",
+        choices=("liquid", "liquid_wide"),
+        help="train-era-locked liquid (~85) or liquid_wide (~175) names (+ SPY).",
     )
     p.add_argument("--data-dir", default=DataConfig().data_dir)
     p.add_argument(
@@ -108,13 +108,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.35,
         help="pause between Yahoo/Stooq symbol fetches (be kind to the public API)",
     )
+    p.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="do not fetch a symbol that already has a parquet in --data-dir",
+    )
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     if args.universe:
-        symbols = universe_download_symbols(include_benchmark=True)
+        symbols = universe_download_symbols(
+            include_benchmark=True, universe=str(args.universe)
+        )
     else:
         symbols = parse_symbols(args.symbols)
     if not symbols:
@@ -135,6 +142,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.source == "alphavantage":
             client = AlphaVantageClient(min_interval_sec=args.min_interval_sec)
         for i, symbol in enumerate(symbols):
+            dest = symbol_parquet_path(args.data_dir, symbol, interval=args.interval)
+            if args.skip_existing and dest.exists() and not args.replace:
+                print(f"skip {symbol.upper()}: already cached")
+                continue
             try:
                 if args.source == "stooq":
                     print(f"fetching {symbol.upper()} {args.interval} via stooq")

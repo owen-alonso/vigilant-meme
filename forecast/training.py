@@ -689,20 +689,45 @@ def apply_ridge_skip(
     """Copy a train-only ridge readout into ``model.skip``. Returns in-sample IC."""
     if (not model.config.linear_skip) or float(train_cfg.ridge_skip) <= 0:
         return float("nan")
-    from forecast.ridge import fit_skip_xy, labelled_rows
+    from forecast.ridge import fit_skip_xy, labelled_rows, year_stable_mask
 
     x, y, dates = labelled_rows(
         bundle["train_symbols"],
         bundle["feature_mean"],
         bundle["feature_std"],
     )
-    weights, bias, ic = fit_skip_xy(
-        x,
-        y,
-        dates,
-        train_cfg,
-        min_names=int(bundle.get("cs_min_names", 8)),
-    )
+    min_names = int(bundle.get("cs_min_names", 8))
+    stable = str(getattr(train_cfg, "ridge_year_stable", "") or "")
+    if stable in ("train", "train_val"):
+        xv = yv = dv = None
+        if stable == "train_val" and bundle.get("val_symbols"):
+            xv, yv, dv = labelled_rows(
+                bundle["val_symbols"],
+                bundle["feature_mean"],
+                bundle["feature_std"],
+            )
+        keep = year_stable_mask(
+            x,
+            y,
+            dates,
+            min_names=min_names,
+            x_val=xv,
+            y_val=yv,
+            d_val=dv,
+        )
+        from forecast.ridge import feature_mask, fit_ridge_xy, ridge_kwargs_from_train_cfg
+
+        kw = ridge_kwargs_from_train_cfg(train_cfg, {"cs_min_names": min_names})
+        kw["feature_mask_bool"] = feature_mask(str(train_cfg.ridge_features or "all")) & keep
+        weights, bias, ic = fit_ridge_xy(x, y, dates, **kw)
+    else:
+        weights, bias, ic = fit_skip_xy(
+            x,
+            y,
+            dates,
+            train_cfg,
+            min_names=min_names,
+        )
     with torch.no_grad():
         model.skip.weight.copy_(
             torch.from_numpy(weights).to(device=device, dtype=model.skip.weight.dtype).unsqueeze(0)
@@ -1210,8 +1235,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "--universe",
         default="",
-        choices=("", "liquid"),
-        help="restrict parquets to the train-era-locked liquid list (+ SPY)",
+        choices=("", "liquid", "liquid_wide"),
+        help="restrict parquets to liquid (~85) or liquid_wide (~175) (+ SPY)",
     )
     g.add_argument(
         "--no-cs-zscore",
@@ -1228,6 +1253,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-sector-residual",
         action="store_true",
         help="residualize vs SPY only (skip mapped sector ETFs)",
+    )
+    g.add_argument(
+        "--double-residual",
+        action="store_true",
+        help="two-factor residual vs SPY and sector (causal betas through t)",
+    )
+    g.add_argument(
+        "--residualize-features",
+        action="store_true",
+        help="residualize ret_* features vs same-bar hedges before the skip",
+    )
+    g.add_argument(
+        "--industry-residual",
+        action="store_true",
+        help="add a mapped industry ETF as a third residual factor when present",
     )
     g.add_argument(
         "--no-equities-only",
@@ -1389,6 +1429,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="drop dot-com and GFC dates from the frozen skip fit",
     )
     g.add_argument(
+        "--ridge-year-balance",
+        action="store_true",
+        help="equalize per-year sample weight in the frozen skip",
+    )
+    g.add_argument(
+        "--ridge-year-stable",
+        default="",
+        choices=("", "train", "train_val"),
+        help="keep features whose univariate CS IC sign is stable across years",
+    )
+    g.add_argument(
         "--listnet-loss-weight",
         type=float,
         default=t.listnet_loss_weight,
@@ -1469,6 +1520,9 @@ def configs_from_cli(
         sector_residual=not args.no_sector_residual,
         equities_only=not args.no_equities_only,
         train_from="" if args.no_train_from else str(args.train_from or ""),
+        double_residual=args.double_residual,
+        residualize_features=args.residualize_features,
+        industry_residual=args.industry_residual,
     )
     model_cfg = ForecastModelConfig(
         n_features=len(FEATURE_NAMES),
@@ -1511,6 +1565,8 @@ def configs_from_cli(
         ridge_huber=args.ridge_huber,
         ridge_sign_constrain=args.ridge_sign_constrain,
         ridge_drop_crashes=args.ridge_drop_crashes,
+        ridge_year_balance=args.ridge_year_balance,
+        ridge_year_stable=args.ridge_year_stable,
         listnet_loss_weight=args.listnet_loss_weight,
         sigma_aux_weight=(
             0.0

@@ -29,6 +29,12 @@ def _ymd_to_days(ymd: str) -> int:
     return int((np.datetime64(ymd) - np.datetime64("1970-01-01")) / np.timedelta64(1, "D"))
 
 
+def dates_to_year(dates: np.ndarray) -> np.ndarray:
+    """Calendar year for day-since-epoch keys."""
+    cal = np.datetime64("1970-01-01") + np.asarray(dates, dtype=np.int64).astype("timedelta64[D]")
+    return cal.astype("datetime64[Y]").astype(int) + 1970
+
+
 def crash_date_set(windows: Sequence[tuple[str, str]] = CRASH_WINDOWS) -> set[int]:
     """Inclusive calendar-day keys for crash windows (days since epoch)."""
     out: set[int] = set()
@@ -123,6 +129,7 @@ def _prepare_cs_design(
     y_winsor: float = 0.0,
     feat_winsor: float = 0.0,
     drop_disp_q: float = 0.0,
+    year_balance: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
     """Within-date design for ridge. Returns ``x, y, sample_weight, used_dates`` or None."""
     if not cs_demean and not cs_zscore and not rank_target:
@@ -206,6 +213,15 @@ def _prepare_cs_design(
         have = True
     if not have:
         return None
+    if year_balance and used_keys:
+        years = dates_to_year(np.asarray(used_keys, dtype=np.int64))
+        year_sum: dict[int, float] = {}
+        for i, year in enumerate(years):
+            year_sum[int(year)] = year_sum.get(int(year), 0.0) + float(weights[i].sum())
+        for i, year in enumerate(years):
+            denom = year_sum[int(year)]
+            if denom > 0:
+                weights[i] = weights[i] / denom
     return (
         np.concatenate(xs),
         np.concatenate(ys),
@@ -277,6 +293,7 @@ def fit_ridge_xy(
     huber_delta: float = 0.0,
     sign_constrain: bool = False,
     drop_crashes: bool = False,
+    year_balance: bool = False,
 ) -> tuple[np.ndarray, float, float]:
     """CS ridge of ``y`` on ``x``. Returns weights, bias (0 if CS), in-sample mean CS IC."""
     n_features = int(x.shape[1]) if x.ndim == 2 else 0
@@ -297,6 +314,7 @@ def fit_ridge_xy(
         y_winsor=y_winsor,
         feat_winsor=feat_winsor,
         drop_disp_q=drop_disp_q,
+        year_balance=year_balance,
     )
     if prepared is None:
         return np.zeros(n_features, dtype=np.float32), 0.0, float("nan")
@@ -400,8 +418,7 @@ def year_cs_ics(
     """Mean CS IC / t-stat grouped by calendar year of ``dates`` (days since epoch)."""
     if pred.size == 0:
         return []
-    cal = np.datetime64("1970-01-01") + dates.astype("timedelta64[D]")
-    yr = cal.astype("datetime64[Y]").astype(int) + 1970
+    yr = dates_to_year(dates)
     rows: list[dict[str, float]] = []
     for year in sorted(set(int(v) for v in yr)):
         sel = yr == year
@@ -409,6 +426,62 @@ def year_cs_ics(
         stats["year"] = float(year)
         rows.append(stats)
     return rows
+
+
+def year_feature_ics(
+    x: np.ndarray,
+    y: np.ndarray,
+    dates: np.ndarray,
+    *,
+    min_names: int = 3,
+) -> dict[int, np.ndarray]:
+    """Univariate mean CS IC of each column, keyed by calendar year."""
+    out: dict[int, np.ndarray] = {}
+    yr = dates_to_year(dates)
+    for year in sorted(set(int(v) for v in yr)):
+        sel = yr == year
+        out[int(year)] = univariate_cs_ics(x[sel], y[sel], dates[sel], min_names=min_names)
+    return out
+
+
+def year_stable_mask(
+    x: np.ndarray,
+    y: np.ndarray,
+    dates: np.ndarray,
+    *,
+    min_names: int = 3,
+    min_frac: float = 0.7,
+    min_abs: float = 0.003,
+    x_val: np.ndarray | None = None,
+    y_val: np.ndarray | None = None,
+    d_val: np.ndarray | None = None,
+) -> np.ndarray:
+    """Keep columns whose univariate CS IC sign is stable across train years.
+
+    Optional val arrays require the same overall val sign (val-gated, not test).
+    """
+    f = int(x.shape[1]) if x.ndim == 2 else 0
+    by_year = year_feature_ics(x, y, dates, min_names=min_names)
+    if not by_year:
+        return np.ones(f, dtype=bool)
+    stacked = np.stack(list(by_year.values()), axis=0)
+    keep = np.zeros(f, dtype=bool)
+    for j in range(f):
+        col = stacked[:, j]
+        finite = col[np.isfinite(col) & (np.abs(col) >= float(min_abs))]
+        if finite.size < 2:
+            continue
+        pos = float((finite > 0).mean())
+        if pos >= float(min_frac) or (1.0 - pos) >= float(min_frac):
+            keep[j] = True
+    if x_val is not None and y_val is not None and d_val is not None:
+        val = univariate_cs_ics(x_val, y_val, d_val, min_names=min_names)
+        train = univariate_cs_ics(x, y, dates, min_names=min_names)
+        agree = np.isfinite(val) & np.isfinite(train) & (val * train > 0)
+        keep &= agree
+    if not bool(keep.any()):
+        return np.ones(f, dtype=bool)
+    return keep
 
 
 def stable_feature_mask(
@@ -762,6 +835,7 @@ def _one_date_design(
     cs_zscore: bool,
     rank_target: bool,
     feature_mask_bool: np.ndarray | None,
+    feat_winsor: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     n = int(xd.shape[0])
     if n < int(min_names):
@@ -771,6 +845,9 @@ def _one_date_design(
     if feature_mask_bool is not None:
         mask = np.asarray(feature_mask_bool, dtype=bool)
         x[:, ~mask] = 0.0
+    if feat_winsor > 0:
+        for j in range(x.shape[1]):
+            x[:, j] = _winsor_1d(x[:, j], feat_winsor)
     if rank_target:
         order = np.argsort(y, kind="mergesort")
         ranks = np.empty(n, dtype=np.float64)
@@ -804,6 +881,7 @@ def walk_forward_predict(
     feature_mask_bool: np.ndarray | None = None,
     date_halflife: float = 0.0,
     min_train_dates: int = 60,
+    feat_winsor: float = 0.0,
 ) -> np.ndarray:
     """Causal scores for ``score_dates``: fit on ``dates < d`` (and ``>= d - lookback``).
 
@@ -832,6 +910,7 @@ def walk_forward_predict(
             cs_zscore=cs_zscore,
             rank_target=rank_target,
             feature_mask_bool=feature_mask_bool,
+            feat_winsor=feat_winsor,
         )
         if des is None:
             continue
@@ -926,6 +1005,7 @@ def fit_skip_xy(
         drop_disp_q=kwargs["drop_disp_q"],
         huber_delta=kwargs["huber_delta"],
         sign_constrain=kwargs["sign_constrain"],
+        year_balance=kwargs["year_balance"],
         **shared,
     )
 
@@ -946,4 +1026,5 @@ def ridge_kwargs_from_train_cfg(train_cfg: Any, bundle: dict[str, Any]) -> dict[
         "huber_delta": float(getattr(train_cfg, "ridge_huber", 0.0) or 0.0),
         "sign_constrain": bool(getattr(train_cfg, "ridge_sign_constrain", False)),
         "drop_crashes": bool(getattr(train_cfg, "ridge_drop_crashes", False)),
+        "year_balance": bool(getattr(train_cfg, "ridge_year_balance", False)),
     }

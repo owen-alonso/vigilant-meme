@@ -159,6 +159,53 @@ def test_new_feature_masks_are_stricter():
     assert int(core.sum()) < int(no_long.sum()) < int(all_m.sum())
 
 
+def test_year_balance_equalizes_short_years():
+    from forecast.ridge import fit_ridge_xy
+
+    # Many dates in year 0, few in year 1. Signal flips in the short year.
+    n_names, f = 12, 2
+    d0 = int((np.datetime64("2000-06-01") - np.datetime64("1970-01-01")) / np.timedelta64(1, "D"))
+    d1 = int((np.datetime64("2001-06-01") - np.datetime64("1970-01-01")) / np.timedelta64(1, "D"))
+    dates0 = np.repeat(np.arange(20, dtype=np.int64) + d0, n_names)
+    dates1 = np.repeat(np.arange(3, dtype=np.int64) + d1, n_names)
+    dates = np.concatenate([dates0, dates1])
+    rng = np.random.default_rng(7)
+    x = rng.normal(size=(dates.size, f))
+    sig = rng.normal(size=dates.size)
+    x[:, 0] = sig
+    y = sig.copy()
+    y[dates >= d1] = -sig[dates >= d1]
+    w_u, _, _ = fit_ridge_xy(x, y, dates, ridge=1e-2, min_names=8, rank_target=True)
+    w_b, _, _ = fit_ridge_xy(
+        x, y, dates, ridge=1e-2, min_names=8, rank_target=True, year_balance=True
+    )
+    # Balancing the short opposite year should shrink the year-0 weight.
+    assert abs(float(w_b[0])) < abs(float(w_u[0]))
+
+
+def test_year_stable_mask_drops_flipping_column():
+    from forecast.ridge import year_stable_mask
+
+    n_names, f = 12, 2
+    dates = []
+    x_rows = []
+    y_rows = []
+    rng = np.random.default_rng(8)
+    for year, x1_sign in ((2000, 1.0), (2001, 1.0), (2002, -1.0), (2003, -1.0)):
+        d0 = int((np.datetime64(f"{year}-03-01") - np.datetime64("1970-01-01")) / np.timedelta64(1, "D"))
+        for k in range(8):
+            dates.extend([d0 + k] * n_names)
+            good = rng.normal(size=n_names)
+            x_rows.append(np.stack([good, x1_sign * good], axis=1))
+            y_rows.append(good + 0.05 * rng.normal(size=n_names))
+    x = np.concatenate(x_rows)
+    y = np.concatenate(y_rows)
+    d = np.asarray(dates, dtype=np.int64)
+    keep = year_stable_mask(x, y, d, min_names=8, min_frac=0.7, min_abs=0.01)
+    assert bool(keep[0])
+    assert not bool(keep[1])
+
+
 def test_year_cs_ics_splits_calendar_years():
     from forecast.ridge import year_cs_ics
 

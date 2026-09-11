@@ -127,6 +127,7 @@ def _frozen(
     sign_constrain: bool = False,
     drop_crashes: bool = False,
     feature_mask_bool: np.ndarray | None = None,
+    year_balance: bool = False,
 ) -> dict[str, Any]:
     min_names = int(cache["cs_min_names"])
     x_tr, y_tr, d_tr = _train_slice(cache, train_from_days)
@@ -148,6 +149,7 @@ def _frozen(
         huber_delta=huber_delta,
         sign_constrain=sign_constrain,
         drop_crashes=drop_crashes,
+        year_balance=year_balance,
     )
     row: dict[str, Any] = {"train_is_cs_ic": train_ic, "n_train": int(y_tr.size)}
     for split in ("val", "test"):
@@ -164,7 +166,7 @@ def _frozen(
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="CS train→test collapse ablations.")
     p.add_argument("--data-dir", default="")
-    p.add_argument("--universe", default="liquid", choices=("", "liquid"))
+    p.add_argument("--universe", default="liquid", choices=("", "liquid", "liquid_wide"))
     p.add_argument("--cache", default="/tmp/cs_lastbars.npz")
     p.add_argument("--rebuild", action="store_true")
     p.add_argument("--train-from", default="", help="used only when building the cache")
@@ -214,6 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         ("frozen_rank_nolong", dict(train_from_days=ymd(1999), rank_target=True, ridge=10.0, mask_mode="no_long_ts")),
         ("frozen_rank_noohlc", dict(train_from_days=ymd(1999), rank_target=True, ridge=10.0, mask_mode="no_ohlc")),
         ("frozen_value_winsor", dict(train_from_days=ymd(1999), rank_target=False, ridge=10.0, y_winsor=3.0)),
+        ("frozen_year_balance", dict(train_from_days=ymd(1999), rank_target=True, ridge=10.0, feat_winsor=3.0, mask_mode="no_long_ts", year_balance=True)),
     ]
     base = dict(ridge=1.0, rank_target=False, cs_zscore=False, mask_mode="all", date_halflife=0.0)
     print(f"{'case':<28} {'val':>8} {'val_t':>7} {'test':>8} {'test_t':>7} {'ntr':>8}")
