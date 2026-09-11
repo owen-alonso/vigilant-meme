@@ -145,6 +145,54 @@ def cs_ic_by_date(
     return pd.DataFrame(rows).set_index("datetime")
 
 
+WEEKDAY_MASK_CHOICES = ("always", "flat_friday", "weekend_only", "flat_monday")
+_WEEKDAY_MASK_ALIASES = {
+    "": "always",
+    "off": "always",
+    "none": "always",
+    "on": "always",
+    "skip_friday": "flat_friday",
+    "no_friday": "flat_friday",
+    "no_weekend": "flat_friday",
+    "friday_only": "weekend_only",
+    "weekend": "weekend_only",
+    "skip_monday": "flat_monday",
+    "no_monday": "flat_monday",
+}
+
+
+def normalize_weekday_mask(mask: str | None) -> str:
+    """Canonical weekday trade mask. Decision uses weekday(t) known at close t."""
+    key = str(mask or "always").strip().lower().replace("-", "_")
+    out = _WEEKDAY_MASK_ALIASES.get(key, key)
+    if out not in WEEKDAY_MASK_CHOICES:
+        raise ValueError(
+            f"unknown weekday_mask {mask!r}; expected one of {WEEKDAY_MASK_CHOICES}"
+        )
+    return out
+
+
+def weekday_mask_is_flat(ts: Any, mask: str | None) -> bool:
+    """True if the overnight book starting at close ``t`` should stay flat.
+
+    Friday flatten skips Friday close → Monday open (weekend gap).
+    Weekend-only trades that Friday gap and flats every other night.
+    Monday flatten skips Monday close → Tuesday open. All use weekday(t)
+    only — next open is never consulted.
+    """
+    kind = normalize_weekday_mask(mask)
+    if kind == "always":
+        return False
+    wd = int(pd.Timestamp(ts).dayofweek)  # Mon=0 … Fri=4
+    if kind == "flat_friday":
+        return wd == 4
+    if kind == "weekend_only":
+        return wd != 4
+    if kind == "flat_monday":
+        return wd == 0
+    return False
+
+
 def trailing_mean_cs_ic(
     pred: pd.DataFrame,
     realized: pd.DataFrame,
@@ -494,6 +542,7 @@ def book_pnl(
     ic_gate_tau: float = 0.0,
     ic_gate_kind: str = "pearson",
     ic_gate_trail: pd.Series | None = None,
+    weekday_mask: str = "always",
 ) -> dict[str, Any]:
     """Cost-aware long-short with optional rank weights, hold smoothing, causal vol.
 
@@ -539,6 +588,9 @@ def book_pnl(
     kept: list[Any] = []
     n_gated = 0
     n_gate_dates = 0
+    wd_kind = normalize_weekday_mask(weekday_mask)
+    n_wd_flat = 0
+    n_wd_dates = 0
     for ts in dates:
         pair_all = pd.concat(
             [pred.loc[ts], realized.loc[ts]], axis=1, keys=["p", "r"]
@@ -585,6 +637,11 @@ def book_pnl(
             if np.isfinite(tval) and tval < float(ic_gate_tau):
                 w = w * 0.0
                 n_gated += 1
+        if wd_kind != "always":
+            n_wd_dates += 1
+            if weekday_mask_is_flat(ts, wd_kind):
+                w = w * 0.0
+                n_wd_flat += 1
         r = pair_all["r"].reindex(w.index)
         pair = pd.concat([w, r], axis=1, keys=["w", "r"]).dropna()
         if len(pair) < 2:
@@ -784,6 +841,14 @@ def book_pnl(
         "ic_gate_coverage": (
             float(1.0 - n_gated / n_gate_dates) if n_gate_dates else float("nan")
         ),
+        "weekday_mask": wd_kind,
+        "weekday_n_flat": float(n_wd_flat),
+        "weekday_n_dates": float(n_wd_dates),
+        "weekday_coverage": (
+            float(1.0 - n_wd_flat / n_wd_dates)
+            if n_wd_dates
+            else (1.0 if wd_kind == "always" else float("nan"))
+        ),
         "ex_post_gap_k": float(ex_post_gap_k),
         "mean_long_nav": sides["mean_long_nav"],
         "mean_short_nav": sides["mean_short_nav"],
@@ -831,6 +896,12 @@ def format_report(stats: dict[str, Any], *, checkpoint: Path, test_start: Any) -
             f"τ={float(stats.get('ic_gate_tau') or 0):+.3f} "
             f"cover {100 * float(stats.get('ic_gate_coverage') or float('nan')):.0f}%"
             if float(stats.get("ic_gate_window") or 0) > 0
+            else ""
+        )
+        + (
+            f"  weekday_mask={stats.get('weekday_mask')} "
+            f"cover {100 * float(stats.get('weekday_coverage') or float('nan')):.0f}%"
+            if str(stats.get("weekday_mask") or "always") not in ("", "always")
             else ""
         ),
         f"  round-trip  {stats.get('round_trip_bps', float('nan')):.1f} bp"
@@ -1026,6 +1097,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="trade the overnight book only if trailing mean CS IC >= this "
         "(flat otherwise). Used with --ic-gate-window.",
+    )
+    p.add_argument(
+        "--weekday-mask",
+        default="always",
+        choices=list(WEEKDAY_MASK_CHOICES),
+        help="causal calendar mask using weekday(t) at close t: always | "
+        "flat_friday (no weekend gap) | weekend_only (Friday overnight only) | "
+        "flat_monday (no Mon close→Tue open). Default always (off).",
     )
     p.add_argument(
         "--locate-adv-pctile",
@@ -1261,6 +1340,7 @@ def main(argv: list[str] | None = None) -> int:
         conf_pctile=float(getattr(args, "conf_pctile", 0.0) or 0.0),
         ic_gate_window=int(getattr(args, "ic_gate_window", 0) or 0),
         ic_gate_tau=float(getattr(args, "ic_gate_tau", 0.0) or 0.0),
+        weekday_mask=str(getattr(args, "weekday_mask", "always") or "always"),
     )
     stats = book_pnl(pred, realized, long_only=args.long_only, **book_kw)
     print(format_report(stats, checkpoint=ckpt_path, test_start=start))

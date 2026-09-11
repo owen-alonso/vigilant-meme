@@ -15,6 +15,7 @@ from forecast.shorting import (
     SHORT_EXCESS_LIFT_PP,
     decide_ic_gate_promote,
     decide_lo_promote,
+    decide_weekday_promote,
     decide_lo_refine,
     decide_ls_promote,
     evaluate_overnight_shorting,
@@ -272,6 +273,60 @@ def test_decide_ic_gate_promote_is_val_only_and_needs_coverage():
     assert no_fit["promote_ic_gate"] is False
 
 
+def test_decide_weekday_promote_is_val_only_and_needs_coverage():
+    always = {
+        "name": "wd_always",
+        "weekday_mask": "always",
+        "unlevered_net_ir": 1.0,
+        "unlevered_max_dd": -0.20,
+        "weekday_coverage": 1.0,
+    }
+    skip_fr = {
+        "name": "wd_flat_friday",
+        "weekday_mask": "flat_friday",
+        "unlevered_net_ir": 1.20,
+        "unlevered_max_dd": -0.18,
+        "weekday_coverage": 0.80,
+    }
+    thin_we = {
+        "name": "wd_weekend_only",
+        "weekday_mask": "weekend_only",
+        "unlevered_net_ir": 9.9,
+        "unlevered_max_dd": 0.0,
+        "weekday_coverage": 0.18,
+    }
+    juicy_test = {"unlevered_net_ir": 99.0}
+    yes = decide_weekday_promote(
+        {
+            "baseline": always,
+            "best": skip_fr,
+            "rows": [skip_fr, always, thin_we],
+            "eligible": [skip_fr, always],
+        }
+    )
+    assert yes["promote_weekday"] is True
+    assert yes["gated_on"] == "val"
+    assert yes["spec"]["weekday_mask"] == "flat_friday"
+    assert juicy_test["unlevered_net_ir"] > yes["ir_gated"]
+
+    no_cover = decide_weekday_promote(
+        {"baseline": always, "best": thin_we, "rows": [thin_we, always]}
+    )
+    # weekend_only juiciness is ineligible at 18% coverage; if it is still
+    # passed as "best", coverage floor must block.
+    assert no_cover["promote_weekday"] is False
+    assert no_cover["spec"]["weekday_mask"] == "always"
+
+    no_lift = decide_weekday_promote(
+        {
+            "baseline": always,
+            "best": {**skip_fr, "unlevered_net_ir": 1.01},
+            "rows": [always, skip_fr],
+        }
+    )
+    assert no_lift["promote_weekday"] is False
+
+
 def test_frame_to_wide_uses_calendar_index():
     df = pd.DataFrame(
         {
@@ -360,7 +415,9 @@ def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
     assert payload["lo_refine_promotion"]["gated_on"] == "val"
     assert payload["ic_gate_fit"]["fit_split"] == "train"
     assert payload["ic_gate_promotion"]["gated_on"] == "val"
+    assert payload["weekday_promotion"]["gated_on"] == "val"
     assert "PROMOTE IC-GATE" in text
+    assert "PROMOTE WEEKDAY MASK" in text
     assert "VAL LONG-ONLY GRID" in text
     assert "VAL LONG-ONLY REFINE" in text
     assert "LS HAIRCUT EXPERIMENT" in text

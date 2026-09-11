@@ -114,6 +114,11 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/be
 # causal trailing overnight CS-IC trade gate (TRAIN-fit W,τ; default off)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --live-costs --long-only --ic-gate-window 60 --ic-gate-tau 0.0
+# causal Friday / weekend weekday mask (VAL-gated; default always-on)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --long-only --weekday-mask flat_friday
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --long-only --weekday-mask weekend_only
 # harsh auction stress
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --cost-bundle harsh

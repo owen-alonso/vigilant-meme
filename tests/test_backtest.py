@@ -12,6 +12,7 @@ from forecast.backtest import (
     rank_weights,
     resize_long_only,
     trailing_mean_cs_ic,
+    weekday_mask_is_flat,
 )
 
 
@@ -87,6 +88,71 @@ def test_ic_gate_flattens_when_trailing_ic_is_dead():
     assert gated["ic_gate_coverage"] > 0.2
     # Dead second half should cut some nights vs always-on path length still kept.
     assert gated["n_dates"] == always["n_dates"]
+
+
+def _lo_panel(n_days: int = 40):
+    dates = pd.bdate_range("2022-01-03", periods=n_days)
+    names = [f"S{i}" for i in range(10)]
+    pred = pd.DataFrame(
+        np.tile(np.linspace(-1, 1, 10), (n_days, 1)), index=dates, columns=names
+    )
+    realized = pred * 0.02
+    return dates, pred, realized
+
+
+def _overnight_lo(**kwargs):
+    pred = kwargs.pop("pred")
+    realized = kwargs.pop("realized")
+    return book_pnl(
+        pred,
+        realized,
+        holding="overnight",
+        hold_halflife=0.0,
+        vol_target=0.0,
+        causal_vol=False,
+        long_only=True,
+        min_names=8,
+        round_trip_bps=10.0,
+        **kwargs,
+    )
+
+
+def test_weekday_mask_friday_and_weekend_only():
+    dates, pred, realized = _lo_panel(40)
+    always = _overnight_lo(pred=pred, realized=realized, weekday_mask="always")
+    skip_fr = _overnight_lo(pred=pred, realized=realized, weekday_mask="flat_friday")
+    only_we = _overnight_lo(pred=pred, realized=realized, weekday_mask="weekend_only")
+    skip_mo = _overnight_lo(pred=pred, realized=realized, weekday_mask="flat_monday")
+    n_fri = int(sum(int(pd.Timestamp(t).dayofweek) == 4 for t in dates))
+    n_mon = int(sum(int(pd.Timestamp(t).dayofweek) == 0 for t in dates))
+    assert skip_fr["n_dates"] == always["n_dates"]
+    assert skip_fr["weekday_mask"] == "flat_friday"
+    assert skip_fr["weekday_n_flat"] == n_fri
+    assert skip_fr["weekday_coverage"] == pytest.approx(1.0 - n_fri / 40)
+    assert only_we["weekday_n_flat"] == 40 - n_fri
+    assert only_we["weekday_coverage"] == pytest.approx(n_fri / 40)
+    assert only_we["weekday_coverage"] < 0.30
+    assert skip_mo["weekday_n_flat"] == n_mon
+    w_fr = skip_fr["weights"]
+    for ts in dates:
+        if int(pd.Timestamp(ts).dayofweek) == 4:
+            assert float(w_fr.loc[ts].abs().sum()) == pytest.approx(0.0)
+        else:
+            assert float(w_fr.loc[ts].abs().sum()) > 0.0
+
+
+def test_weekday_mask_is_causal_calendar_only():
+    dates, pred, realized = _lo_panel(30)
+    y2 = realized.copy()
+    y2.loc[dates[-1]] = -pred.loc[dates[-1]]
+    a = _overnight_lo(pred=pred, realized=realized, weekday_mask="flat_friday")
+    b = _overnight_lo(pred=pred, realized=y2, weekday_mask="flat_friday")
+    assert a["weekday_n_flat"] == b["weekday_n_flat"]
+    assert weekday_mask_is_flat(pd.Timestamp("2022-01-07"), "flat_friday")  # Friday
+    assert not weekday_mask_is_flat(pd.Timestamp("2022-01-06"), "flat_friday")
+    assert weekday_mask_is_flat(pd.Timestamp("2022-01-06"), "weekend_only")
+    assert not weekday_mask_is_flat(pd.Timestamp("2022-01-07"), "weekend_only")
+    assert weekday_mask_is_flat(pd.Timestamp("2022-01-03"), "flat_monday")
 
 
 def test_resize_long_only_conf_drops_low_abs_pred():

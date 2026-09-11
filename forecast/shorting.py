@@ -110,6 +110,13 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/be
 # causal trailing CS-IC trade gate (TRAIN-fit W,τ; default off until VAL promote)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only --ic-gate-window 60 --ic-gate-tau 0.0
+# causal Friday / weekend weekday mask (VAL-gated; default always-on)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
+  --holding overnight --live-costs --long-only --weekday-mask flat_friday
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
+  --holding overnight --live-costs --long-only --weekday-mask weekend_only
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
+  --holding overnight --live-costs --long-only --weekday-mask flat_monday
 """
 
 
@@ -183,6 +190,7 @@ def _run_overnight_book(
     ic_gate_window: int = 0,
     ic_gate_tau: float = 0.0,
     ic_gate_trail: pd.Series | None = None,
+    weekday_mask: str = "always",
 ) -> dict[str, Any]:
     stats = book_pnl(
         pred,
@@ -205,6 +213,7 @@ def _run_overnight_book(
         ic_gate_window=int(ic_gate_window or 0),
         ic_gate_tau=float(ic_gate_tau or 0.0),
         ic_gate_trail=ic_gate_trail,
+        weekday_mask=str(weekday_mask or "always"),
         overnight_r=overnight_r,
         turnover_z=turnover_z,
         vol_level=vol_level,
@@ -618,6 +627,7 @@ def _lo_q20_book(
     ic_gate_window: int = 0,
     ic_gate_tau: float = 0.0,
     ic_gate_trail: pd.Series | None = None,
+    weekday_mask: str = "always",
 ) -> dict[str, Any]:
     return _run_overnight_book(
         pred,
@@ -634,6 +644,7 @@ def _lo_q20_book(
         ic_gate_window=int(ic_gate_window),
         ic_gate_tau=float(ic_gate_tau),
         ic_gate_trail=ic_gate_trail,
+        weekday_mask=str(weekday_mask or "always"),
     )
 
 
@@ -772,6 +783,156 @@ def decide_ic_gate_promote(
         "dd_delta": dd_delta,
         "coverage": cover,
         "cover_min_val": IC_GATE_COVER_VAL,
+        "ir_lift": LO_IR_LIFT,
+    }
+
+
+WEEKDAY_MASKS = ("always", "flat_friday", "weekend_only", "flat_monday")
+WEEKDAY_COVER_VAL = 0.30
+
+
+def weekday_mask_grid(
+    df: pd.DataFrame,
+    *,
+    min_names: int,
+    vol_target: float = 0.15,
+) -> dict[str, Any]:
+    """Score causal weekday masks on one split. Caller decides VAL vs TEST."""
+    empty = {"rows": [], "best": {}, "baseline": {}, "eligible": []}
+    if df.empty:
+        return empty
+    pred, y, r_on, tz, vol = _wide_from_frame(df)
+    if pred.empty or pred.shape[1] < 2:
+        return empty
+    rows: list[dict[str, Any]] = []
+    baseline: dict[str, Any] = {}
+    for mask in WEEKDAY_MASKS:
+        stats = _lo_q20_book(
+            pred,
+            y,
+            min_names=min_names,
+            vol_target=vol_target,
+            overnight_r=r_on,
+            turnover_z=tz,
+            vol_level=vol,
+            weekday_mask=mask,
+        )
+        cover = _as_float(stats.get("weekday_coverage"))
+        if mask == "always" and not np.isfinite(cover):
+            cover = 1.0
+        row = {
+            "name": f"wd_{mask}",
+            "weekday_mask": mask,
+            "unlevered_net_ir": stats.get("unlevered_net_ir"),
+            "unlevered_max_dd": stats.get("unlevered_max_dd"),
+            "mean_cost_unlev_bp": stats.get("mean_cost_unlev_bp"),
+            "weekday_coverage": cover,
+            "weekday_n_flat": stats.get("weekday_n_flat"),
+            "weekday_n_dates": stats.get("weekday_n_dates"),
+            "n_dates": stats.get("n_dates"),
+        }
+        rows.append(row)
+        if mask == "always":
+            baseline = dict(row)
+    eligible = [
+        dict(r)
+        for r in rows
+        if np.isfinite(_as_float(r.get("unlevered_net_ir")))
+        and np.isfinite(_as_float(r.get("weekday_coverage")))
+        and _as_float(r.get("weekday_coverage")) >= WEEKDAY_COVER_VAL
+    ]
+    eligible.sort(
+        key=lambda r: (
+            -_as_float(r.get("unlevered_net_ir"), default=-1e9),
+            str(r.get("name")),
+        )
+    )
+    rows.sort(
+        key=lambda r: (
+            -_as_float(r.get("unlevered_net_ir"), default=-1e9),
+            str(r.get("name")),
+        )
+    )
+    return {
+        "rows": rows,
+        "best": dict(eligible[0]) if eligible else {},
+        "baseline": baseline,
+        "eligible": eligible,
+        "cover_min": WEEKDAY_COVER_VAL,
+        "note": (
+            "weekday(t) at close t only; Friday=weekend gap; "
+            "Monday=Mon close→Tue open; next open never a feature"
+        ),
+    }
+
+
+def decide_weekday_promote(grid: dict[str, Any]) -> dict[str, Any]:
+    """VAL-only vs always-on q20. TEST never enters."""
+    baseline = dict(grid.get("baseline") or {})
+    best = dict(grid.get("best") or {})
+    ir_on = _as_float(baseline.get("unlevered_net_ir"))
+    ir_g = _as_float(best.get("unlevered_net_ir"))
+    dd_on = _as_float(baseline.get("unlevered_max_dd"))
+    dd_g = _as_float(best.get("unlevered_max_dd"))
+    cover = _as_float(best.get("weekday_coverage"))
+    ir_delta = (
+        float(ir_g - ir_on) if np.isfinite(ir_g) and np.isfinite(ir_on) else float("nan")
+    )
+    dd_delta = (
+        float(dd_g - dd_on) if np.isfinite(dd_g) and np.isfinite(dd_on) else float("nan")
+    )
+    mask = str(best.get("weekday_mask") or "")
+    same = mask in ("", "always") or str(best.get("name") or "") == str(
+        baseline.get("name") or ""
+    )
+    ir_ok = bool(np.isfinite(ir_delta) and ir_delta >= LO_IR_LIFT)
+    dd_ok = bool(not np.isfinite(dd_delta) or dd_delta >= -LO_DD_TOL)
+    cover_ok = bool(np.isfinite(cover) and cover >= WEEKDAY_COVER_VAL)
+    promote = bool((not same) and ir_ok and dd_ok and cover_ok and bool(mask))
+    if not best:
+        reason = (
+            "NO PROMOTE: no weekday mask met VAL coverage "
+            f">= {WEEKDAY_COVER_VAL:.0%}. Keep always-on q20."
+        )
+    elif same or not ir_ok:
+        reason = (
+            f"NO PROMOTE: no weekday mask beats always-on by {LO_IR_LIFT:.2f} "
+            f"unlev net IR (best {best.get('name')} {ir_g:+.3f} vs always-on "
+            f"{ir_on:+.3f}, delta {ir_delta:+.3f}). Keep always-on q20."
+        )
+    elif not cover_ok:
+        reason = (
+            f"NO PROMOTE: {best.get('name')} VAL coverage "
+            f"{100 * cover:.0f}% < {100 * WEEKDAY_COVER_VAL:.0f}% "
+            "(catastrophic flatten). Keep always-on q20."
+        )
+    elif not dd_ok:
+        reason = (
+            f"NO PROMOTE: weekday {mask} IR lift {ir_delta:+.3f} but VAL max DD "
+            f"{dd_g:+.3f} vs always-on {dd_on:+.3f} exceeds {LO_DD_TOL:.2f}. "
+            "Keep always-on q20."
+        )
+    else:
+        reason = (
+            f"PROMOTE weekday mask {mask}: VAL IR {ir_g:+.3f} vs {ir_on:+.3f} "
+            f"(delta {ir_delta:+.3f}), max DD {dd_g:+.3f} vs {dd_on:+.3f}, "
+            f"coverage {100 * cover:.0f}%."
+        )
+    return {
+        "promote_weekday": promote,
+        "gated_on": "val",
+        "reason": reason,
+        "spec": {"weekday_mask": mask} if promote else {"weekday_mask": "always"},
+        "chosen": best,
+        "baseline": baseline,
+        "ir_always": ir_on,
+        "ir_gated": ir_g,
+        "ir_delta": ir_delta,
+        "dd_always": dd_on,
+        "dd_gated": dd_g,
+        "dd_delta": dd_delta,
+        "coverage": cover,
+        "cover_min_val": WEEKDAY_COVER_VAL,
         "ir_lift": LO_IR_LIFT,
     }
 
@@ -1029,6 +1190,13 @@ def evaluate_overnight_shorting(
     ic_promo = decide_ic_gate_promote(
         val_always=ic_val_always, val_gated=ic_val_gated, chosen=ic_chosen
     )
+    wd_val = weekday_mask_grid(
+        frames["val"], min_names=min_names, vol_target=vol_target
+    )
+    wd_promo = decide_weekday_promote(wd_val)
+    wd_test = weekday_mask_grid(
+        frames["test"], min_names=min_names, vol_target=vol_target
+    )
     exp_book = {}
     if not frames["val"].empty:
         pred = frame_to_wide(frames["val"], "pred")
@@ -1153,6 +1321,9 @@ def evaluate_overnight_shorting(
         "ic_gate_val_gated": ic_val_gated,
         "ic_gate_test_always": ic_test_always,
         "ic_gate_test_gated": ic_test_gated,
+        "weekday_val_grid": wd_val,
+        "weekday_test_grid": wd_test,
+        "weekday_promotion": wd_promo,
         "ls_experiment": ls_exp,
         "test_long_only_promoted": test_lo_promoted,
         "test_long_only_refine_best": test_refine_best,
@@ -1186,6 +1357,8 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
         f"  {(payload.get('lo_refine_promotion') or {}).get('reason')}",
         "",
         _ic_gate_block(payload),
+        "",
+        _weekday_block(payload),
         "",
         _lo_refine_block(
             payload.get("val_long_only_refine") or {},
@@ -1265,6 +1438,48 @@ def _ic_gate_block(payload: dict[str, Any]) -> str:
         f"maxDD {_fmt(tg.get('unlevered_max_dd'), '+.3f')}  "
         f"cover {_cov(tg.get('ic_gate_coverage'))}  (report-only)",
     ]
+    return "\n".join(lines)
+
+
+def _weekday_block(payload: dict[str, Any]) -> str:
+    promo = payload.get("weekday_promotion") or {}
+    val = payload.get("weekday_val_grid") or {}
+    test = payload.get("weekday_test_grid") or {}
+    chosen = promo.get("chosen") or {}
+    base = val.get("baseline") or promo.get("baseline") or {}
+
+    def _cov(value: Any) -> str:
+        x = _as_float(value)
+        return "nan%" if not np.isfinite(x) else f"{100.0 * x:.0f}%"
+
+    def _row(r: dict[str, Any]) -> str:
+        return (
+            f"  {str(r.get('name') or ''):22} "
+            f"IR {_fmt(r.get('unlevered_net_ir'), '+.3f')}  "
+            f"maxDD {_fmt(r.get('unlevered_max_dd'), '+.3f')}  "
+            f"cover {_cov(r.get('weekday_coverage'))}  "
+            f"flat {int(_as_float(r.get('weekday_n_flat'), 0.0))}/"
+            f"{int(_as_float(r.get('weekday_n_dates'), 0.0))}"
+        )
+
+    lines = [
+        f"PROMOTE WEEKDAY MASK? {'YES' if promo.get('promote_weekday') else 'NO'}",
+        f"  {val.get('note')}",
+        f"  {promo.get('reason')}",
+        f"  VAL always-on  IR {_fmt(base.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(base.get('unlevered_max_dd'), '+.3f')}  "
+        f"cover {_cov(base.get('weekday_coverage'))}",
+        f"  VAL best={chosen.get('name')}  "
+        f"IR {_fmt(chosen.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(chosen.get('unlevered_max_dd'), '+.3f')}  "
+        f"cover {_cov(chosen.get('weekday_coverage'))}",
+        "  VAL weekday masks (gate):",
+    ]
+    for row in list(val.get("rows") or []):
+        lines.append(_row(row))
+    lines.append("  TEST weekday masks (report-only):")
+    for row in list(test.get("rows") or []):
+        lines.append(_row(row))
     return "\n".join(lines)
 
 
