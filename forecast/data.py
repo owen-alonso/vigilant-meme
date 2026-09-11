@@ -42,6 +42,8 @@ from forecast.universe import (
     hedge_symbol_for,
     industry_symbol_for,
     is_equity_name,
+    peer_symbols_for,
+    size_symbol_for,
 )
 from mamba_lm.paths import REPO_ROOT, resolve_path
 
@@ -439,6 +441,12 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     out["turnover_z"] = _causal_zscore(
         np.log1p(out["volume"] * close), cfg.z_window, cfg.z_min_periods
     )
+    # Dollar ADV known at t. Not a model feature (keeps n_features stable).
+    out["dollar_adv"] = np.where(
+        (out["volume"].to_numpy(dtype=np.float64) > 0) & (close.to_numpy() > 0),
+        out["volume"].to_numpy(dtype=np.float64) * close.to_numpy(dtype=np.float64),
+        np.nan,
+    )
     out["ret_vol"] = out["ret_1"] * out["volume_z"]
     # Filled by attach_cross_section_features when more than one symbol exists.
     out["peer_ret_1"] = 0.0
@@ -750,6 +758,8 @@ def attach_residual_target(
     ``sector_residual`` uses the mapped sector ETF when that parquet exists.
     ``double_residual`` adds SPY as a second factor next to the sector hedge.
     ``industry_residual`` adds a mapped industry ETF when present.
+    ``size_residual`` adds IWM when that parquet exists.
+    ``peer_residual`` adds a same-sector equal-weight peer (exclude self).
     ``residualize_features`` subtracts the same causal betas times same-bar
     hedge ``ret_*`` from the name's own ``ret_*`` (not a label leak).
     ``label_return`` selects which forward log-return is residualized.
@@ -793,6 +803,8 @@ def attach_residual_target(
     hl = max(2, int(cfg.beta_halflife))
     double = bool(getattr(cfg, "double_residual", False))
     industry = bool(getattr(cfg, "industry_residual", False))
+    size = bool(getattr(cfg, "size_residual", False))
+    peer = bool(getattr(cfg, "peer_residual", False))
     resid_feat = bool(getattr(cfg, "residualize_features", False))
     feat_cols = ("ret_1", "ret_5", "ret_15", "ret_60", "ret_390")
     out: dict[str, pd.DataFrame] = {}
@@ -821,9 +833,34 @@ def attach_residual_target(
             ind = industry_symbol_for(sym)
             if ind and ind in panels and ind not in names:
                 names.append(ind)
+        if size:
+            sz = size_symbol_for(sym)
+            if sz and sz in panels and sz not in names and sz != sym:
+                names.append(sz)
         series = [_hedge_series(n) for n in names]
         series = [s for s in series if s is not None]
-        if not series:
+        peer_fwd_arr = None
+        peer_r_arr = None
+        if peer:
+            trade = [
+                s
+                for s in panels
+                if s != bench and s != sym and is_equity_name(s)
+            ]
+            peers = peer_symbols_for(sym, trade)
+            if len(peers) >= 2:
+                fwd_parts = []
+                r_parts = []
+                for pnm in peers:
+                    hs = _hedge_series(pnm)
+                    if hs is None:
+                        continue
+                    fwd_parts.append(hs[0])
+                    r_parts.append(hs[1])
+                if len(fwd_parts) >= 2:
+                    peer_fwd_arr = pd.concat(fwd_parts, axis=1).mean(axis=1, skipna=True)
+                    peer_r_arr = pd.concat(r_parts, axis=1).mean(axis=1, skipna=True)
+        if not series and peer_fwd_arr is None:
             out[sym] = p
             continue
         keys = _cross_section_key(p, cfg)
@@ -834,6 +871,14 @@ def attach_residual_target(
             xs.append(keys.map(hedge_r).to_numpy(dtype=np.float64))
             fwd = keys.map(hedge_fwd).to_numpy(dtype=np.float64)
             fwds.append(np.where(np.isfinite(fwd), fwd, 0.0))
+        if peer_fwd_arr is not None and peer_r_arr is not None:
+            xs.append(keys.map(peer_r_arr).to_numpy(dtype=np.float64))
+            fwd = keys.map(peer_fwd_arr).to_numpy(dtype=np.float64)
+            fwds.append(np.where(np.isfinite(fwd), fwd, 0.0))
+            names = list(names) + [f"PEER:{sym}"]
+        if not xs:
+            out[sym] = p
+            continue
         betas = _ewm_multi_beta(own_r, xs, hl) if len(xs) > 1 else [_ewm_beta(own_r, xs[0], hl)]
         own_fwd = p["target_raw"].to_numpy(dtype=np.float64)
         resid = own_fwd.astype(np.float64, copy=True)
@@ -1228,6 +1273,10 @@ def build_datasets(
     """
     from forecast.diagnostics import assert_calendar_price_quality
 
+    # Vendor data-quality ingest is intentionally not implemented (lever 7).
+    # Owen will supply datasets later. Drop vendor parquets into data_dir with
+    # the Yahoo/Stooq OHLCV contract; do not add a vendor client here.
+
     paths = list(paths) if paths is not None else discover_symbol_files(
         cfg.data_dir, interval=cfg.interval
     )
@@ -1304,6 +1353,43 @@ def build_datasets(
     else:
         train_end, val_end = None, None
 
+    # Train-era locked liquid protocol (ADV floor). Val/test do not peek.
+    usd = float(getattr(cfg, "train_adv_floor_usd", 0.0) or 0.0)
+    pct = float(getattr(cfg, "train_adv_floor_pctile", 0.0) or 0.0)
+    if (usd > 0 or pct > 0) and trade_panels:
+        from forecast.levers import train_era_liquid_names
+
+        medians: dict[str, float] = {}
+        for symbol, panel in trade_panels.items():
+            if train_end is not None:
+                train_rows = panel.loc[panel["session"] < train_end]
+            else:
+                train_rows = panel
+            adv = train_rows["dollar_adv"] if "dollar_adv" in train_rows.columns else (
+                train_rows["volume"] * train_rows["close"]
+            )
+            adv = pd.to_numeric(adv, errors="coerce")
+            medians[symbol] = float(adv.median()) if len(adv) else float("nan")
+        kept_names = train_era_liquid_names(
+            medians,
+            list(trade_panels.keys()),
+            floor_usd=usd,
+            floor_pctile=pct,
+            min_names=int(getattr(cfg, "liquid_min_names", 0) or 0),
+        )
+        dropped = [s for s in trade_panels if s not in set(kept_names)]
+        trade_panels = {s: trade_panels[s] for s in kept_names if s in trade_panels}
+        if log_fn:
+            log_fn(
+                f"train-era ADV lock: usd={usd:.0f} pctile={pct:.2f} "
+                f"kept={len(trade_panels)} dropped={len(dropped)}"
+            )
+        if not trade_panels:
+            raise ValueError(
+                "train-era ADV floor dropped every trading name; "
+                "lower --train-adv-floor-usd / --train-adv-floor-pctile"
+            )
+
     train_syms: list[SymbolArrays] = []
     val_syms: list[SymbolArrays] = []
     test_syms: list[SymbolArrays] = []
@@ -1363,6 +1449,8 @@ def build_datasets(
                     benchmark=bench,
                 ),
                 "train_from": raw_from,
+                "size_residual": bool(getattr(cfg, "size_residual", False)),
+                "peer_residual": bool(getattr(cfg, "peer_residual", False)),
             }
         )
         if log_fn:
@@ -1470,6 +1558,10 @@ def build_datasets(
         "train_from": raw_from,
         "n_trading_names": int(len(trade_panels)),
         "label_return": normalize_label_return(getattr(cfg, "label_return", "close")),
+        "size_residual": bool(getattr(cfg, "size_residual", False)),
+        "peer_residual": bool(getattr(cfg, "peer_residual", False)),
+        "train_adv_floor_usd": float(getattr(cfg, "train_adv_floor_usd", 0.0) or 0.0),
+        "train_adv_floor_pctile": float(getattr(cfg, "train_adv_floor_pctile", 0.0) or 0.0),
     }
 
 

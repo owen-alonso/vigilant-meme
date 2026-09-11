@@ -153,6 +153,16 @@ def masked_loss(
         list_term = masked_listnet_loss(mean, target, mask, date_ids=date_ids)
         if torch.isfinite(list_term):
             total = total + float(cfg.listnet_loss_weight) * list_term
+    if float(getattr(cfg, "long_only_loss_weight", 0.0) or 0.0) > 0:
+        lo_term = masked_long_only_rank_loss(
+            mean,
+            target,
+            mask,
+            date_ids=date_ids,
+            quantile=float(getattr(cfg, "long_only_quantile", 0.2) or 0.2),
+        )
+        if torch.isfinite(lo_term):
+            total = total + float(cfg.long_only_loss_weight) * lo_term
     if cfg.pred_std_weight > 0:
         scale_term = masked_pred_std_loss(mean, target, mask)
         if torch.isfinite(scale_term):
@@ -298,6 +308,57 @@ def _ranknet(pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     diff_p = unit.unsqueeze(0) - unit.unsqueeze(1)
     diff_y = y.unsqueeze(0) - y.unsqueeze(1)
     valid = diff_y.abs() > 1e-6
+    if not bool(valid.any()):
+        return pred.new_zeros(())
+    return F.softplus(-diff_p * diff_y.sign())[valid].mean()
+
+
+def masked_long_only_rank_loss(
+    mean: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    date_ids: torch.Tensor | None = None,
+    quantile: float = 0.2,
+) -> torch.Tensor:
+    """RankNet restricted to pairs that involve the within-date long sleeve.
+
+    Aligns encoder training with the runnable long-only book (top quantile).
+    """
+    dates = _expand_date_ids(date_ids, mask)
+    sel = mask.bool()
+    pred = mean[sel]
+    y = target[sel]
+    q = min(0.49, max(0.05, float(quantile)))
+    if dates is None:
+        return _long_only_ranknet(pred, y, q)
+    keys = dates[sel]
+    parts: list[torch.Tensor] = []
+    for key in keys.unique():
+        m = keys == key
+        if int(m.sum()) < 3:
+            continue
+        parts.append(_long_only_ranknet(pred[m], y[m], q))
+    if not parts:
+        return mean.new_zeros(())
+    return torch.stack(parts).mean()
+
+
+def _long_only_ranknet(pred: torch.Tensor, y: torch.Tensor, quantile: float) -> torch.Tensor:
+    n = int(pred.numel())
+    if n < 3:
+        return pred.new_zeros(())
+    k = max(1, int(math.floor(n * float(quantile))))
+    thresh = torch.topk(y, k, largest=True).values.min()
+    long = y >= thresh
+    if int(long.sum()) < 1:
+        return pred.new_zeros(())
+    scale = pred.detach().std(unbiased=False).clamp(min=1.0)
+    unit = pred / scale
+    diff_p = unit.unsqueeze(0) - unit.unsqueeze(1)
+    diff_y = y.unsqueeze(0) - y.unsqueeze(1)
+    involve = long.unsqueeze(0) | long.unsqueeze(1)
+    valid = (diff_y.abs() > 1e-6) & involve
     if not bool(valid.any()):
         return pred.new_zeros(())
     return F.softplus(-diff_p * diff_y.sign())[valid].mean()
@@ -715,7 +776,7 @@ def apply_ridge_skip(
     )
     min_names = int(bundle.get("cs_min_names", 8))
     stable = str(getattr(train_cfg, "ridge_year_stable", "") or "")
-    if stable in ("train", "train_val"):
+    if stable in ("train", "train_val", "train_recency", "recency"):
         xv = yv = dv = None
         if stable == "train_val" and bundle.get("val_symbols"):
             xv, yv, dv = labelled_rows(
@@ -723,15 +784,20 @@ def apply_ridge_skip(
                 bundle["feature_mean"],
                 bundle["feature_std"],
             )
-        keep = year_stable_mask(
-            x,
-            y,
-            dates,
-            min_names=min_names,
-            x_val=xv,
-            y_val=yv,
-            d_val=dv,
-        )
+        if stable in ("train_recency", "recency"):
+            from forecast.levers import year_sign_consistency_mask
+
+            keep = year_sign_consistency_mask(x, y, dates, min_names=min_names)
+        else:
+            keep = year_stable_mask(
+                x,
+                y,
+                dates,
+                min_names=min_names,
+                x_val=xv,
+                y_val=yv,
+                d_val=dv,
+            )
         from forecast.ridge import feature_mask, fit_ridge_xy, ridge_kwargs_from_train_cfg
 
         kw = ridge_kwargs_from_train_cfg(train_cfg, {"cs_min_names": min_names})
@@ -937,6 +1003,7 @@ def _train(
                     f"t={test.get('cs_ic_tstat', float('nan')):.2f}"
                 )
         year_rows: dict[str, list[dict[str, float]]] = {}
+        ensemble_report: dict[str, Any] = {}
         if model.config.linear_skip:
             from forecast.ridge import labelled_rows as _rows
             from forecast.ridge import year_cs_ics
@@ -963,6 +1030,73 @@ def _train(
                             f"n={int(row['cs_n_dates'])}"
                         )
 
+        if bool(getattr(train_cfg, "ensemble_mlp", False)) and model.config.linear_skip:
+            from forecast.levers import blend_skip_mlp, val_gate, year_slice_stats
+            from forecast.ridge import labelled_rows as _ens_rows
+
+            w = model.skip.weight.detach().cpu().numpy().reshape(-1).astype(np.float64)
+            b = float(model.skip.bias.detach().cpu().numpy().reshape(-1)[0])
+            x_tr, y_tr, d_tr = _ens_rows(
+                bundle["train_symbols"], bundle["feature_mean"], bundle["feature_std"]
+            )
+            skip_tr = x_tr @ w + b
+            min_n = int(bundle.get("cs_min_names", 8))
+            ens = blend_skip_mlp(
+                x_tr,
+                y_tr,
+                d_tr,
+                skip_tr,
+                min_names=min_n,
+                hidden=int(getattr(train_cfg, "ensemble_hidden", 8) or 8),
+                seed=int(train_cfg.seed),
+            )
+            x_va, y_va, d_va = _ens_rows(
+                bundle["val_symbols"], bundle["feature_mean"], bundle["feature_std"]
+            )
+            skip_va = x_va @ w + b
+            from forecast.ridge import predict_residual_mlp
+
+            mlp_va = predict_residual_mlp(
+                x_va, d_va, ens["w1"], ens["b1"], ens["w2"], min_names=min_n
+            )
+            mix = float(ens["mix"])
+            pred_va = skip_va + mix * mlp_va
+            from forecast.ridge import cs_stats as _cs
+
+            skip_stats = _cs(skip_va, y_va, d_va, min_names=min_n)
+            blend_stats = _cs(pred_va, y_va, d_va, min_names=min_n)
+            y2017_skip = year_slice_stats(skip_va, y_va, d_va, min_names=min_n, year=2017)
+            y2017_blend = year_slice_stats(pred_va, y_va, d_va, min_names=min_n, year=2017)
+            promote = val_gate(
+                float(blend_stats.get("cs_ic", float("nan"))),
+                float(skip_stats.get("cs_ic", float("nan"))),
+                candidate_2017=float(y2017_blend.get("cs_ic", float("nan"))),
+                baseline_2017=float(y2017_skip.get("cs_ic", float("nan"))),
+            )
+            if not promote:
+                mix = 0.0
+            ensemble_report = {
+                "mix": mix,
+                "promote": bool(promote),
+                "skip_val_cs_ic": float(skip_stats.get("cs_ic", float("nan"))),
+                "blend_val_cs_ic": float(blend_stats.get("cs_ic", float("nan"))),
+                "hold_ic": float(ens["hold_ic"]),
+                "note": (
+                    "promoted skip+MLP residual"
+                    if promote
+                    else "discarded: locked val did not clear vs skip"
+                ),
+            }
+            (ckpt_dir / "ensemble.json").write_text(
+                json.dumps(ensemble_report, indent=2, default=str)
+            )
+            if log_fn:
+                log_fn(
+                    f"  ensemble mlp mix={mix:.2f} val={ensemble_report['blend_val_cs_ic']:+.4f} "
+                    f"vs skip {ensemble_report['skip_val_cs_ic']:+.4f} "
+                    f"{'PROMOTE' if promote else 'discard'}"
+                )
+
     if train_cfg.skip_only:
         save(ckpt_dir / "best.pt", 0, skip_only_val)
         save(ckpt_dir / "last.pt", 0, skip_only_val)
@@ -977,6 +1111,7 @@ def _train(
             "skip_only_test": skip_only_test,
             "walk_forward": walk_forward,
             "cs_ic_by_year": year_rows,
+            "ensemble": ensemble_report,
             "interrupted": False,
             "last_step": 0,
             "n_params": n_params,
@@ -1296,6 +1431,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="add a mapped industry ETF as a third residual factor when present",
     )
     g.add_argument(
+        "--size-residual",
+        action="store_true",
+        help="add IWM as a causal size factor (off until locked-val gate)",
+    )
+    g.add_argument(
+        "--peer-residual",
+        action="store_true",
+        help="add same-sector peer-average residual (exclude self; causal beta)",
+    )
+    g.add_argument(
+        "--train-adv-floor-usd",
+        type=float,
+        default=d.train_adv_floor_usd,
+        help="train-era locked median dollar ADV floor (0=off); val/test do not peek",
+    )
+    g.add_argument(
+        "--train-adv-floor-pctile",
+        type=float,
+        default=d.train_adv_floor_pctile,
+        help="train-era percentile floor on median dollar ADV (0.67=top tercile)",
+    )
+    g.add_argument(
+        "--liquid-min-names",
+        type=int,
+        default=d.liquid_min_names,
+        help="after ADV lock, keep at least this many names (top train-era ADV)",
+    )
+    g.add_argument(
         "--label-return",
         default=d.label_return,
         help="residual label: close (default/locked book), overnight "
@@ -1431,8 +1594,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "--ridge-objective",
         default=t.ridge_objective,
-        choices=("ridge", "listnet", "ranknet"),
-        help="frozen skip fitter: closed-form ridge or linear ListNet/RankNet",
+        choices=("ridge", "listnet", "ranknet", "long_only"),
+        help="frozen skip fitter: closed-form ridge, ListNet/RankNet, or long-sleeve ridge",
     )
     g.add_argument(
         "--ridge-y-winsor",
@@ -1476,8 +1639,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "--ridge-year-stable",
         default="",
-        choices=("", "train", "train_val"),
-        help="keep features whose univariate CS IC sign is stable across years",
+        choices=("", "train", "train_recency", "train_val"),
+        help="keep features whose univariate CS IC sign is stable across train years "
+        "(train_recency weights later years and requires a trailing sign lock)",
+    )
+    g.add_argument(
+        "--long-only-quantile",
+        type=float,
+        default=t.long_only_quantile,
+        help="top CS quantile for the long-only skip / long-only rank loss",
+    )
+    g.add_argument(
+        "--long-only-loss-weight",
+        type=float,
+        default=t.long_only_loss_weight,
+        help="within-date RankNet on long-sleeve pairs (0 disables)",
+    )
+    g.add_argument(
+        "--ensemble-mlp",
+        action="store_true",
+        help="fit a tiny residual MLP and blend only if locked val clears vs skip",
+    )
+    g.add_argument(
+        "--ic-shrink-lookback",
+        type=int,
+        default=t.ic_shrink_lookback,
+        help="causal trailing-IC sizing lookback in days (0=off; apply in backtest)",
+    )
+    g.add_argument(
+        "--ic-shrink-mode",
+        default=t.ic_shrink_mode,
+        choices=("flatten_ic", "flatten_tstat", "flatten_weak", "scale", "scale_cap"),
+        help="how trailing CS IC maps onto overnight leverage (not scores)",
     )
     g.add_argument(
         "--listnet-loss-weight",
@@ -1578,6 +1771,11 @@ def configs_from_cli(
         double_residual=args.double_residual,
         residualize_features=args.residualize_features,
         industry_residual=args.industry_residual,
+        size_residual=bool(getattr(args, "size_residual", False)),
+        peer_residual=bool(getattr(args, "peer_residual", False)),
+        train_adv_floor_usd=float(getattr(args, "train_adv_floor_usd", 0.0) or 0.0),
+        train_adv_floor_pctile=float(getattr(args, "train_adv_floor_pctile", 0.0) or 0.0),
+        liquid_min_names=int(getattr(args, "liquid_min_names", 0) or 0),
         label_return=_cli_label_return(args),
         fill_minutes=_cli_fill_minutes(args),
     )
@@ -1625,6 +1823,11 @@ def configs_from_cli(
         ridge_year_balance=args.ridge_year_balance,
         ridge_year_stable=args.ridge_year_stable,
         listnet_loss_weight=args.listnet_loss_weight,
+        long_only_quantile=float(getattr(args, "long_only_quantile", 0.2) or 0.2),
+        long_only_loss_weight=float(getattr(args, "long_only_loss_weight", 0.0) or 0.0),
+        ensemble_mlp=bool(getattr(args, "ensemble_mlp", False)),
+        ic_shrink_lookback=int(getattr(args, "ic_shrink_lookback", 0) or 0),
+        ic_shrink_mode=str(getattr(args, "ic_shrink_mode", "flatten_ic") or "flatten_ic"),
         sigma_aux_weight=(
             0.0
             if (not heteroscedastic or args.loss == "gaussian")

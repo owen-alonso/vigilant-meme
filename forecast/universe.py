@@ -7,6 +7,8 @@ trading name here.
 
 from __future__ import annotations
 
+from typing import Sequence
+
 # Mega-caps and other liquid names that existed (under these or predecessor
 # tickers Yahoo still serves) through the 2018 train cut.
 LIQUID_NAMES: tuple[str, ...] = (
@@ -133,6 +135,8 @@ SECTOR_ETFS: tuple[str, ...] = (
     "XLRE",
 )
 MACRO_HEDGES: tuple[str, ...] = ("GLD", "TLT", "HYG", "LQD", "EEM", "EFA")
+# Size hedge for optional ``size_residual`` (already in INDEX_ETFS / liquid).
+SIZE_ETF = "IWM"
 # Optional industry ETFs (pre-2018). Used only when industry_residual=True.
 INDUSTRY_ETFS: tuple[str, ...] = ("SMH", "KBE", "XBI", "IYR", "XRT")
 
@@ -260,6 +264,27 @@ def hedge_symbol_for(symbol: str, *, sector_residual: bool, benchmark: str = "SP
 def industry_symbol_for(symbol: str) -> str | None:
     """Optional finer hedge. None if the name has no industry ETF map."""
     return INDUSTRY_ETF_BY_SYMBOL.get(str(symbol).upper())
+
+
+def size_symbol_for(_symbol: str | None = None) -> str:
+    """IWM size hedge. Same ticker for every name; causal beta still per-name."""
+    return SIZE_ETF
+
+
+def peer_symbols_for(symbol: str, universe: Sequence[str]) -> list[str]:
+    """Other trading names that share this name's mapped sector ETF."""
+    own = str(symbol).upper()
+    sector = SECTOR_ETF_BY_SYMBOL.get(own)
+    if not sector:
+        return []
+    out: list[str] = []
+    for name in universe:
+        n = str(name).upper()
+        if n == own:
+            continue
+        if SECTOR_ETF_BY_SYMBOL.get(n) == sector:
+            out.append(n)
+    return out
 
 
 def trading_symbols(universe: str = "liquid") -> list[str]:

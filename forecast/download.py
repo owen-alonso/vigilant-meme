@@ -62,7 +62,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="alphavantage",
         choices=("alphavantage", "stooq", "yahoo"),
         help="alphavantage (~100 daily bars on a free key), yahoo (full daily history, no key), "
-        "or stooq",
+        "or stooq. Vendor data-quality ingest is not implemented; drop vendor parquets "
+        "into --data-dir with the same OHLCV contract.",
     )
     p.add_argument(
         "--history-months",

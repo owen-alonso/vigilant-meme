@@ -24,6 +24,7 @@ import torch
 
 from forecast.checkpoint import load_forecaster
 from forecast.config import DataConfig
+from forecast.levers import apply_gap_risk_cap, calibration_scale
 from forecast.overnight import (
     apply_locate_gate,
     book_side_stats,
@@ -326,6 +327,12 @@ def book_pnl(
     turnover_z: pd.DataFrame | None = None,
     vol_level: pd.DataFrame | None = None,
     adv_floor_pctile: float = 0.0,
+    dollar_adv: pd.DataFrame | None = None,
+    adv_borrow_k: float = 0.0,
+    adv_auction_k: float = 0.0,
+    ic_shrink_lookback: int = 0,
+    ic_shrink_mode: str = "flatten_ic",
+    gap_risk_cap: float = 0.0,
 ) -> dict[str, Any]:
     """Cost-aware long-short with optional rank weights, hold smoothing, causal vol.
 
@@ -421,6 +428,21 @@ def book_pnl(
             long_only=False,
         )
         w_panel = pd.DataFrame(gated, index=w_panel.index, columns=w_panel.columns)
+    adv_kept = None
+    if dollar_adv is not None:
+        adv_kept = dollar_adv.reindex(index=w_panel.index, columns=w_panel.columns)
+    if float(gap_risk_cap) > 0 and vol_kept is not None:
+        capped = apply_gap_risk_cap(
+            w_panel.to_numpy(dtype=np.float64),
+            vol_kept.to_numpy(dtype=np.float64),
+            cap=float(gap_risk_cap),
+        )
+        w_panel = pd.DataFrame(capped, index=w_panel.index, columns=w_panel.columns)
+        w_panel = pd.DataFrame(
+            [_renorm_row(row, long_only=long_only) for row in w_panel.to_numpy()],
+            index=w_panel.index,
+            columns=w_panel.columns,
+        )
     realized_kept = realized.reindex(index=w_panel.index, columns=w_panel.columns)
     gross_s = (w_panel * realized_kept).sum(axis=1, skipna=True).astype(np.float64)
     w_arr = w_panel.to_numpy(dtype=np.float64)
@@ -444,6 +466,9 @@ def book_pnl(
         thin_mult=thin_mult,
         thin_pctile=thin_pctile,
         ex_post_gap_k=ex_post_gap_k,
+        dollar_adv=None if adv_kept is None else adv_kept.to_numpy(dtype=np.float64),
+        adv_borrow_k=float(adv_borrow_k),
+        adv_auction_k=float(adv_auction_k),
     )
     if flatten:
         turnover = pd.Series(overnight_one_way_turnover(w_arr), index=w_panel.index)
@@ -503,6 +528,37 @@ def book_pnl(
         lever_s = pd.Series(1.0, index=gross_s.index, dtype=np.float64)
         mean_lever = 1.0
 
+    shrink_frac = 1.0
+    if int(ic_shrink_lookback) > 0:
+        day_keys = ((pd.to_datetime(w_panel.index) - pd.Timestamp("1970-01-01"))
+                    // pd.Timedelta("1D")).astype(np.int64).to_numpy()
+        pred_flat = []
+        y_flat = []
+        d_flat = []
+        for i, ts in enumerate(w_panel.index):
+            p = pred.loc[ts]
+            y = realized.loc[ts]
+            pair = pd.concat([p, y], axis=1, keys=["p", "y"]).dropna()
+            if len(pair) < int(min_names):
+                continue
+            pred_flat.append(pair["p"].to_numpy())
+            y_flat.append(pair["y"].to_numpy())
+            d_flat.append(np.full(len(pair), int(day_keys[i]), dtype=np.int64))
+        if pred_flat:
+            keys, scales = calibration_scale(
+                np.concatenate(pred_flat),
+                np.concatenate(y_flat),
+                np.concatenate(d_flat),
+                min_names=int(min_names),
+                lookback_days=int(ic_shrink_lookback),
+                mode=str(ic_shrink_mode or "flatten_ic"),
+            )
+            scale_map = {int(k): float(s) for k, s in zip(keys, scales)}
+            conf = np.array([scale_map.get(int(k), 1.0) for k in day_keys], dtype=np.float64)
+            lever_s = lever_s * pd.Series(conf, index=w_panel.index, dtype=np.float64)
+            shrink_frac = float(np.mean(conf == 0.0)) if conf.size else 0.0
+            mean_lever = float(lever_s.mean()) if len(lever_s) else mean_lever
+
     cost = cost_unlev * lever_s
     net_s = lever_s * gross_s - cost
     ics = cs_ic_by_date(pred.loc[w_panel.index], realized.loc[w_panel.index])
@@ -551,6 +607,12 @@ def book_pnl(
         "thin_pctile": float(thin_pctile),
         "locate_pctile": float(locate_pctile),
         "adv_floor_pctile": float(adv_floor_pctile),
+        "adv_borrow_k": float(adv_borrow_k),
+        "adv_auction_k": float(adv_auction_k),
+        "ic_shrink_lookback": float(ic_shrink_lookback),
+        "ic_shrink_mode": str(ic_shrink_mode),
+        "gap_risk_cap": float(gap_risk_cap),
+        "shrink_flat_frac": float(shrink_frac) if int(ic_shrink_lookback) > 0 else 0.0,
         "ex_post_gap_k": float(ex_post_gap_k),
         "mean_long_nav": sides["mean_long_nav"],
         "mean_short_nav": sides["mean_short_nav"],
@@ -670,7 +732,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--cost-bundle",
         default="",
         help="named overnight cost pack: paper, live_flat, live, live_locate, "
-        "live_long_only, harsh, ex_post_gap, fill_live. CLI flags override fields.",
+        "live_long_only, live_adv, live_adv_long_only, harsh, borrow_stress, "
+        "auction_stress, ex_post_gap, fill_live. CLI flags override fields.",
     )
     p.add_argument(
         "--live-costs",
@@ -768,6 +831,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="look-ahead full-sample vol targeting (old behavior; IR scale-invariant)",
     )
+    p.add_argument(
+        "--gap-risk-cap",
+        type=float,
+        default=0.0,
+        help="cap sum(|w|*vol_level) per date (0=off). Known at t; not a realized gap.",
+    )
+    p.add_argument(
+        "--ic-shrink-lookback",
+        type=int,
+        default=0,
+        help="causal trailing CS IC lookback (days) applied to leverage (0=off)",
+    )
+    p.add_argument(
+        "--ic-shrink-mode",
+        default="flatten_ic",
+        choices=("flatten_ic", "flatten_tstat", "flatten_weak", "scale", "scale_cap"),
+        help="trailing-IC sizing overlay; flatten zeros NAV when trailing IC is dead",
+    )
+    p.add_argument(
+        "--adv-borrow-k",
+        type=float,
+        default=None,
+        help="borrow *= (median ADV / ADV)^k on shorts (0=flat; long-only zeros borrow)",
+    )
+    p.add_argument(
+        "--adv-auction-k",
+        type=float,
+        default=None,
+        help="MOC/MOO *= (median ADV / ADV)^k (thin names more expensive)",
+    )
     p.add_argument("--long-only", action="store_true", help="long the top quantile/ranks only (no short leg, no locate)")
     p.add_argument(
         "--compare-long-only",
@@ -799,6 +892,8 @@ def cost_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
         name = "live"
     if bool(getattr(args, "long_only", False)) and name == "live":
         name = "live_long_only"
+    if bool(getattr(args, "long_only", False)) and name == "live_adv":
+        name = "live_adv_long_only"
     bundle = resolve_cost_bundle(name) if name else None
     overrides = {
         "round_trip_bps": getattr(args, "cost_bps", None),
@@ -813,6 +908,8 @@ def cost_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "thin_pctile": getattr(args, "thin_pctile", None),
         "locate_pctile": getattr(args, "locate_adv_pctile", None),
         "ex_post_gap_k": getattr(args, "ex_post_gap_k", None),
+        "adv_borrow_k": getattr(args, "adv_borrow_k", None),
+        "adv_auction_k": getattr(args, "adv_auction_k", None),
     }
     merged = merge_cost_kwargs(bundle, **overrides)
     if not name and args.cost_bps is None:
@@ -890,6 +987,7 @@ def main(argv: list[str] | None = None) -> int:
     costs = cost_kwargs_from_args(args)
     tz = panel_feature_wide(panels, "turnover_z", pred) if len(pred) else None
     vol = panel_feature_wide(panels, "vol_level", pred) if len(pred) else None
+    adv = panel_feature_wide(panels, "dollar_adv", pred) if len(pred) else None
     ppy = 252.0 if data_cfg.is_daily() else (52.0 if data_cfg.interval == "weekly" else 12.0)
     book_kw = dict(
         quantile=args.quantile,
@@ -915,7 +1013,13 @@ def main(argv: list[str] | None = None) -> int:
         ex_post_gap_k=float(costs["ex_post_gap_k"]),
         turnover_z=tz,
         vol_level=vol,
+        dollar_adv=adv,
         adv_floor_pctile=float(args.adv_floor_pctile or 0.0),
+        adv_borrow_k=float(costs.get("adv_borrow_k", 0.0) or 0.0),
+        adv_auction_k=float(costs.get("adv_auction_k", 0.0) or 0.0),
+        ic_shrink_lookback=int(getattr(args, "ic_shrink_lookback", 0) or 0),
+        ic_shrink_mode=str(getattr(args, "ic_shrink_mode", "flatten_ic") or "flatten_ic"),
+        gap_risk_cap=float(getattr(args, "gap_risk_cap", 0.0) or 0.0),
     )
     stats = book_pnl(pred, realized, long_only=args.long_only, **book_kw)
     print(format_report(stats, checkpoint=ckpt_path, test_start=start))

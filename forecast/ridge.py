@@ -1430,6 +1430,31 @@ def fit_skip_xy(
         return fit_listnet_xy(x, y, dates, **shared)
     if objective == "ranknet":
         return fit_ranknet_xy(x, y, dates, **shared)
+    if objective in ("long_only", "longonly", "long-only"):
+        from forecast.levers import fit_long_only_xy, promoted_feature_mask
+
+        mask = kwargs["feature_mask_bool"]
+        stable = str(getattr(train_cfg, "ridge_year_stable", "") or "")
+        if stable:
+            mask = promoted_feature_mask(
+                str(getattr(train_cfg, "ridge_features", "all") or "all"),
+                x,
+                y,
+                dates,
+                year_stable=stable,
+                min_names=min_names,
+            )
+        return fit_long_only_xy(
+            x,
+            y,
+            dates,
+            ridge=kwargs["ridge"],
+            min_names=min_names,
+            quantile=float(getattr(train_cfg, "long_only_quantile", 0.2) or 0.2),
+            feat_winsor=kwargs["feat_winsor"],
+            feature_mask_bool=mask,
+            date_halflife=kwargs["date_halflife"],
+        )
     return fit_ridge_xy(
         x,
         y,

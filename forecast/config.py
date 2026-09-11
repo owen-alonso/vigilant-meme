@@ -106,6 +106,17 @@ class DataConfig:
     residualize_features: bool = False
     # Optional third factor vs a mapped industry ETF when that parquet exists.
     industry_residual: bool = False
+    # Optional size factor vs IWM (causal beta through t). Off until val-gate.
+    size_residual: bool = False
+    # Optional same-sector peer-average factor (exclude self; causal beta).
+    peer_residual: bool = False
+    # Train-era locked ADV floor in USD (median volume*close on train sessions).
+    # 0 = off. Membership is frozen at the train cut; val/test do not peek.
+    train_adv_floor_usd: float = 0.0
+    # Train-era percentile floor on median dollar ADV (0.67 = top tercile).
+    train_adv_floor_pctile: float = 0.0
+    # After the ADV filter, require at least this many names (0 = no backfill).
+    liquid_min_names: int = 0
     # Which forward log-return the residual label uses. ``close`` is close_t →
     # close_{t+h} (the locked close-to-close book). ``overnight`` is
     # close_t → open_{t+h} (gap residual; next open is a *label*, never a
@@ -148,6 +159,16 @@ class DataConfig:
             payload["residualize_features"] = False
         if "industry_residual" not in payload:
             payload["industry_residual"] = False
+        if "size_residual" not in payload:
+            payload["size_residual"] = False
+        if "peer_residual" not in payload:
+            payload["peer_residual"] = False
+        if "train_adv_floor_usd" not in payload:
+            payload["train_adv_floor_usd"] = 0.0
+        if "train_adv_floor_pctile" not in payload:
+            payload["train_adv_floor_pctile"] = 0.0
+        if "liquid_min_names" not in payload:
+            payload["liquid_min_names"] = 0
         if "label_return" not in payload:
             payload["label_return"] = "close"
         if "fill_minutes" not in payload:
@@ -363,11 +384,21 @@ class ForecastTrainConfig:
     ridge_sign_constrain: bool = False
     # Drop dot-com + GFC dates from the frozen skip fit.
     ridge_drop_crashes: bool = False
-    # ``ridge`` / ``listnet`` / ``ranknet`` skip objective.
+    # ``ridge`` / ``listnet`` / ``ranknet`` / ``long_only`` skip objective.
     ridge_objective: str = "ridge"
+    # Top CS quantile used by the long-only skip / long-only rank loss.
+    long_only_quantile: float = 0.2
+    # Within-date RankNet on pairs that involve the long sleeve (0 = off).
+    long_only_loss_weight: float = 0.0
+    # Fit a tiny residual MLP on late-train and blend iff locked val clears.
+    ensemble_mlp: bool = False
+    ensemble_hidden: int = 8
+    # Causal trailing-IC sizing overlay lookback in days (0 = off).
+    ic_shrink_lookback: int = 0
+    ic_shrink_mode: str = "flatten_ic"
     # Equalize per-year total weight in the frozen skip (train only).
     ridge_year_balance: bool = False
-    # Year-sign stability mask: ``train`` or ``train_val`` (empty = off).
+    # Year-sign stability mask: ``train`` / ``train_recency`` / ``train_val`` (empty = off).
     ridge_year_stable: str = ""
     # ListNet (softmax CE) within date. 0 keeps RankNet-only ranking.
     listnet_loss_weight: float = 0.0
@@ -407,6 +438,7 @@ def validate_loss_head(model_cfg: ForecastModelConfig, train_cfg: ForecastTrainC
         "sign_loss_weight",
         "rank_loss_weight",
         "listnet_loss_weight",
+        "long_only_loss_weight",
         "pred_std_weight",
         "ridge_skip",
         "skip_lr_mult",
