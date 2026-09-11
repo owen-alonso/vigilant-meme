@@ -138,16 +138,16 @@ Training logs periodic Dynamic A scale stats (`mean/std/min/max`) so you can see
 
 ## Next-day residual CS forecasting
 
-`forecast/` predicts **next-day SPY-residual** returns for a train-era-locked
-liquid universe. The estimand is last-bar **mean CS IC**, not weekly AAPL+MSFT
-time-series Pearson. Dynamic A is optional and off by default.
+`forecast/` predicts **next-day residual** returns (sector hedge, else SPY) for
+train-era-locked **equities**. The estimand is last-bar **mean CS IC**, not
+weekly AAPL+MSFT time-series Pearson. Dynamic A is optional and off by default.
 
 ```
 forecast/
-  universe.py      # 2018-era liquid names + SPY benchmark
-  data.py          # causal features, residual label, CS z-scores, CS ridge
+  universe.py      # 2018-era liquid names, equity filter, sector hedge map
+  data.py          # causal features, residual label, CS z/rank, CS ridge
   training.py      # skip-only ridge, CS IC / RankNet, checkpoints
-  backtest.py      # last-bar quantile long-short with costs
+  backtest.py      # rank/quantile book, hold smoothing, causal vol, costs
   diagnostics.py   # mixed adjusted/raw weekly gate
   synthetic.py     # planted CS-momentum universe for CPU ablations
 ```
@@ -165,13 +165,15 @@ Yahoo/Stooq daily caches are split-adjusted (`adjclose` is written into
 protocol. Target:
 
 \[
-y_t = \frac{r_{t+1} - \beta_t r^{\mathrm{SPY}}_{t+1}}{\sigma_t}
+y_t = \frac{r_{t+1} - \beta_t r^{\mathrm{hedge}}_{t+1}}{\sigma_t}
 \]
 
 `best.pt` is selected by mean CS IC when a cross-section exists. `backtest.py`
-builds a dollar-neutral (or `--long-only`) quantile book on the locked test
-window, with round-trip costs. Report mean CS IC + t-stat + net IR; do not
-call a Spearman/Pearson blend or a val number "test IC 0.14".
+builds a dollar-neutral (or `--long-only`) rank or quantile book on the locked
+test window, with round-trip costs, causal vol targeting, and optional hold
+smoothing. Report mean CS IC + t-stat + **unlevered** net IR and causal max DD.
+Do not call a Spearman/Pearson blend, a val number, or a 100% vol path "test IC
+0.14" / "IR 1 with a survivable book".
 
 ## Tests
 

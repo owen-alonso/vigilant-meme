@@ -2,9 +2,9 @@
 
 This file is the operating manual for the **equity forecast** model in `forecast/`. It is not the language-model path (`main.py`, Shakespeare, Dynamic A LM). Those share a Mamba backbone; they do not share data, targets, or `generate.py`.
 
-The **estimand** is last-bar **cross-sectional** Pearson/Spearman on **next-day market-residual** returns, over a train-era-locked liquid universe (50–200 names). It is **not** time-series Pearson on weekly AAPL+MSFT.
+The **estimand** is last-bar **cross-sectional** Pearson/Spearman on **next-day residual** returns (sector ETF when the parquet exists, otherwise SPY), over a train-era-locked liquid **equity** book (50–200 names). Index/sector/macro ETFs load as hedges, not as names you rank. Train labels start in 1999 by default; val/test calendar cuts stay locked.
 
-Success band (honest, locked test window): mean CS IC **0.04–0.08** with t-stat **> 3**, and long-short **net IR ~1** after costs. A single-date CS IC print near 0.14 can happen; report the **mean and the CS IC time series**. Do not retarget after seeing test. Dynamic A / bigger Mamba / more IC-loss weight are **not** the path.
+Success band (honest, locked test window): mean CS IC **0.04–0.08** with t-stat **> 3**, and long-short **net IR ~1** after costs **without** a ruinous path (report unlevered IR + causal-vol max DD; `vol_target=1.0` is a 100% vol book). A single-date CS IC print near 0.14 can happen; report the **mean and the CS IC time series**. Do not retarget after seeing test. Dynamic A / bigger Mamba / more IC-loss weight are **not** the path.
 
 Run commands from the **repo root**.
 
@@ -18,7 +18,7 @@ python -m forecast.backtest -h
 
 ## What the model actually does
 
-Given **daily** OHLCV for a liquid universe (Yahoo/Stooq split-adjusted, plus SPY), it predicts each name's **next-session residual log return** vs trailing-beta SPY, in vol units.
+Given **daily** OHLCV for a liquid universe (Yahoo/Stooq split-adjusted, plus SPY and sector ETFs), it predicts each **equity's** next-session residual log return vs a trailing-beta **sector or SPY** hedge, in vol units.
 
 It does **not**:
 
@@ -31,12 +31,12 @@ It does **not**:
 The network predicts a **volatility-normalized residual**. `generate.py` multiplies by the vol known at bar `t` and reports basis points.
 
 \[
-y_t = \frac{r_{t+1} - \beta_t r^{\mathrm{SPY}}_{t+1}}{\sigma_t}
+y_t = \frac{r_{t+1} - \beta_t r^{\mathrm{hedge}}_{t+1}}{\sigma_t}
 \]
 
-\(\beta_t\) uses same-bar returns **through \(t\) only**. \(\sigma_t\) is EWM realized vol using only bars **up to \(t-1\)**. **1 bp = 0.01%**.
+\(\beta_t\) uses same-bar returns **through \(t\) only**. The hedge is the mapped sector ETF when `--sector-residual` (default) and that parquet exists, otherwise SPY. \(\sigma_t\) is EWM realized vol using only bars **up to \(t-1\)**. **1 bp = 0.01%**. Sector *forward* return is a **label** term, never a feature.
 
-The same weights apply to any ticker: features are scale-free (no per-symbol embedding). Trading names are the train-era-locked list in `forecast/universe.py`; SPY is a **benchmark**, not a book name.
+The same weights apply to any ticker: features are scale-free (no per-symbol embedding). Trading names are equities on the train-era-locked list in `forecast/universe.py`; SPY and sector/macro ETFs are **hedges**, not book names.
 
 ---
 
@@ -53,18 +53,21 @@ python -m forecast.download --universe liquid --source yahoo --replace --interva
 
 ```bash
 python -m forecast.training --universe liquid --interval daily --skip-only --checkpoint-dir checkpoints/forecast_ridge
+# optional: --no-sector-residual --no-equities-only --no-train-from
 ```
 
 3. Optional tiny frozen-skip encoder (do **not** scale Mamba / Dynamic A / IC-loss weight to chase 0.14):
 
 ```bash
-python -m forecast.training --universe liquid --interval daily --checkpoint-dir checkpoints/forecast
+python -m forecast.training --universe liquid --interval daily --checkpoint-dir checkpoints/forecast --d-model 32 --n-layer 1
 ```
 
-4. Locked-window quantile long-short with costs:
+4. Locked-window book with costs. Default is **rank weights**, 5-day hold smoothing, **causal** expanding vol at 15% annual (not a 100% vol toy):
 
 ```bash
-python -m forecast.backtest --checkpoint checkpoints/forecast_ridge/best.pt --cost-bps 10 --quantile 0.2 --json checkpoints/forecast_ridge/backtest.json --cs-csv checkpoints/forecast_ridge/cs_ic.csv
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge/best.pt --cost-bps 10 --json checkpoints/forecast_ridge/backtest.json --cs-csv checkpoints/forecast_ridge/cs_ic.csv
+# Owen-comparable tails + 100% vol (will print huge max DD):
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge/best.pt --weighting quantile --hold-halflife 0 --vol-target 1 --full-sample-vol --cost-bps 10
 ```
 
 5. Ablations (synthetic CS universe on CPU, or your `data/` on GPU):

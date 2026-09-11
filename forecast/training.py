@@ -1075,6 +1075,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="min names per date for CS batches / CS IC (default: 30)",
     )
+    g.add_argument(
+        "--no-sector-residual",
+        action="store_true",
+        help="residualize vs SPY only (skip mapped sector ETFs)",
+    )
+    g.add_argument(
+        "--no-equities-only",
+        action="store_true",
+        help="keep index/sector/macro ETFs in the trading book",
+    )
+    g.add_argument(
+        "--train-from",
+        default=d.train_from,
+        help="drop train labels before this date (YYYY-MM-DD); val/test cuts unchanged",
+    )
+    g.add_argument(
+        "--no-train-from",
+        action="store_true",
+        help="use every train-session label (no 1999 floor)",
+    )
 
     g = p.add_argument_group("model")
     g.add_argument("--d-model", type=int, default=None)
@@ -1229,6 +1249,9 @@ def configs_from_cli(
             if args.cs_min_names is None
             else args.cs_min_names
         ),
+        sector_residual=not args.no_sector_residual,
+        equities_only=not args.no_equities_only,
+        train_from="" if args.no_train_from else str(args.train_from or ""),
     )
     model_cfg = ForecastModelConfig(
         n_features=len(FEATURE_NAMES),

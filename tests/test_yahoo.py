@@ -63,7 +63,13 @@ def test_parse_yahoo_chart_uses_adjclose():
 
 
 def test_liquid_universe_is_train_era_locked():
-    from forecast.universe import LIQUID_NAMES, BENCHMARK_SYMBOL, download_symbols
+    from forecast.universe import (
+        BENCHMARK_SYMBOL,
+        LIQUID_NAMES,
+        SECTOR_ETF_BY_SYMBOL,
+        download_symbols,
+        is_equity_name,
+    )
 
     names = download_symbols(include_benchmark=True)
     assert BENCHMARK_SYMBOL == "SPY"
@@ -71,6 +77,10 @@ def test_liquid_universe_is_train_era_locked():
     assert "AAPL" in LIQUID_NAMES
     assert 80 <= len(LIQUID_NAMES) <= 150
     assert "SPY" not in LIQUID_NAMES
+    equities = [s for s in LIQUID_NAMES if is_equity_name(s)]
+    assert 50 <= len(equities) <= 200
+    missing = [s for s in equities if s not in SECTOR_ETF_BY_SYMBOL]
+    assert missing == []
 
 
 def test_download_parser_replace_and_universe():

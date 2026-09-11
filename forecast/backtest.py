@@ -32,6 +32,7 @@ from forecast.generate import (
     symbol_from_path,
 )
 from forecast.training import _pearson, _spearman
+from forecast.universe import is_equity_name
 from mamba_lm.paths import anchor_to_repo, resolve_path
 
 
@@ -165,29 +166,139 @@ def quantile_weights(
     return w
 
 
+def rank_weights(scores: pd.Series, *, long_only: bool = False) -> pd.Series:
+    """Dollar-neutral weights from centered CS rank (softer than 20% tails)."""
+    s = scores.dropna()
+    w = pd.Series(0.0, index=s.index, dtype=np.float64)
+    n = int(s.size)
+    if n < 2:
+        return w
+    r = s.rank(method="average")
+    z = r - r.mean()
+    if long_only:
+        z = z.clip(lower=0.0)
+        total = float(z.sum())
+        if total <= 1e-12:
+            return w
+        w.loc[z.index] = z / total
+        return w
+    denom = float(z.abs().sum())
+    if denom <= 1e-12:
+        return w
+    w.loc[z.index] = z / denom
+    return w
+
+
+def date_weights(
+    scores: pd.Series,
+    *,
+    weighting: str = "quantile",
+    quantile: float = 0.2,
+    long_only: bool = False,
+) -> pd.Series:
+    mode = str(weighting or "quantile").lower()
+    if mode == "rank":
+        return rank_weights(scores, long_only=long_only)
+    return quantile_weights(scores, quantile=quantile, long_only=long_only)
+
+
+def _renorm_row(w: np.ndarray, *, long_only: bool) -> np.ndarray:
+    out = np.asarray(w, dtype=np.float64).copy()
+    if long_only:
+        out = np.clip(out, 0.0, None)
+        s = float(out.sum())
+        if s > 1e-12:
+            return out / s
+        return np.zeros_like(out)
+    long = np.clip(out, 0.0, None)
+    short = np.clip(out, None, 0.0)
+    ls = float(long.sum())
+    ss = float(-short.sum())
+    if ls > 1e-12:
+        long *= 0.5 / ls
+    else:
+        long[:] = 0.0
+    if ss > 1e-12:
+        short *= 0.5 / ss
+    else:
+        short[:] = 0.0
+    return long + short
+
+
+def smooth_weights(
+    w_panel: pd.DataFrame,
+    *,
+    hold_halflife: float,
+    long_only: bool = False,
+) -> pd.DataFrame:
+    """Causal EWMA of target weights, then renormalize each date."""
+    hl = float(hold_halflife)
+    if hl <= 0 or len(w_panel) < 2:
+        return w_panel
+    alpha = 1.0 - math.exp(math.log(0.5) / hl)
+    arr = w_panel.to_numpy(dtype=np.float64, copy=True)
+    smoothed = np.empty_like(arr)
+    smoothed[0] = _renorm_row(arr[0], long_only=long_only)
+    for i in range(1, len(arr)):
+        blended = alpha * arr[i] + (1.0 - alpha) * smoothed[i - 1]
+        smoothed[i] = _renorm_row(blended, long_only=long_only)
+    return pd.DataFrame(smoothed, index=w_panel.index, columns=w_panel.columns)
+
+
+def _annualized_ir(x: pd.Series, periods_per_year: float) -> float:
+    if len(x) < 2:
+        return float("nan")
+    sd = float(x.std(ddof=0))
+    if sd <= 1e-12:
+        return float("nan")
+    return float(x.mean() / sd * math.sqrt(periods_per_year))
+
+
+def _max_dd(pnl: pd.Series) -> float:
+    if pnl.empty:
+        return float("nan")
+    equity = pnl.cumsum()
+    return float((equity - equity.cummax()).min())
+
+
 def book_pnl(
     pred: pd.DataFrame,
     realized: pd.DataFrame,
     *,
     quantile: float = 0.2,
     round_trip_bps: float = 10.0,
-    vol_target: float = 1.0,
+    vol_target: float = 0.15,
     periods_per_year: float = 252.0,
     long_only: bool = False,
     min_names: int = 8,
+    weighting: str = "rank",
+    hold_halflife: float = 5.0,
+    causal_vol: bool = True,
+    lever_cap: float = 3.0,
+    min_vol_days: int = 21,
 ) -> dict[str, Any]:
-    """Vol-scaled quantile long-short (or long-only). Costs from one-way turnover * half round-trip."""
+    """Cost-aware long-short with optional rank weights, hold smoothing, causal vol.
+
+    Full-sample ``vol / lever`` is look-ahead on the *path* (IR of a constant
+    scale is invariant). Default ``causal_vol`` uses expanding std of prior
+    unlevered gross only. ``vol_target`` is annualized; 1.0 is a 100% vol book
+    and will print catastrophic max DD even when IR is ~1.
+    """
     dates = pred.index.intersection(realized.index)
-    weights: list[pd.Series] = []
+    raw_w: list[pd.Series] = []
     gross: list[float] = []
+    kept: list[Any] = []
     for ts in dates:
         pair_all = pd.concat(
             [pred.loc[ts], realized.loc[ts]], axis=1, keys=["p", "r"]
         ).dropna()
         if len(pair_all) < int(min_names):
             continue
-        w = quantile_weights(
-            pair_all["p"], quantile=quantile, long_only=long_only
+        w = date_weights(
+            pair_all["p"],
+            weighting=weighting,
+            quantile=quantile,
+            long_only=long_only,
         )
         r = pair_all["r"].reindex(w.index)
         pair = pd.concat([w, r], axis=1, keys=["w", "r"]).dropna()
@@ -196,51 +307,83 @@ def book_pnl(
         pnl = float((pair["w"] * pair["r"]).sum())
         if not np.isfinite(pnl):
             continue
-        weights.append(w.rename(ts))
+        raw_w.append(w.rename(ts))
         gross.append(pnl)
+        kept.append(ts)
     if len(gross) < 5:
         return {
             "n_dates": float(len(gross)),
             "gross_ir": float("nan"),
             "net_ir": float("nan"),
+            "unlevered_gross_ir": float("nan"),
+            "unlevered_net_ir": float("nan"),
             "hit_rate": float("nan"),
             "max_dd": float("nan"),
+            "unlevered_max_dd": float("nan"),
             "mean_cs_ic": float("nan"),
             "mean_cs_ic_spearman": float("nan"),
         }
-    w_panel = pd.concat(weights, axis=1).T.fillna(0.0)
+    w_panel = pd.concat(raw_w, axis=1).T.fillna(0.0)
     w_panel.index = pd.to_datetime(w_panel.index)
+    w_panel = smooth_weights(
+        w_panel, hold_halflife=hold_halflife, long_only=long_only
+    )
+    realized_kept = realized.reindex(index=w_panel.index, columns=w_panel.columns)
+    gross_s = (w_panel * realized_kept).sum(axis=1, skipna=True).astype(np.float64)
     prev = w_panel.shift(1).fillna(0.0)
     turnover = 0.5 * (w_panel - prev).abs().sum(axis=1)
-    gross_s = pd.Series(gross, index=w_panel.index, dtype=np.float64)
-    vol = float(gross_s.std(ddof=0))
-    lever = 1.0
-    if vol > 1e-12 and vol_target > 0:
-        lever = float(vol_target) / (vol * math.sqrt(periods_per_year))
-    cost = (float(round_trip_bps) * 1e-4) * turnover * lever
-    net_s = lever * gross_s - cost
-    equity = net_s.cumsum()
-    peak = equity.cummax()
-    dd = equity - peak
-    ir = lambda x: (
-        float(x.mean() / x.std(ddof=0) * math.sqrt(periods_per_year))
-        if float(x.std(ddof=0)) > 1e-12
-        else float("nan")
-    )
-    ics = cs_ic_by_date(pred.loc[dates], realized.loc[dates])
+    cost_unlev = (float(round_trip_bps) * 1e-4) * turnover
+    net_unlev = gross_s - cost_unlev
+
+    ppy = float(periods_per_year)
+    if causal_vol and vol_target > 0:
+        past = gross_s.shift(1)
+        exp_std = past.expanding(min_periods=max(2, int(min_vol_days))).std(ddof=0)
+        prior = float(vol_target) / math.sqrt(ppy)
+        exp_std = exp_std.fillna(prior)
+        lever_s = float(vol_target) / (exp_std * math.sqrt(ppy))
+        if lever_cap > 0:
+            lever_s = lever_s.clip(upper=float(lever_cap))
+        lever_s = lever_s.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        mean_lever = float(lever_s.mean())
+    elif vol_target > 0:
+        vol = float(gross_s.std(ddof=0))
+        lever = 1.0
+        if vol > 1e-12:
+            lever = float(vol_target) / (vol * math.sqrt(ppy))
+            if lever_cap > 0:
+                lever = min(lever, float(lever_cap))
+        lever_s = pd.Series(lever, index=gross_s.index, dtype=np.float64)
+        mean_lever = float(lever)
+    else:
+        lever_s = pd.Series(1.0, index=gross_s.index, dtype=np.float64)
+        mean_lever = 1.0
+
+    cost = cost_unlev * lever_s
+    net_s = lever_s * gross_s - cost
+    ics = cs_ic_by_date(pred.loc[w_panel.index], realized.loc[w_panel.index])
     return {
         "n_dates": float(len(net_s)),
         "n_names": float(pred.shape[1]),
-        "lever": lever,
-        "gross_ir": ir(lever * gross_s),
-        "net_ir": ir(net_s),
+        "lever": mean_lever,
+        "mean_lever": mean_lever,
+        "max_lever": float(lever_s.max()) if len(lever_s) else float("nan"),
+        "gross_ir": _annualized_ir(lever_s * gross_s, ppy),
+        "net_ir": _annualized_ir(net_s, ppy),
+        "unlevered_gross_ir": _annualized_ir(gross_s, ppy),
+        "unlevered_net_ir": _annualized_ir(net_unlev, ppy),
         "hit_rate": float((net_s > 0).mean()),
-        "max_dd": float(dd.min()) if len(dd) else float("nan"),
+        "max_dd": _max_dd(net_s),
+        "unlevered_max_dd": _max_dd(net_unlev),
         "mean_turnover": float(turnover.mean()),
         "mean_cost": float(cost.mean()),
         "round_trip_bps": float(round_trip_bps),
         "quantile": float(quantile),
         "vol_target": float(vol_target),
+        "weighting": str(weighting),
+        "hold_halflife": float(hold_halflife),
+        "causal_vol": bool(causal_vol),
+        "lever_cap": float(lever_cap),
         "long_only": bool(long_only),
         "min_names": float(min_names),
         "mean_cs_ic": float(ics["ic"].mean()) if len(ics) else float("nan"),
@@ -253,7 +396,9 @@ def book_pnl(
             else float("nan")
         ),
         "net": net_s,
-        "gross": lever * gross_s,
+        "gross": lever_s * gross_s,
+        "unlevered_net": net_unlev,
+        "leverage": lever_s,
         "cs_ic": ics,
         "weights": w_panel,
     }
@@ -262,24 +407,31 @@ def book_pnl(
 def format_report(stats: dict[str, Any], *, checkpoint: Path, test_start: Any) -> str:
     lines = [
         "=" * 72,
-        "  LAST-BAR QUANTILE LONG-SHORT",
+        "  LAST-BAR CROSS-SECTIONAL BOOK",
         "=" * 72,
         f"  Checkpoint  {checkpoint}",
         f"  Test from   {test_start}",
         f"  Names       {int(stats.get('n_names', 0))}   dates {int(stats.get('n_dates', 0))}",
-        f"  Quantile    {stats.get('quantile', float('nan')):.2f}  "
-        f"round-trip {stats.get('round_trip_bps', float('nan')):.1f} bp"
+        f"  Weighting   {stats.get('weighting', 'quantile')}  "
+        f"quantile {stats.get('quantile', float('nan')):.2f}  "
+        f"hold_hl {stats.get('hold_halflife', 0):.1f}"
         f"{'  LONG-ONLY' if stats.get('long_only') else ''}",
-        f"  Lever       {stats.get('lever', float('nan')):.3f}  (vol target "
-        f"{stats.get('vol_target', float('nan')):.2f} annual)",
+        f"  round-trip  {stats.get('round_trip_bps', float('nan')):.1f} bp",
+        f"  Lever       mean {stats.get('mean_lever', stats.get('lever', float('nan'))):.3f}  "
+        f"max {stats.get('max_lever', float('nan')):.3f}  "
+        f"(vol target {stats.get('vol_target', float('nan')):.2f} annual"
+        f"{', causal' if stats.get('causal_vol') else ', FULL-SAMPLE'})",
         "",
         f"  mean CS IC (Pearson)   {stats.get('mean_cs_ic', float('nan')):+.4f}  "
         f"t={stats.get('cs_ic_tstat', float('nan')):.2f}",
         f"  mean CS IC (Spearman)  {stats.get('mean_cs_ic_spearman', float('nan')):+.4f}",
-        f"  gross IR               {stats.get('gross_ir', float('nan')):+.3f}",
-        f"  net IR                 {stats.get('net_ir', float('nan')):+.3f}",
+        f"  unlevered gross IR     {stats.get('unlevered_gross_ir', float('nan')):+.3f}",
+        f"  unlevered net IR       {stats.get('unlevered_net_ir', float('nan')):+.3f}",
+        f"  unlevered max DD       {stats.get('unlevered_max_dd', float('nan')):+.3f}",
+        f"  levered gross IR       {stats.get('gross_ir', float('nan')):+.3f}",
+        f"  levered net IR         {stats.get('net_ir', float('nan')):+.3f}",
+        f"  levered max DD         {stats.get('max_dd', float('nan')):+.3f}",
         f"  hit rate               {stats.get('hit_rate', float('nan')):.3f}",
-        f"  max DD (vol units)     {stats.get('max_dd', float('nan')):+.3f}",
         f"  mean turnover (1-way)  {stats.get('mean_turnover', float('nan')):.3f}",
         "=" * 72,
     ]
@@ -287,14 +439,42 @@ def format_report(stats: dict[str, Any], *, checkpoint: Path, test_start: Any) -
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Quantile long-short backtest of last-bar scores.")
+    p = argparse.ArgumentParser(description="Quantile / rank long-short backtest of last-bar scores.")
     p.add_argument("--checkpoint", default="checkpoints/forecast/best.pt")
     p.add_argument("--data", default=None)
     p.add_argument("--symbols", default=None)
     p.add_argument("--quantile", type=float, default=0.2)
+    p.add_argument(
+        "--weighting",
+        choices=("quantile", "rank"),
+        default="rank",
+        help="quantile tails (high turnover) or centered CS rank (default)",
+    )
+    p.add_argument(
+        "--hold-halflife",
+        type=float,
+        default=5.0,
+        help="EWMA half-life in days for target weights (0 = no smoothing)",
+    )
     p.add_argument("--cost-bps", type=float, default=10.0, help="round-trip cost in basis points")
-    p.add_argument("--vol-target", type=float, default=1.0)
-    p.add_argument("--long-only", action="store_true", help="long the top quantile only (no short leg)")
+    p.add_argument(
+        "--vol-target",
+        type=float,
+        default=0.15,
+        help="annualized vol target for the levered path (1.0 is a 100%% vol book)",
+    )
+    p.add_argument(
+        "--lever-cap",
+        type=float,
+        default=3.0,
+        help="cap on causal leverage (0 disables)",
+    )
+    p.add_argument(
+        "--full-sample-vol",
+        action="store_true",
+        help="look-ahead full-sample vol targeting (old behavior; IR scale-invariant)",
+    )
+    p.add_argument("--long-only", action="store_true", help="long the top quantile/ranks only (no short leg)")
     p.add_argument(
         "--min-names",
         type=int,
@@ -355,6 +535,9 @@ def main(argv: list[str] | None = None) -> int:
         else int(data_cfg.cross_section_min_names)
     )
     start = test_start_from_state(state)
+    skip = {bench} if bench else set()
+    if bool(getattr(data_cfg, "equities_only", False)):
+        skip.update(s for s in panels if not is_equity_name(s))
     pred, realized = score_last_bars(
         model,
         panels,
@@ -363,7 +546,7 @@ def main(argv: list[str] | None = None) -> int:
         context=data_cfg.seq_len,
         start=start,
         batch_size=args.batch_size,
-        exclude=frozenset({bench} if bench else ()),
+        exclude=frozenset(skip),
     )
     stats = book_pnl(
         pred,
@@ -374,10 +557,15 @@ def main(argv: list[str] | None = None) -> int:
         periods_per_year=252.0 if data_cfg.is_daily() else (52.0 if data_cfg.interval == "weekly" else 12.0),
         long_only=args.long_only,
         min_names=min_names,
+        weighting=args.weighting,
+        hold_halflife=args.hold_halflife,
+        causal_vol=not args.full_sample_vol,
+        lever_cap=args.lever_cap,
     )
     print(format_report(stats, checkpoint=ckpt_path, test_start=start))
     if args.json:
-        out = {k: v for k, v in stats.items() if k not in {"net", "gross", "cs_ic", "weights"}}
+        skip_keys = {"net", "gross", "cs_ic", "weights", "leverage", "unlevered_net"}
+        out = {k: v for k, v in stats.items() if k not in skip_keys}
         path = anchor_to_repo(args.json)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(out, indent=2, default=str))

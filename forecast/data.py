@@ -27,7 +27,7 @@ import torch
 from torch.utils.data import Dataset
 
 from forecast.config import BARS_PER_SESSION, SESSION_START_MINUTE, DataConfig
-from forecast.universe import allowed_symbols
+from forecast.universe import allowed_symbols, hedge_symbol_for, is_equity_name
 from mamba_lm.paths import REPO_ROOT, resolve_path
 
 
@@ -50,6 +50,9 @@ FEATURE_NAMES: tuple[str, ...] = (
     "peer_ret_1",
     "mkt_ret_1",
     "idio_ret_1",
+    "sector_ret_1",
+    "idio_sector",
+    "cs_rank_1",
     "cs_ret_1",
     "cs_ret_5",
     "cs_ret_15",
@@ -69,6 +72,9 @@ CROSS_SECTION_FEATURES: tuple[str, ...] = (
     "peer_ret_1",
     "mkt_ret_1",
     "idio_ret_1",
+    "sector_ret_1",
+    "idio_sector",
+    "cs_rank_1",
     "cs_ret_1",
     "cs_ret_5",
     "cs_ret_15",
@@ -360,6 +366,9 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     out["peer_ret_1"] = 0.0
     out["mkt_ret_1"] = 0.0
     out["idio_ret_1"] = 0.0
+    out["sector_ret_1"] = 0.0
+    out["idio_sector"] = 0.0
+    out["cs_rank_1"] = 0.0
     for _src, dest in CS_ZSCORE_SOURCES:
         out[dest] = 0.0
 
@@ -467,6 +476,30 @@ def _cs_zscore_wide(wide: pd.DataFrame) -> pd.DataFrame:
     return wide.sub(mean, axis=0).div(std, axis=0)
 
 
+def _cs_rank_wide(wide: pd.DataFrame) -> pd.DataFrame:
+    """Centered within-date percentile rank of ``ret_1`` in [-1, 1]."""
+    ranks = wide.rank(axis=1, method="average")
+    n = wide.notna().sum(axis=1).astype(np.float64)
+    denom = (n - 1.0).where(n >= 2, np.nan)
+    return ranks.sub(1.0, axis=0).div(denom, axis=0).mul(2.0).sub(1.0)
+
+
+def _indexed_col(panel: pd.DataFrame, cfg: DataConfig, column: str) -> pd.Series:
+    key = pd.Index(_cross_section_key(panel, cfg).to_numpy())
+    return pd.Series(
+        panel[column].to_numpy(dtype=np.float64), index=key
+    ).groupby(level=0).last()
+
+
+def trading_panel_symbols(panels: dict[str, pd.DataFrame], cfg: DataConfig) -> list[str]:
+    """Names that enter the CS book (benchmark always excluded)."""
+    bench = str(cfg.benchmark_symbol or "").upper()
+    names = [s for s in panels if s != bench]
+    if bool(getattr(cfg, "equities_only", False)):
+        names = [s for s in names if is_equity_name(s)]
+    return names
+
+
 def attach_cross_section_features(
     panels: dict[str, pd.DataFrame],
     cfg: DataConfig,
@@ -477,27 +510,36 @@ def attach_cross_section_features(
     ``panels``, otherwise the equal-weight mean of trading names.
     ``peer_ret_1`` averages the other *trading* names (benchmark excluded).
     ``idio_ret_1`` is own ``ret_1`` minus ``mkt_ret_1``.
+    ``sector_ret_1`` / ``idio_sector`` use the mapped sector ETF's same-bar
+    ``ret_1`` (SPY if that ETF is missing). Never uses t+1.
     ``cs_*`` columns are same-day z-scores across trading names (not SPY).
+    ``cs_rank_1`` is the centered within-date rank of ``ret_1``.
     """
     if not panels:
         return panels
     bench = str(cfg.benchmark_symbol or "").upper()
-    trade_syms = [s for s in panels if s != bench]
+    trade_syms = trading_panel_symbols(panels, cfg)
     clip = float(cfg.clip)
 
     mkt: pd.Series | None = None
     if bench in panels:
-        bpanel = panels[bench]
-        mkt = pd.Series(
-            bpanel["ret_1"].to_numpy(dtype=np.float64),
-            index=pd.Index(_cross_section_key(bpanel, cfg).to_numpy()),
-        ).groupby(level=0).mean()
+        mkt = _indexed_col(panels[bench], cfg, "ret_1")
     elif len(trade_syms) >= 2:
         wide_mkt = _traded_wide(panels, trade_syms, cfg, "ret_1")
         if wide_mkt is not None:
             mkt = wide_mkt.mean(axis=1, skipna=True)
 
+    hedge_ret: dict[str, pd.Series] = {}
+    for hedge in {hedge_symbol_for(
+        s,
+        sector_residual=bool(getattr(cfg, "sector_residual", False)),
+        benchmark=bench,
+    ) for s in panels}:
+        if hedge in panels:
+            hedge_ret[hedge] = _indexed_col(panels[hedge], cfg, "ret_1")
+
     peer_wide = _traded_wide(panels, trade_syms, cfg, "ret_1") if len(trade_syms) >= 2 else None
+    rank_wide = _cs_rank_wide(peer_wide) if peer_wide is not None else None
     cs_wides: dict[str, pd.DataFrame] = {}
     if bool(cfg.cs_zscore) and peer_wide is not None:
         for src, dest in CS_ZSCORE_SOURCES:
@@ -508,7 +550,13 @@ def attach_cross_section_features(
                 continue
             cs_wides[dest] = _cs_zscore_wide(src_wide)
 
-    if mkt is None and peer_wide is None and not cs_wides:
+    if (
+        mkt is None
+        and peer_wide is None
+        and not cs_wides
+        and not hedge_ret
+        and rank_wide is None
+    ):
         return panels
 
     out: dict[str, pd.DataFrame] = {}
@@ -528,9 +576,28 @@ def attach_cross_section_features(
                 peer_s = others.mean(axis=1, skipna=True)
                 peer = keys.map(peer_s).to_numpy(dtype=np.float64)
                 peer = np.where(np.isfinite(peer), peer, 0.0)
+        hedge = hedge_symbol_for(
+            sym,
+            sector_residual=bool(getattr(cfg, "sector_residual", False)),
+            benchmark=bench,
+        )
+        if hedge not in hedge_ret and bench in hedge_ret:
+            hedge = bench
+        if hedge in hedge_ret:
+            sec_vals = keys.map(hedge_ret[hedge]).to_numpy(dtype=np.float64)
+            sec_vals = np.where(np.isfinite(sec_vals), sec_vals, 0.0)
+        else:
+            sec_vals = np.zeros(len(p), dtype=np.float64)
+        rank_vals = np.zeros(len(p), dtype=np.float64)
+        if rank_wide is not None and sym in getattr(rank_wide, "columns", []):
+            rank_vals = keys.map(rank_wide[sym]).to_numpy(dtype=np.float64)
+            rank_vals = np.where(np.isfinite(rank_vals), rank_vals, 0.0)
         p["peer_ret_1"] = np.clip(peer, -clip, clip)
         p["mkt_ret_1"] = np.clip(mkt_vals, -clip, clip)
         p["idio_ret_1"] = np.clip(own - mkt_vals, -clip, clip)
+        p["sector_ret_1"] = np.clip(sec_vals, -clip, clip)
+        p["idio_sector"] = np.clip(own - sec_vals, -clip, clip)
+        p["cs_rank_1"] = np.clip(rank_vals, -clip, clip)
         for _src, dest in CS_ZSCORE_SOURCES:
             if dest not in p.columns:
                 p[dest] = 0.0
@@ -548,22 +615,37 @@ def attach_residual_target(
     panels: dict[str, pd.DataFrame],
     cfg: DataConfig,
 ) -> dict[str, pd.DataFrame]:
-    """Replace the label with trailing-beta residual vs the benchmark forward return.
+    """Replace the label with trailing-beta residual vs a hedge forward return.
 
-    ``beta_t`` uses same-bar returns through ``t`` only. The benchmark's
-    *forward* return enters the label, never ``FEATURE_NAMES``.
+    ``beta_t`` uses same-bar returns through ``t`` only. The hedge's *forward*
+    return enters the label, never ``FEATURE_NAMES``. Default hedge is SPY;
+    ``sector_residual`` uses the mapped sector ETF when that parquet exists.
     """
     bench = str(cfg.benchmark_symbol or "").upper()
-    if not cfg.residual_target or bench not in panels:
+    if not cfg.residual_target:
         return panels
-    spy = panels[bench]
-    spy_key = pd.Index(_cross_section_key(spy, cfg).to_numpy())
-    spy_fwd = pd.Series(
-        spy["target_raw"].to_numpy(dtype=np.float64), index=spy_key
-    ).groupby(level=0).last()
-    spy_r = pd.Series(
-        spy["ret_raw"].to_numpy(dtype=np.float64), index=spy_key
-    ).groupby(level=0).last()
+    if bench not in panels and not any(
+        hedge_symbol_for(
+            s,
+            sector_residual=bool(getattr(cfg, "sector_residual", False)),
+            benchmark=bench,
+        )
+        in panels
+        for s in panels
+    ):
+        return panels
+
+    cache_fwd: dict[str, pd.Series] = {}
+    cache_r: dict[str, pd.Series] = {}
+
+    def _hedge_series(name: str) -> tuple[pd.Series, pd.Series] | None:
+        if name not in panels:
+            return None
+        if name not in cache_fwd:
+            cache_fwd[name] = _indexed_col(panels[name], cfg, "target_raw")
+            cache_r[name] = _indexed_col(panels[name], cfg, "ret_raw")
+        return cache_fwd[name], cache_r[name]
+
     hl = max(2, int(cfg.beta_halflife))
     out: dict[str, pd.DataFrame] = {}
     for sym, panel in panels.items():
@@ -571,17 +653,27 @@ def attach_residual_target(
         if sym == bench:
             out[sym] = p
             continue
+        hedge = hedge_symbol_for(
+            sym,
+            sector_residual=bool(getattr(cfg, "sector_residual", False)),
+            benchmark=bench,
+        )
+        series = _hedge_series(hedge) or _hedge_series(bench)
+        if series is None:
+            out[sym] = p
+            continue
+        hedge_fwd, hedge_r = series
         keys = _cross_section_key(p, cfg)
-        spy_r_al = keys.map(spy_r).to_numpy(dtype=np.float64)
-        spy_fwd_al = keys.map(spy_fwd).to_numpy(dtype=np.float64)
+        x = keys.map(hedge_r).to_numpy(dtype=np.float64)
+        fwd = keys.map(hedge_fwd).to_numpy(dtype=np.float64)
         own_r = p["ret_raw"].to_numpy(dtype=np.float64)
-        frame = pd.DataFrame({"y": own_r, "x": spy_r_al})
+        frame = pd.DataFrame({"y": own_r, "x": x})
         cov = frame["y"].ewm(halflife=hl, min_periods=hl).cov(frame["x"])
         var = frame["x"].ewm(halflife=hl, min_periods=hl).var()
         beta = (cov / var.replace(0.0, np.nan)).fillna(0.0).clip(-5.0, 5.0).to_numpy()
         own_fwd = p["target_raw"].to_numpy(dtype=np.float64)
-        spy_fwd_al = np.where(np.isfinite(spy_fwd_al), spy_fwd_al, 0.0)
-        resid = own_fwd - beta * spy_fwd_al
+        fwd = np.where(np.isfinite(fwd), fwd, 0.0)
+        resid = own_fwd - beta * fwd
         scale = p["scale"].to_numpy(dtype=np.float64)
         p["target_raw"] = resid
         p["target"] = np.divide(resid, scale, out=np.zeros_like(resid), where=scale > 0)
@@ -1002,10 +1094,26 @@ def build_datasets(
     raw_panels = attach_residual_target(raw_panels, cfg)
 
     bench = str(cfg.benchmark_symbol or "").upper()
-    trade_panels = {s: p for s, p in raw_panels.items() if s != bench}
+    trade_names = trading_panel_symbols(raw_panels, cfg)
+    trade_panels = {s: raw_panels[s] for s in trade_names}
+    train_from_ts: pd.Timestamp | None = None
+    raw_from = str(getattr(cfg, "train_from", "") or "").strip()
+    if raw_from:
+        train_from_ts = pd.Timestamp(raw_from)
     if not trade_panels:
         raise ValueError(
-            f"only benchmark {bench} was loaded; add trading-name parquets"
+            f"no trading names after filters (benchmark={bench}, "
+            f"equities_only={bool(getattr(cfg, 'equities_only', False))}); "
+            "add single-name equity parquets"
+        )
+    if log_fn:
+        dropped = [s for s in raw_panels if s not in trade_panels and s != bench]
+        log_fn(
+            f"trading names={len(trade_panels)} equities_only="
+            f"{bool(getattr(cfg, 'equities_only', False))} "
+            f"sector_residual={bool(getattr(cfg, 'sector_residual', False))} "
+            f"train_from={raw_from or 'all'}"
+            + (f" (held out of book: {','.join(sorted(dropped))})" if dropped else "")
         )
 
     if cfg.global_calendar_split and cfg.is_calendar() and len(trade_panels) >= 1:
@@ -1028,6 +1136,8 @@ def build_datasets(
             sym_train_end, sym_val_end = train_end, val_end
 
         is_train = (panel["session"] < sym_train_end).to_numpy()
+        if train_from_ts is not None:
+            is_train = is_train & (pd.to_datetime(panel["session"]) >= train_from_ts).to_numpy()
         is_val = (
             (panel["session"] >= sym_train_end) & (panel["session"] < sym_val_end)
         ).to_numpy()
@@ -1063,6 +1173,13 @@ def build_datasets(
                 "test_source_mix": test_mix,
                 "residual_target": bool(cfg.residual_target and bench in raw_panels),
                 "benchmark": bench if bench in raw_panels else "",
+                "sector_residual": bool(getattr(cfg, "sector_residual", False)),
+                "hedge": hedge_symbol_for(
+                    symbol,
+                    sector_residual=bool(getattr(cfg, "sector_residual", False)),
+                    benchmark=bench,
+                ),
+                "train_from": raw_from,
             }
         )
         if log_fn:
@@ -1166,6 +1283,9 @@ def build_datasets(
         "cross_section": use_cs,
         "cs_min_names": int(cfg.cross_section_min_names),
         "universe": cfg.universe,
+        "equities_only": bool(getattr(cfg, "equities_only", False)),
+        "train_from": raw_from,
+        "n_trading_names": int(len(trade_panels)),
     }
 
 

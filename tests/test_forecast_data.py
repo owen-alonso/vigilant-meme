@@ -519,6 +519,9 @@ def test_weekly_cli_uses_week_scale_context():
     assert data_cfg.cs_zscore is True
     assert data_cfg.cross_section_min_names == 30
     assert data_cfg.universe == ""
+    assert data_cfg.sector_residual is True
+    assert data_cfg.equities_only is True
+    assert data_cfg.train_from == "1999-01-01"
 
 
 def test_sequence_dataset_last_bar_is_six_tuple():
@@ -856,3 +859,151 @@ def test_mean_cs_stats_reports_tstat_and_spearman():
     assert stats["cs_ic"] == pytest.approx(1.0)
     assert stats["cs_ic_spearman"] == pytest.approx(1.0)
     assert stats["cs_n_dates"] == pytest.approx(2.0)
+
+
+def test_old_checkpoint_data_config_keeps_pre_protocol_flags():
+    cfg = DataConfig.from_dict(
+        {"interval": "daily", "horizon": 1, "seq_len": 32, "cs_zscore": True}
+    )
+    assert cfg.sector_residual is False
+    assert cfg.equities_only is False
+    assert cfg.train_from == ""
+
+
+def test_cs_rank_is_same_day_and_centered():
+    cfg = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+        benchmark_symbol="SPY",
+        equities_only=True,
+    )
+    a = compute_features(_daily_grid(40), cfg)
+    b_grid = _daily_grid(40)
+    b_grid["close"] = b_grid["close"] * 1.2 + np.linspace(0, 1.0, 40)
+    b = compute_features(b_grid, cfg)
+    spy = compute_features(_daily_grid(40), cfg)
+    a["symbol"], b["symbol"], spy["symbol"] = "AAPL", "MSFT", "SPY"
+    out = attach_cross_section_features({"AAPL": a, "MSFT": b, "SPY": spy}, cfg)
+    mid = 20
+    r_a = float(out["AAPL"]["cs_rank_1"].iloc[mid])
+    r_b = float(out["MSFT"]["cs_rank_1"].iloc[mid])
+    assert r_a == pytest.approx(-r_b, abs=1e-5)
+    assert abs(r_a) == pytest.approx(1.0, abs=1e-5)
+    spiked = b.copy()
+    spiked.loc[spiked.index[-1], "ret_1"] = 9.0
+    alt = attach_cross_section_features({"AAPL": a.copy(), "MSFT": spiked, "SPY": spy.copy()}, cfg)
+    assert out["AAPL"]["cs_rank_1"].iloc[mid] == pytest.approx(
+        float(alt["AAPL"]["cs_rank_1"].iloc[mid]), abs=1e-8
+    )
+
+
+def test_sector_residual_uses_future_xlk_in_label_not_features():
+    cfg = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+        residual_target=True,
+        sector_residual=True,
+        beta_halflife=5,
+        benchmark_symbol="SPY",
+    )
+    a = compute_features(_daily_grid(50), cfg)
+    spy = compute_features(_daily_grid(50), cfg)
+    xlk = compute_features(_daily_grid(50), cfg)
+    a["symbol"], spy["symbol"], xlk["symbol"] = "AAPL", "SPY", "XLK"
+    base = attach_cross_section_features(
+        {"AAPL": a.copy(), "SPY": spy.copy(), "XLK": xlk.copy()}, cfg
+    )
+    base = attach_residual_target(base, cfg)
+    spiked_grid = _daily_grid(50)
+    spiked_grid.loc[spiked_grid.index[-1], "close"] = (
+        float(spiked_grid["close"].iloc[-1]) * 1.08
+    )
+    spiked = compute_features(spiked_grid, cfg)
+    spiked["symbol"] = "XLK"
+    alt_panels = attach_cross_section_features(
+        {"AAPL": a.copy(), "SPY": spy.copy(), "XLK": spiked}, cfg
+    )
+    alt = attach_residual_target(alt_panels, cfg)
+    t = 48
+    for col in ("ret_1", "mkt_ret_1", "sector_ret_1", "idio_sector", "cs_rank_1"):
+        assert base["AAPL"][col].iloc[t] == pytest.approx(float(alt["AAPL"][col].iloc[t]))
+    assert base["AAPL"]["target"].iloc[t] != pytest.approx(float(alt["AAPL"]["target"].iloc[t]))
+
+
+def test_equities_only_drops_etfs_from_the_book(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_daily_parquet(data_dir / "AAPL_daily.parquet", "AAPL", 90, "2018-01-02")
+    _write_daily_parquet(data_dir / "MSFT_daily.parquet", "MSFT", 90, "2018-01-02", 0.02)
+    _write_daily_parquet(data_dir / "QQQ_daily.parquet", "QQQ", 90, "2018-01-02", 0.015)
+    _write_daily_parquet(data_dir / "SPY_daily.parquet", "SPY", 90, "2018-01-02", 0.012)
+    cfg = DataConfig(
+        data_dir=str(data_dir),
+        interval="daily",
+        horizon=1,
+        seq_len=16,
+        stride=1,
+        min_context=4,
+        warmup_bars=8,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=5,
+        global_calendar_split=True,
+        residual_target=False,
+        eval_last_bar=True,
+        cross_section_min_names=99,
+        allow_mixed_prices=True,
+        equities_only=True,
+        sector_residual=False,
+        train_from="",
+    )
+    bundle = build_datasets(cfg, log_fn=None)
+    names = {m["symbol"] for m in bundle["meta"]}
+    assert names == {"AAPL", "MSFT"}
+    assert bundle["equities_only"] is True
+
+
+def test_train_from_drops_early_train_labels_not_val_end(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    for i, name in enumerate(("AAPL", "MSFT", "GOOGL", "JPM", "XOM", "JNJ", "PG", "HD")):
+        _write_daily_parquet(
+            data_dir / f"{name}_daily.parquet",
+            name,
+            600,
+            "1998-01-02",
+            0.01 + 0.001 * i,
+        )
+    common = dict(
+        data_dir=str(data_dir),
+        interval="daily",
+        horizon=1,
+        seq_len=16,
+        stride=1,
+        min_context=4,
+        warmup_bars=8,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=5,
+        global_calendar_split=True,
+        residual_target=False,
+        eval_last_bar=True,
+        cross_section_min_names=8,
+        allow_mixed_prices=True,
+        equities_only=True,
+        sector_residual=False,
+    )
+    full = build_datasets(DataConfig(train_from="", **common), log_fn=None)
+    cut = build_datasets(DataConfig(train_from="1999-01-01", **common), log_fn=None)
+    assert {m["val_end"] for m in full["meta"]} == {m["val_end"] for m in cut["meta"]}
+    assert cut["datasets"]["train"].n_valid_bars < full["datasets"]["train"].n_valid_bars
+    assert cut["datasets"]["test"].n_valid_bars == full["datasets"]["test"].n_valid_bars
+

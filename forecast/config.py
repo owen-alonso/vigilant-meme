@@ -91,6 +91,15 @@ class DataConfig:
     universe: str = ""
     # Same-day cross-sectional z-scores of momentum / volume (known at close).
     cs_zscore: bool = True
+    # y = r_{t+h} - beta_t * r_sector_{t+h} when the sector ETF parquet exists.
+    # beta still uses data through t only; missing sector ETFs fall back to SPY.
+    sector_residual: bool = True
+    # Train / score single-name equities only. SPY and sector/macro ETFs still
+    # load for features and hedges, but they are not book names.
+    equities_only: bool = True
+    # Drop *train* labels before this date. Empty = keep every train session.
+    # Val/test calendar cuts are unchanged (locked test window).
+    train_from: str = "1999-01-01"
 
     def is_daily(self) -> bool:
         return self.interval == "daily"
@@ -111,6 +120,13 @@ class DataConfig:
         # Older checkpoints were 1-minute / next-hour and had no interval field.
         if "interval" not in payload and int(payload.get("horizon", 1)) >= 60:
             payload["interval"] = "1min"
+        # New protocol flags: absent on old checkpoints means the old behavior.
+        if "sector_residual" not in payload:
+            payload["sector_residual"] = False
+        if "equities_only" not in payload:
+            payload["equities_only"] = False
+        if "train_from" not in payload:
+            payload["train_from"] = ""
         return cls(**filter_dataclass_fields(cls, payload))
 
 
@@ -203,7 +219,7 @@ def interval_model_kwargs(interval: str) -> dict[str, Any]:
 class ForecastModelConfig:
     """Mamba backbone sized for continuous financial features."""
 
-    n_features: int = 31
+    n_features: int = 34
     d_model: int = 96
     n_layer: int = 4
     d_state: int = 16

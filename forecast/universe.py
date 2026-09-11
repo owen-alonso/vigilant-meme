@@ -119,6 +119,66 @@ LIQUID_NAMES: tuple[str, ...] = (
 
 BENCHMARK_SYMBOL = "SPY"
 
+INDEX_ETFS: tuple[str, ...] = ("QQQ", "IWM", "DIA")
+SECTOR_ETFS: tuple[str, ...] = (
+    "XLK",
+    "XLF",
+    "XLE",
+    "XLV",
+    "XLI",
+    "XLY",
+    "XLP",
+    "XLU",
+    "XLB",
+    "XLRE",
+)
+MACRO_HEDGES: tuple[str, ...] = ("GLD", "TLT", "HYG", "LQD", "EEM", "EFA")
+
+# Approximate GICS-ish map used only as a feature / residual hedge.
+# Unknown equities and missing sector ETFs fall back to SPY. XLC names use XLK.
+SECTOR_ETF_BY_SYMBOL: dict[str, str] = {
+    "AAPL": "XLK", "MSFT": "XLK", "NVDA": "XLK", "AVGO": "XLK", "CRM": "XLK",
+    "CSCO": "XLK", "ACN": "XLK", "ADBE": "XLK", "TXN": "XLK", "IBM": "XLK",
+    "QCOM": "XLK", "INTU": "XLK", "AMAT": "XLK", "NOW": "XLK", "INTC": "XLK",
+    "GOOGL": "XLK", "GOOG": "XLK", "META": "XLK", "NFLX": "XLK", "DIS": "XLK",
+    "CMCSA": "XLK", "T": "XLK", "VZ": "XLK",
+    "JPM": "XLF", "BAC": "XLF", "WFC": "XLF", "GS": "XLF", "MS": "XLF",
+    "C": "XLF", "BLK": "XLF", "SCHW": "XLF", "AXP": "XLF", "V": "XLF",
+    "MA": "XLF", "SPGI": "XLF", "PGR": "XLF", "CB": "XLF",
+    "UNH": "XLV", "JNJ": "XLV", "LLY": "XLV", "ABBV": "XLV", "MRK": "XLV",
+    "PFE": "XLV", "TMO": "XLV", "ABT": "XLV", "DHR": "XLV", "AMGN": "XLV",
+    "ISRG": "XLV", "SYK": "XLV", "MDT": "XLV", "GILD": "XLV", "VRTX": "XLV",
+    "ELV": "XLV", "CI": "XLV", "BMY": "XLV", "CVS": "XLV",
+    "XOM": "XLE", "CVX": "XLE",
+    "CAT": "XLI", "GE": "XLI", "HON": "XLI", "UNP": "XLI", "DE": "XLI",
+    "BA": "XLI", "RTX": "XLI", "LMT": "XLI", "ADP": "XLI",
+    "AMZN": "XLY", "TSLA": "XLY", "HD": "XLY", "MCD": "XLY", "NKE": "XLY",
+    "SBUX": "XLY", "LOW": "XLY", "TJX": "XLY", "BKNG": "XLY",
+    "PG": "XLP", "KO": "XLP", "PEP": "XLP", "COST": "XLP", "WMT": "XLP",
+    "PM": "XLP", "MO": "XLP", "MDLZ": "XLP",
+    "NEE": "XLU", "DUK": "XLU", "SO": "XLU",
+    "LIN": "XLB",
+    "AMT": "XLRE", "PLD": "XLRE",
+}
+
+_NON_EQUITY: frozenset[str] = frozenset(
+    (BENCHMARK_SYMBOL,) + INDEX_ETFS + SECTOR_ETFS + MACRO_HEDGES
+)
+
+
+def is_equity_name(symbol: str) -> bool:
+    """True for single-name equities (not SPY / index / sector / macro ETFs)."""
+    return str(symbol).upper() not in _NON_EQUITY
+
+
+def hedge_symbol_for(symbol: str, *, sector_residual: bool, benchmark: str = "SPY") -> str:
+    """Causal hedge ticker for residual labels. SPY if sector map or ETF is unused."""
+    bench = str(benchmark or "SPY").upper()
+    if not sector_residual:
+        return bench
+    mapped = SECTOR_ETF_BY_SYMBOL.get(str(symbol).upper())
+    return mapped if mapped else bench
+
 
 def trading_symbols() -> list[str]:
     return list(LIQUID_NAMES)
