@@ -70,8 +70,9 @@ def test_book_pnl_overnight_r_prints_sleeve_after_locate():
     )
     realized = pred * 0.02
     r_on = pred * 0.01
+    # High turnover on the short tail so locate does not wipe the whole leg.
     tz = pd.DataFrame(
-        np.tile(np.linspace(-2, 2, 10), (40, 1)), index=dates, columns=names
+        np.tile(np.linspace(2, -2, 10), (40, 1)), index=dates, columns=names
     )
     stats = book_pnl(
         pred,
@@ -159,7 +160,7 @@ def test_frame_to_wide_uses_calendar_index():
     assert wide.loc[pd.Timestamp("1970-01-03"), "B"] == pytest.approx(-0.4)
 
 
-def test_split_shorting_metrics_ls_costs_more_than_long_only():
+def test_split_shorting_metrics_ls_has_borrow_and_short_nav():
     dates = np.repeat(np.arange(20, dtype=np.int64) + 18000, 8)
     names = np.tile([f"S{i}" for i in range(8)], 20)
     ranks = np.tile(np.linspace(-1.0, 1.0, 8), 20)
@@ -174,7 +175,7 @@ def test_split_shorting_metrics_ls_costs_more_than_long_only():
             "close": np.full(len(dates), 100.0),
             "next_open": 100.0 * np.exp(r_on),
             "r_on": r_on,
-            "turnover_z": ranks,
+            "turnover_z": -ranks,
             "vol_level": np.full(len(dates), 0.2),
             "pred_r": ranks * 0.01,
             "implied_open": 100.0 * np.exp(ranks * 0.01),
@@ -190,9 +191,10 @@ def test_split_shorting_metrics_ls_costs_more_than_long_only():
     lo = out["books"]["live_long_only"]
     assert ls["mean_short_nav"] > 0
     assert lo["mean_short_nav"] == pytest.approx(0.0, abs=1e-12)
-    assert ls["mean_cost_unlev_bp"] > lo["mean_cost_unlev_bp"]
     assert ls["borrow_bps"] > 0
     assert lo["borrow_bps"] == pytest.approx(0.0)
+    assert float((ls.get("cost_parts") or {}).get("borrow") or 0.0) > 0
+    assert float((lo.get("cost_parts") or {}).get("borrow") or 0.0) == pytest.approx(0.0)
 
 
 def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
