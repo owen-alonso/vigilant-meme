@@ -16,6 +16,7 @@ from forecast.shorting import (
     decide_ic_gate_promote,
     decide_lo_promote,
     decide_weekday_promote,
+    decide_sector_promote,
     decide_lo_refine,
     decide_ls_promote,
     evaluate_overnight_shorting,
@@ -26,6 +27,7 @@ from forecast.shorting import (
     val_long_only_grid,
 )
 from forecast.synthetic import write_cs_overnight_universe
+from forecast.universe import hedge_symbol_for, is_equity_name
 
 
 def test_sleeve_book_block_short_selects_bottom_pred_and_scores_down():
@@ -327,6 +329,41 @@ def test_decide_weekday_promote_is_val_only_and_needs_coverage():
     assert no_lift["promote_weekday"] is False
 
 
+def test_decide_sector_promote_is_val_only():
+    spy = {"unlevered_net_ir": 1.0, "unlevered_max_dd": -0.20}
+    sector = {"unlevered_net_ir": 1.20, "unlevered_max_dd": -0.18}
+    juicy_test = {"unlevered_net_ir": 9.9}
+    yes = decide_sector_promote(
+        val_spy=spy, val_sector=sector, n_sector_hedges=8, n_names=12
+    )
+    assert yes["promote_sector"] is True
+    assert yes["gated_on"] == "val"
+    assert juicy_test["unlevered_net_ir"] > yes["ir_sector"]
+
+    no_files = decide_sector_promote(
+        val_spy=spy, val_sector=sector, n_sector_hedges=0, n_names=12
+    )
+    assert no_files["promote_sector"] is False
+
+    no_lift = decide_sector_promote(
+        val_spy=spy,
+        val_sector={"unlevered_net_ir": 1.01, "unlevered_max_dd": -0.18},
+        n_sector_hedges=8,
+        n_names=12,
+    )
+    assert no_lift["promote_sector"] is False
+
+
+def test_synthetic_names_map_to_sector_etfs_and_etfs_are_not_book_names():
+    assert hedge_symbol_for("S00", sector_residual=True) == "XLK"
+    assert hedge_symbol_for("S05", sector_residual=True) == "XLK"
+    assert hedge_symbol_for("S06", sector_residual=True) == "XLF"
+    assert hedge_symbol_for("S00", sector_residual=False) == "SPY"
+    assert is_equity_name("S00")
+    assert not is_equity_name("XLK")
+    assert not is_equity_name("XLF")
+
+
 def test_frame_to_wide_uses_calendar_index():
     df = pd.DataFrame(
         {
@@ -389,7 +426,9 @@ def test_split_shorting_metrics_ls_has_borrow_and_short_nav():
 
 def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
     data_dir = tmp_path / "data"
-    write_cs_overnight_universe(data_dir, n_names=12, n_days=220, seed=1, rho=0.65)
+    write_cs_overnight_universe(
+        data_dir, n_names=12, n_days=220, seed=1, rho=0.65, include_sectors=True
+    )
     payload = evaluate_overnight_shorting(str(data_dir), "synthetic", log_fn=None)
     assert payload["promotion"]["gated_on"] == "val"
     test = payload["test"]
@@ -416,8 +455,11 @@ def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
     assert payload["ic_gate_fit"]["fit_split"] == "train"
     assert payload["ic_gate_promotion"]["gated_on"] == "val"
     assert payload["weekday_promotion"]["gated_on"] == "val"
+    assert payload["sector_promotion"]["gated_on"] == "val"
+    assert payload["sector_compare"]["n_sector_hedges"] > 0
     assert "PROMOTE IC-GATE" in text
     assert "PROMOTE WEEKDAY MASK" in text
+    assert "PROMOTE SECTOR-OVERNIGHT" in text
     assert "VAL LONG-ONLY GRID" in text
     assert "VAL LONG-ONLY REFINE" in text
     assert "LS HAIRCUT EXPERIMENT" in text

@@ -117,6 +117,14 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/be
   --holding overnight --live-costs --long-only --weekday-mask weekend_only
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only --weekday-mask flat_monday
+# IDEA 3: SPY-only overnight residual (A) vs default sector-overnight residual (B)
+python -m forecast.training --universe liquid --interval daily --skip-only \\
+  --label-return overnight --no-sector-residual \\
+  --checkpoint-dir checkpoints/forecast_ridge_overnight_spy
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight_spy/best.pt \\
+  --holding overnight --live-costs --long-only
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
+  --holding overnight --live-costs --long-only
 """
 
 
@@ -937,6 +945,126 @@ def decide_weekday_promote(grid: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def decide_sector_promote(
+    *,
+    val_spy: dict[str, Any],
+    val_sector: dict[str, Any],
+    n_sector_hedges: int = 0,
+    n_names: int = 0,
+) -> dict[str, Any]:
+    """VAL-only: promote sector-overnight residual vs SPY/market baseline."""
+    ir_a = _as_float(val_spy.get("unlevered_net_ir"))
+    ir_b = _as_float(val_sector.get("unlevered_net_ir"))
+    dd_a = _as_float(val_spy.get("unlevered_max_dd"))
+    dd_b = _as_float(val_sector.get("unlevered_max_dd"))
+    ir_delta = (
+        float(ir_b - ir_a) if np.isfinite(ir_b) and np.isfinite(ir_a) else float("nan")
+    )
+    dd_delta = (
+        float(dd_b - dd_a) if np.isfinite(dd_b) and np.isfinite(dd_a) else float("nan")
+    )
+    ir_ok = bool(np.isfinite(ir_delta) and ir_delta >= LO_IR_LIFT)
+    dd_ok = bool(not np.isfinite(dd_delta) or dd_delta >= -LO_DD_TOL)
+    used_sector = int(n_sector_hedges) > 0
+    promote = bool(ir_ok and dd_ok and used_sector)
+    if not used_sector:
+        reason = (
+            "NO PROMOTE: sector ETFs missing (all names fell back to SPY). "
+            "A and B are the same overnight residual. Keep current skip "
+            "(sector_residual=True with SPY fallback)."
+        )
+    elif not ir_ok:
+        reason = (
+            f"NO PROMOTE: sector-overnight residual VAL unlev net IR {ir_b:+.3f} "
+            f"vs SPY/market {ir_a:+.3f} (delta {ir_delta:+.3f} < {LO_IR_LIFT:.2f}). "
+            "Do not prefer sector hedge on this tape."
+        )
+    elif not dd_ok:
+        reason = (
+            f"NO PROMOTE: sector IR lift {ir_delta:+.3f} but VAL max DD "
+            f"{dd_b:+.3f} vs SPY {dd_a:+.3f} exceeds {LO_DD_TOL:.2f}."
+        )
+    else:
+        reason = (
+            f"PROMOTE sector-overnight residual: VAL IR {ir_b:+.3f} vs SPY "
+            f"{ir_a:+.3f} (delta {ir_delta:+.3f}), max DD {dd_b:+.3f} vs "
+            f"{dd_a:+.3f}. {n_sector_hedges}/{n_names} names used a sector ETF."
+        )
+    return {
+        "promote_sector": promote,
+        "gated_on": "val",
+        "reason": reason,
+        "spec": {"sector_residual": True} if promote else {"sector_residual": True},
+        "ir_spy": ir_a,
+        "ir_sector": ir_b,
+        "ir_delta": ir_delta,
+        "dd_spy": dd_a,
+        "dd_sector": dd_b,
+        "dd_delta": dd_delta,
+        "n_sector_hedges": int(n_sector_hedges),
+        "n_names": int(n_names),
+        "ir_lift": LO_IR_LIFT,
+        "fallback": "SPY when mapped sector ETF parquet is missing",
+    }
+
+
+def _split_lo_q20(
+    df: pd.DataFrame,
+    *,
+    min_names: int,
+    vol_target: float,
+) -> dict[str, Any]:
+    if df.empty:
+        return {}
+    pred, y, r_on, tz, vol = _wide_from_frame(df)
+    if pred.empty or pred.shape[1] < 2:
+        return {}
+    return _lo_q20_book(
+        pred,
+        y,
+        min_names=min_names,
+        vol_target=vol_target,
+        overnight_r=r_on,
+        turnover_z=tz,
+        vol_level=vol,
+    )
+
+
+def _overnight_skip_frames(
+    data_dir: str,
+    universe: str,
+    *,
+    sector_residual: bool,
+    log_fn: Any | None = None,
+) -> tuple[dict[str, pd.DataFrame], int, float, list[dict[str, Any]]]:
+    """Fit the promoted overnight skip on TRAIN for one hedge mode."""
+    cfg = overnight_skip_data_config(
+        data_dir, universe, sector_residual=bool(sector_residual)
+    )
+    if log_fn:
+        log_fn(
+            "overnight residual hedge="
+            + (
+                "sector ETF (SPY fallback if parquet missing)"
+                if sector_residual
+                else "SPY/market"
+            )
+        )
+    bundle = build_datasets(cfg, log_fn=log_fn)
+    weights, bias, train_ic = fit_promoted_overnight_skip(bundle)
+    min_names = int(bundle.get("cs_min_names", 30))
+    px, _missing = load_split_px(bundle, cfg, log_fn=log_fn)
+    frames: dict[str, pd.DataFrame] = {}
+    for split in ("train", "val", "test"):
+        df, _x = _frame_for_split(bundle, split, px, weights, bias, min_names)
+        frames[split] = df
+    hedges = [
+        {"symbol": m.get("symbol"), "hedge": m.get("hedge")}
+        for m in (bundle.get("meta") or [])
+    ]
+    return frames, min_names, float(train_ic), hedges
+
+
 def decide_ls_experiment(val: dict[str, Any], experiment_book: dict[str, Any]) -> dict[str, Any]:
     """VAL-only haircut experiment. Never changes the default live book."""
     lo = (val.get("books") or {}).get("live_long_only") or {}
@@ -1197,6 +1325,53 @@ def evaluate_overnight_shorting(
     wd_test = weekday_mask_grid(
         frames["test"], min_names=min_names, vol_target=vol_target
     )
+    if log_fn:
+        log_fn("IDEA 3: SPY/market overnight residual (A) vs sector-overnight (B)")
+    spy_frames, _spy_min, spy_train_ic, _spy_hedges = _overnight_skip_frames(
+        data_dir, universe, sector_residual=False, log_fn=None
+    )
+    spy_val_lo = _split_lo_q20(
+        spy_frames.get("val", pd.DataFrame()),
+        min_names=min_names,
+        vol_target=vol_target,
+    )
+    spy_test_lo = _split_lo_q20(
+        spy_frames.get("test", pd.DataFrame()),
+        min_names=min_names,
+        vol_target=vol_target,
+    )
+    sector_val_lo = (val.get("books") or {}).get("live_long_only") or {}
+    sector_test_lo = (test.get("books") or {}).get("live_long_only") or {}
+    bench = str(getattr(cfg, "benchmark_symbol", None) or "SPY").upper()
+    hedge_rows = [
+        {"symbol": m.get("symbol"), "hedge": m.get("hedge")}
+        for m in (bundle.get("meta") or [])
+    ]
+    n_sector_hedges = sum(
+        1
+        for row in hedge_rows
+        if str(row.get("hedge") or "").upper() not in ("", bench)
+    )
+    sector_promo = decide_sector_promote(
+        val_spy=spy_val_lo,
+        val_sector=sector_val_lo,
+        n_sector_hedges=n_sector_hedges,
+        n_names=len(hedge_rows),
+    )
+    sector_compare = {
+        "a": "spy_market_overnight",
+        "b": "sector_overnight",
+        "fallback": "SPY when mapped sector ETF parquet is missing",
+        "train_cs_ic_spy": spy_train_ic,
+        "train_cs_ic_sector": float(train_ic),
+        "n_sector_hedges": n_sector_hedges,
+        "n_names": len(hedge_rows),
+        "hedges": hedge_rows,
+        "val_spy": spy_val_lo,
+        "val_sector": sector_val_lo,
+        "test_spy": spy_test_lo,
+        "test_sector": sector_test_lo,
+    }
     exp_book = {}
     if not frames["val"].empty:
         pred = frame_to_wide(frames["val"], "pred")
@@ -1324,6 +1499,8 @@ def evaluate_overnight_shorting(
         "weekday_val_grid": wd_val,
         "weekday_test_grid": wd_test,
         "weekday_promotion": wd_promo,
+        "sector_compare": sector_compare,
+        "sector_promotion": sector_promo,
         "ls_experiment": ls_exp,
         "test_long_only_promoted": test_lo_promoted,
         "test_long_only_refine_best": test_refine_best,
@@ -1359,6 +1536,8 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
         _ic_gate_block(payload),
         "",
         _weekday_block(payload),
+        "",
+        _sector_block(payload),
         "",
         _lo_refine_block(
             payload.get("val_long_only_refine") or {},
@@ -1480,6 +1659,40 @@ def _weekday_block(payload: dict[str, Any]) -> str:
     lines.append("  TEST weekday masks (report-only):")
     for row in list(test.get("rows") or []):
         lines.append(_row(row))
+    return "\n".join(lines)
+
+
+def _sector_block(payload: dict[str, Any]) -> str:
+    promo = payload.get("sector_promotion") or {}
+    cmp_ = payload.get("sector_compare") or {}
+    va = cmp_.get("val_spy") or {}
+    vb = cmp_.get("val_sector") or {}
+    ta = cmp_.get("test_spy") or {}
+    tb = cmp_.get("test_sector") or {}
+    n_sec = int(cmp_.get("n_sector_hedges") or 0)
+    n_nm = int(cmp_.get("n_names") or 0)
+    lines = [
+        f"PROMOTE SECTOR-OVERNIGHT RESIDUAL? "
+        f"{'YES' if promo.get('promote_sector') else 'NO'}",
+        f"  A = SPY/market overnight residual   "
+        f"train CS IC {_fmt(cmp_.get('train_cs_ic_spy'), '+.4f')}",
+        f"  B = sector ETF overnight residual   "
+        f"train CS IC {_fmt(cmp_.get('train_cs_ic_sector'), '+.4f')}  "
+        f"({n_sec}/{n_nm} names mapped to a sector ETF; "
+        f"{cmp_.get('fallback')})",
+        f"  {promo.get('reason')}",
+        f"  VAL A (SPY)     IR {_fmt(va.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(va.get('unlevered_max_dd'), '+.3f')}  "
+        f"cost {_fmt(va.get('mean_cost_unlev_bp'), '.1f')} bp",
+        f"  VAL B (sector)  IR {_fmt(vb.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(vb.get('unlevered_max_dd'), '+.3f')}  "
+        f"cost {_fmt(vb.get('mean_cost_unlev_bp'), '.1f')} bp  "
+        f"delta {_fmt(promo.get('ir_delta'), '+.3f')}",
+        f"  TEST A (SPY)    IR {_fmt(ta.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(ta.get('unlevered_max_dd'), '+.3f')}  (report-only)",
+        f"  TEST B (sector) IR {_fmt(tb.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(tb.get('unlevered_max_dd'), '+.3f')}  (report-only)",
+    ]
     return "\n".join(lines)
 
 

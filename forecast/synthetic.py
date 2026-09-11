@@ -71,12 +71,15 @@ def write_cs_overnight_universe(
     seed: int = 1,
     rho: float = 0.6,
     include_spy: bool = True,
+    include_sectors: bool = False,
 ) -> list[str]:
     """Write daily parquets whose *overnight gap* residual ranks are planted.
 
     ``open[t+1] / close[t]`` carries CS-momentum in the idiosyncratic gap.
     The next session ``close[t+1] / open[t+1]`` is independent noise, so a
     close-to-close skip should not recover the same object.
+    ``include_sectors`` writes XLK/XLF with a planted same-night sector gap
+    (S00–S05 → XLK, S06+ → XLF). Missing sector files fall back to SPY.
     """
     root = Path(data_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -93,6 +96,12 @@ def write_cs_overnight_universe(
         z = (prev - prev.mean()) / max(float(prev.std()), 1e-8)
         idio_gap[t] = np.clip(rho * 0.006 * z + noise_gap[t], -0.03, 0.03)
     betas = 0.7 + 0.6 * rng.random(n_names)
+    sec_gap = (
+        rng.normal(scale=0.0035, size=(n_days, 2)) if include_sectors else None
+    )
+    sec_sess = (
+        rng.normal(scale=0.0030, size=(n_days, 2)) if include_sectors else None
+    )
 
     def _write_ohlc(symbol: str, open_px: np.ndarray, close: np.ndarray) -> None:
         high = np.maximum(open_px, close) * 1.001
@@ -111,8 +120,14 @@ def write_cs_overnight_universe(
         ).to_parquet(root / f"{symbol}_daily.parquet")
 
     for j, name in enumerate(names):
-        gap = np.clip(betas[j] * mkt_gap + idio_gap[:, j], -0.05, 0.05)
-        sess = np.clip(betas[j] * mkt_sess + noise_sess[:, j], -0.05, 0.05)
+        gap = betas[j] * mkt_gap + idio_gap[:, j]
+        sess = betas[j] * mkt_sess + noise_sess[:, j]
+        if sec_gap is not None and sec_sess is not None:
+            sid = 0 if j < 6 else 1
+            gap = gap + sec_gap[:, sid]
+            sess = sess + sec_sess[:, sid]
+        gap = np.clip(gap, -0.05, 0.05)
+        sess = np.clip(sess, -0.05, 0.05)
         close = np.empty(n_days, dtype=np.float64)
         open_px = np.empty(n_days, dtype=np.float64)
         close[0] = 50.0 * (1.0 + j)
@@ -130,4 +145,18 @@ def write_cs_overnight_universe(
             spy_open[t] = spy_close[t - 1] * np.exp(mkt_gap[t] + rng.normal(scale=0.0005))
             spy_close[t] = spy_open[t] * np.exp(mkt_sess[t] + rng.normal(scale=0.0005))
         _write_ohlc("SPY", spy_open, spy_close)
+    if include_sectors and sec_gap is not None and sec_sess is not None:
+        for sid, etf in enumerate(("XLK", "XLF")):
+            close = np.empty(n_days, dtype=np.float64)
+            open_px = np.empty(n_days, dtype=np.float64)
+            close[0] = 80.0 + 10.0 * sid
+            open_px[0] = close[0]
+            for t in range(1, n_days):
+                open_px[t] = close[t - 1] * np.exp(
+                    mkt_gap[t] + sec_gap[t, sid] + rng.normal(scale=0.0004)
+                )
+                close[t] = open_px[t] * np.exp(
+                    mkt_sess[t] + sec_sess[t, sid] + rng.normal(scale=0.0004)
+                )
+            _write_ohlc(etf, open_px, close)
     return names

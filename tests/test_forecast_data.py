@@ -1023,6 +1023,47 @@ def test_sector_residual_uses_future_xlk_in_label_not_features():
     assert base["AAPL"]["target"].iloc[t] != pytest.approx(float(alt["AAPL"]["target"].iloc[t]))
 
 
+def test_sector_overnight_residual_uses_xlk_next_open_not_features():
+    """Overnight y vs sector hedge overnight. Next open is a label only."""
+    cfg = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+        residual_target=True,
+        sector_residual=True,
+        beta_halflife=5,
+        benchmark_symbol="SPY",
+        label_return="overnight",
+    )
+    a = compute_features(_daily_grid(50), cfg)
+    spy = compute_features(_daily_grid(50), cfg)
+    xlk = compute_features(_daily_grid(50), cfg)
+    a["symbol"], spy["symbol"], xlk["symbol"] = "AAPL", "SPY", "XLK"
+    base = attach_cross_section_features(
+        {"AAPL": a.copy(), "SPY": spy.copy(), "XLK": xlk.copy()}, cfg
+    )
+    base = attach_residual_target(base, cfg)
+    spiked_grid = _daily_grid(50)
+    spiked_grid.loc[spiked_grid.index[-1], "open"] = (
+        float(spiked_grid["open"].iloc[-1]) * 1.08
+    )
+    spiked = compute_features(spiked_grid, cfg)
+    spiked["symbol"] = "XLK"
+    alt_panels = attach_cross_section_features(
+        {"AAPL": a.copy(), "SPY": spy.copy(), "XLK": spiked}, cfg
+    )
+    alt = attach_residual_target(alt_panels, cfg)
+    t = 48
+    for col in ("ret_1", "mkt_ret_1", "sector_ret_1", "idio_sector", "cs_rank_1"):
+        assert base["AAPL"][col].iloc[t] == pytest.approx(float(alt["AAPL"][col].iloc[t]))
+    assert base["AAPL"]["target"].iloc[t] != pytest.approx(
+        float(alt["AAPL"]["target"].iloc[t])
+    )
+
+
 def test_double_residual_uses_spy_and_sector_forward():
     cfg = DataConfig(
         interval="daily",

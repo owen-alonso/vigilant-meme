@@ -119,6 +119,13 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/be
   --holding overnight --live-costs --long-only --weekday-mask flat_friday
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --live-costs --long-only --weekday-mask weekend_only
+# sector-overnight residual is the default skip (--sector-residual).
+# SPY-only overnight residual baseline (A) for the VAL compare:
+python -m forecast.training --universe liquid --interval daily --skip-only \
+  --label-return overnight --no-sector-residual \
+  --checkpoint-dir checkpoints/forecast_ridge_overnight_spy
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight_spy/best.pt \
+  --holding overnight --live-costs --long-only
 # harsh auction stress
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --cost-bundle harsh

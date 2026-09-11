@@ -72,7 +72,12 @@ def main(argv: list[str] | None = None) -> int:
         if not args.data_dir:
             args.data_dir = "/tmp/cs_overnight_shorting_synth"
         write_cs_overnight_universe(
-            args.data_dir, n_names=12, n_days=220, seed=1, rho=0.65
+            args.data_dir,
+            n_names=12,
+            n_days=220,
+            seed=1,
+            rho=0.65,
+            include_sectors=True,
         )
         print(f"synthetic overnight universe -> {args.data_dir}", flush=True)
     if not args.data_dir:

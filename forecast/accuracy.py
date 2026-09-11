@@ -74,8 +74,15 @@ def overnight_skip_data_config(
     *,
     label_return: str = "overnight",
     interval: str = "daily",
+    sector_residual: bool = True,
 ) -> DataConfig:
-    """Locked overnight skip DataConfig (same cuts/features as ``cs_overnight``)."""
+    """Locked overnight skip DataConfig (same cuts/features as ``cs_overnight``).
+
+    ``sector_residual=True`` residualizes overnight y vs the mapped sector
+    ETF's same-night overnight (SPY if that parquet is missing).
+    ``sector_residual=False`` is the SPY/market overnight residual baseline.
+    Sector/index ETFs stay out of the trading book (``equities_only=True``).
+    """
     preset = interval_data_kwargs(interval)
     seq_len = 32 if interval == "daily" else int(preset["seq_len"])
     synthetic = universe in ("", "synthetic")
@@ -98,8 +105,8 @@ def overnight_skip_data_config(
         allow_mixed_prices=synthetic,
         cs_zscore=True,
         universe="" if synthetic else universe,
-        sector_residual=True,
-        equities_only=not synthetic,
+        sector_residual=bool(sector_residual),
+        equities_only=True,
         train_from="" if synthetic else "1999-01-01",
         label_return=label_return,
         fill_minutes=0,
