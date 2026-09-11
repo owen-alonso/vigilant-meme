@@ -326,6 +326,8 @@ class ForecastTrainConfig:
     freeze_skip: bool = True
     # Apply ridge, log last-bar train/val/test IC, write best.pt, exit (no AdamW).
     skip_only: bool = False
+    # Skip-only / encoder baseline eval on the train split (slow on CS dates).
+    eval_train_split: bool = True
     # Frozen skip vs causal expanding/rolling refit (walk-forward uses labels < t).
     ridge_window: str = "frozen"
     # Trailing calendar days for rolling ridge. Ignored when window=frozen.

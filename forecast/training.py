@@ -907,11 +907,14 @@ def _train(
     t0 = time.perf_counter()
     if log_fn:
         log_fn(f"steps/epoch={steps_per_epoch} total_steps={total_steps}")
-    skip_only_train = evaluate(model, train_eval_loader, device, train_cfg, **cs_eval)
+    skip_only_train: dict[str, float] = {}
+    if bool(getattr(train_cfg, "eval_train_split", True)):
+        skip_only_train = evaluate(model, train_eval_loader, device, train_cfg, **cs_eval)
     skip_only_val = evaluate(model, val_loader, device, train_cfg, **cs_eval)
     skip_only_test = evaluate(model, test_loader, device, train_cfg, **cs_eval)
     if log_fn:
-        log_fn(f"  skip-only train: {_fmt(skip_only_train)}")
+        if skip_only_train:
+            log_fn(f"  skip-only train: {_fmt(skip_only_train)}")
         log_fn(f"  skip-only val: {_fmt(skip_only_val)}")
         log_fn(f"  skip-only test: {_fmt(skip_only_test)}")
     walk_forward: dict[str, Any] = {}

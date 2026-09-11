@@ -192,6 +192,104 @@ def _split_stats(
     return out
 
 
+def _winsor_cols(x: np.ndarray, k: float, mask: np.ndarray) -> np.ndarray:
+    out = np.asarray(x, dtype=np.float64).copy()
+    if k <= 0:
+        return out
+    for j in np.flatnonzero(np.asarray(mask, dtype=bool)):
+        col = out[:, int(j)]
+        if col.size < 3:
+            continue
+        s = float(col.std())
+        if s < 1e-8:
+            continue
+        mu = float(col.mean())
+        out[:, int(j)] = np.clip(col, mu - k * s, mu + k * s)
+    return out
+
+
+def _fit_lastbar_residual(
+    cache: dict[str, Any],
+    w: np.ndarray,
+    b: float,
+    *,
+    hidden: int = 32,
+    steps: int = 400,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Tiny last-bar MLP residual on frozen skip. Same X as the overnight ridge.
+
+    Sequence Mamba is a different (CUDA) ablation. This answers whether extra
+    last-bar capacity lifts locked overnight val. Do not retarget from test.
+    """
+    import torch
+    import torch.nn as nn
+
+    mask = feature_mask(PROMOTED["mask_mode"])
+    x_tr, y_tr, _d_tr = _train_xy(cache)
+    x_tr = _winsor_cols(x_tr, float(PROMOTED["feat_winsor"]), mask)
+    w64 = np.asarray(w, dtype=np.float64).reshape(-1)
+    skip_tr = x_tr @ w64 + float(b)
+    resid = y_tr - skip_tr
+    keep = mask.astype(bool)
+    xt = torch.from_numpy(x_tr[:, keep].astype(np.float32))
+    yt = torch.from_numpy(resid.astype(np.float32))
+    torch.manual_seed(int(seed))
+    net = nn.Sequential(
+        nn.Linear(int(keep.sum()), int(hidden)),
+        nn.Tanh(),
+        nn.Linear(int(hidden), 1),
+    )
+    nn.init.zeros_(net[-1].weight)
+    nn.init.zeros_(net[-1].bias)
+    opt = torch.optim.Adam(net.parameters(), lr=3e-4, weight_decay=1e-4)
+    min_names = int(cache["cs_min_names"])
+    x_va = cache["val_x"].astype(np.float64)
+    y_va = cache["val_y"].astype(np.float64)
+    d_va = cache["val_d"].astype(np.int64)
+    x_te = cache["test_x"].astype(np.float64)
+    y_te = cache["test_y"].astype(np.float64)
+    d_te = cache["test_d"].astype(np.int64)
+
+    def _pred(x_np: np.ndarray) -> np.ndarray:
+        with torch.no_grad():
+            extra = net(torch.from_numpy(x_np[:, keep].astype(np.float32))).squeeze(-1)
+        return x_np @ w64 + float(b) + extra.numpy().astype(np.float64)
+
+    net.eval()
+    start_val = float(cs_stats(_pred(x_va), y_va, d_va, min_names=min_names)["cs_ic"])
+    best_val = start_val if np.isfinite(start_val) else -1e9
+    best_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
+    n = int(xt.shape[0])
+    batch = min(4096, max(256, n))
+    for step in range(int(steps)):
+        net.train()
+        idx = torch.randint(0, n, (batch,))
+        pred = net(xt[idx]).squeeze(-1)
+        loss = torch.nn.functional.huber_loss(pred, yt[idx], delta=1.0)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        if (step + 1) % 50 == 0 or step + 1 == int(steps):
+            net.eval()
+            val_ic = float(cs_stats(_pred(x_va), y_va, d_va, min_names=min_names)["cs_ic"])
+            if np.isfinite(val_ic) and val_ic > best_val:
+                best_val = val_ic
+                best_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
+    net.load_state_dict(best_state)
+    net.eval()
+    val_stats = cs_stats(_pred(x_va), y_va, d_va, min_names=min_names)
+    test_stats = cs_stats(_pred(x_te), y_te, d_te, min_names=min_names)
+    return {
+        "best_val_ic": float(val_stats.get("cs_ic", float("nan"))),
+        "val": slim_cs_stats(val_stats),
+        "test": slim_cs_stats(test_stats),
+        "hidden": int(hidden),
+        "steps": int(steps),
+        "kind": "lastbar_mlp_residual",
+    }
+
+
 def _fit_promoted(cache: dict[str, Any]) -> tuple[np.ndarray, float, float]:
     x, y, d = _train_xy(cache)
     mask = feature_mask(PROMOTED["mask_mode"])
@@ -340,11 +438,13 @@ def _train_encoder(
 
     ssm = interval_model_kwargs("daily")
     data_cfg = _cfg(data_dir, universe)
+    # Last-bar CS skip does not need 128-bar windows. Keep the overnight
+    # protocol seq_len so the encoder ablation is comparable and runnable.
     if universe not in ("", "synthetic"):
-        data_cfg.seq_len = 128
-        data_cfg.min_context = 32
-        data_cfg.warmup_bars = 21
         data_cfg.cross_section_min_names = 30
+        data_cfg.equities_only = True
+        data_cfg.train_from = "1999-01-01"
+        data_cfg.allow_mixed_prices = False
     model_cfg = ForecastModelConfig(
         n_features=len(FEATURE_NAMES),
         d_model=int(ssm.get("d_model", 32)),
@@ -375,6 +475,7 @@ def _train_encoder(
         eval_interval=max(10, int(max_steps) // 2) if not skip_only else 250,
         ic_loss_weight=2.0,
         rank_loss_weight=1.0,
+        eval_train_split=False,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return train(data_cfg, model_cfg, train_cfg, device=device, log_fn=print)
@@ -404,6 +505,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--encoder-steps", type=int, default=80)
     p.add_argument("--checkpoint-dir", default="checkpoints/forecast_overnight")
+    p.add_argument(
+        "--no-lastbar-residual",
+        action="store_true",
+        help="skip the cheap last-bar MLP residual (default: run it from the cache)",
+    )
     args = p.parse_args(argv)
 
     if args.synthetic:
@@ -452,11 +558,31 @@ def main(argv: list[str] | None = None) -> int:
             "test_years": test.get("years"),
         },
         "stress": [],
+        "lastbar_residual": None,
         "encoder": None,
         "dynamic_a": None,
         "promoted": None,
         "verdict": "",
     }
+    if not args.no_lastbar_residual:
+        print("tiny last-bar MLP residual (frozen skip, same overnight y) ...", flush=True)
+        residual = _fit_lastbar_residual(cache, w, b)
+        residual_val = float(residual.get("best_val_ic", float("nan")))
+        residual_test = float((residual.get("test") or {}).get("cs_ic", float("nan")))
+        payload["lastbar_residual"] = residual
+        print(
+            f"lastbar residual val CS IC={residual_val:+.4f}  "
+            f"skip val={val['cs_ic']:+.4f}  test={residual_test:+.4f}",
+            flush=True,
+        )
+        if np.isfinite(residual_val) and residual_val >= float(val["cs_ic"]) + VAL_LIFT:
+            print("lastbar residual lifted locked overnight val.", flush=True)
+        else:
+            print(
+                "NO PROMOTE lastbar residual: did not lift locked overnight val by "
+                f"{VAL_LIFT:.3f}. Sequence Mamba is not the default next step.",
+                flush=True,
+            )
     print("overnight holding-period stress (locked test last bars):", flush=True)
     payload["stress"] = _stress_grid(split["test_pred"], split["test_y"], split["test_d"])
 

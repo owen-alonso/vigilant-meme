@@ -295,6 +295,65 @@ def test_long_only_overnight_has_no_short_borrow():
     assert ls["mean_cost"] > lo["mean_cost"]
 
 
+def test_lastbar_residual_zero_steps_matches_skip():
+    import importlib.util
+
+    from forecast.data import FEATURE_NAMES
+    from forecast.ridge import cs_stats, feature_mask, fit_ridge_xy
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "cs_overnight.py"
+    spec = importlib.util.spec_from_file_location("cs_overnight_mod", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+
+    rng = np.random.default_rng(3)
+    n_dates, n_names, f = 24, 12, len(FEATURE_NAMES)
+    assert f == feature_mask(mod.PROMOTED["mask_mode"]).size
+
+    def pack(offset: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        x = rng.normal(size=(n_dates * n_names, f)).astype(np.float32)
+        d = np.repeat(np.arange(n_dates, dtype=np.int64) + offset, n_names)
+        y = (x[:, 0] * 0.4 + rng.normal(scale=0.6, size=x.shape[0])).astype(np.float32)
+        return x, y, d
+
+    tr_x, tr_y, tr_d = pack(0)
+    va_x, va_y, va_d = pack(100)
+    te_x, te_y, te_d = pack(200)
+    cache = {
+        "train_x": tr_x,
+        "train_y": tr_y,
+        "train_d": tr_d,
+        "val_x": va_x,
+        "val_y": va_y,
+        "val_d": va_d,
+        "test_x": te_x,
+        "test_y": te_y,
+        "test_d": te_d,
+        "cs_min_names": 8,
+    }
+    mask = feature_mask(mod.PROMOTED["mask_mode"])
+    w, b, _ic = fit_ridge_xy(
+        tr_x.astype(np.float64),
+        tr_y.astype(np.float64),
+        tr_d,
+        ridge=mod.PROMOTED["ridge"],
+        min_names=8,
+        cs_demean=True,
+        rank_target=True,
+        feat_winsor=mod.PROMOTED["feat_winsor"],
+        feature_mask_bool=mask,
+    )
+    skip_val = float(
+        cs_stats(va_x.astype(np.float64) @ w + b, va_y.astype(np.float64), va_d, min_names=8)[
+            "cs_ic"
+        ]
+    )
+    residual = mod._fit_lastbar_residual(cache, w, b, steps=0, hidden=8)
+    assert residual["kind"] == "lastbar_mlp_residual"
+    assert residual["best_val_ic"] == pytest.approx(skip_val, abs=1e-5)
+
+
 def test_overnight_cli_flag():
     from forecast.training import build_arg_parser, configs_from_cli
 

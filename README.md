@@ -176,8 +176,8 @@ y_t = \frac{r_{t+1} - \beta_t r^{\mathrm{hedge}}_{t+1}}{\sigma_t}
 
 Overnight (`--label-return overnight`) replaces \(r_{t+1}\) with
 \(\log(\mathrm{open}_{t+1})-\log(\mathrm{close}_t)\). Next open is a **label**,
-never a feature. Backtest `--holding overnight` flattens every open (MOC→MOO)
-and does not headline `vol_target=1`.
+never a feature. Backtest `--holding overnight` flattens every open (MOC→MOO),
+charges enter+exit each night, and does not headline `vol_target=1`.
 
 `best.pt` is selected by mean CS IC when a cross-section exists. `backtest.py`
 builds a dollar-neutral (or `--long-only`) quantile book on the locked

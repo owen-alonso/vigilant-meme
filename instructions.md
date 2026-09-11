@@ -68,9 +68,7 @@ python -m forecast.training --universe liquid --interval daily --skip-only \
   --label-return overnight --checkpoint-dir checkpoints/forecast_ridge_overnight
 # year series + cost/auction/borrow stress (locked test)
 python scripts/cs_overnight.py --data-dir data --universe liquid
-# tiny frozen-skip encoder; Dynamic A only if you want a val-gated extra
-python -m forecast.training --universe liquid --interval daily --label-return overnight \
-  --d-model 32 --n-layer 1 --checkpoint-dir checkpoints/forecast_overnight_enc
+# tiny last-bar MLP residual is on by default (val-gate ≥0.003 vs skip)
 python scripts/cs_overnight.py --data-dir data --universe liquid --encoder
 python scripts/cs_overnight.py --data-dir data --universe liquid --try-dynamic-a
 # holding period matches the label (flatten every open); do not headline vol_target=1
