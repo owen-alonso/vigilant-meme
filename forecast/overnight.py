@@ -88,6 +88,8 @@ PAPER_BUNDLE: dict[str, Any] = {
     "thin_pctile": 0.0,
     "locate_pctile": 0.0,
     "ex_post_gap_k": 0.0,
+    "adv_borrow_k": 0.0,
+    "adv_auction_k": 0.0,
 }
 
 # Flat overlay used in the first overnight live-ish print (IR ~1.6–2.0).
@@ -106,6 +108,8 @@ LIVE_FLAT_BUNDLE: dict[str, Any] = {
     "thin_pctile": 0.0,
     "locate_pctile": 0.0,
     "ex_post_gap_k": 0.0,
+    "adv_borrow_k": 0.0,
+    "adv_auction_k": 0.0,
 }
 
 # Name-level auction: extra MOC/MOO vs official prints, thin-name multiplier,
@@ -124,6 +128,8 @@ LIVE_BUNDLE: dict[str, Any] = {
     "thin_pctile": 0.30,
     "locate_pctile": 0.0,
     "ex_post_gap_k": 0.0,
+    "adv_borrow_k": 0.0,
+    "adv_auction_k": 0.0,
 }
 
 LIVE_LOCATE_BUNDLE: dict[str, Any] = {
@@ -154,6 +160,8 @@ HARSH_BUNDLE: dict[str, Any] = {
     "thin_pctile": 0.40,
     "locate_pctile": 0.30,
     "ex_post_gap_k": 0.0,
+    "adv_borrow_k": 0.0,
+    "adv_auction_k": 0.0,
 }
 
 # Ex-post |gap| impact is a *sensitivity* (uses the realized overnight move).
@@ -178,6 +186,43 @@ FILL_LIVE_BUNDLE: dict[str, Any] = {
     "thin_pctile": 0.30,
     "locate_pctile": 0.0,
     "ex_post_gap_k": 0.0,
+    "adv_borrow_k": 0.0,
+    "adv_auction_k": 0.0,
+}
+
+# Live + ADV-scaled borrow/auction (thin names cost more than the flat overlay).
+LIVE_ADV_BUNDLE: dict[str, Any] = {
+    **LIVE_BUNDLE,
+    "name": "live_adv",
+    "adv_borrow_k": 0.5,
+    "adv_auction_k": 0.5,
+}
+
+# Borrow stress: HTB names (low ADV) pay a steeper locate. Long-only zeros this.
+BORROW_STRESS_BUNDLE: dict[str, Any] = {
+    **LIVE_BUNDLE,
+    "name": "borrow_stress",
+    "borrow_bps": 15.0,
+    "adv_borrow_k": 1.0,
+    "adv_auction_k": 0.0,
+    "locate_pctile": 0.30,
+}
+
+# Auction stress: MOC/MOO scale with 1/ADV on top of the harsh print.
+AUCTION_STRESS_BUNDLE: dict[str, Any] = {
+    **HARSH_BUNDLE,
+    "name": "auction_stress",
+    "adv_borrow_k": 0.0,
+    "adv_auction_k": 1.0,
+    "locate_pctile": 0.0,
+}
+
+LIVE_ADV_LONG_ONLY_BUNDLE: dict[str, Any] = {
+    **LIVE_ADV_BUNDLE,
+    "name": "live_adv_long_only",
+    "borrow_bps": 0.0,
+    "locate_pctile": 0.0,
+    "adv_borrow_k": 0.0,
 }
 
 COST_BUNDLES: dict[str, dict[str, Any]] = {
@@ -187,8 +232,12 @@ COST_BUNDLES: dict[str, dict[str, Any]] = {
     "live": LIVE_BUNDLE,
     "live_locate": LIVE_LOCATE_BUNDLE,
     "live_long_only": LIVE_LONG_ONLY_BUNDLE,
+    "live_adv": LIVE_ADV_BUNDLE,
+    "live_adv_long_only": LIVE_ADV_LONG_ONLY_BUNDLE,
     "harsh": HARSH_BUNDLE,
     "harsh_auction": HARSH_BUNDLE,
+    "borrow_stress": BORROW_STRESS_BUNDLE,
+    "auction_stress": AUCTION_STRESS_BUNDLE,
     "ex_post_gap": EX_POST_GAP_BUNDLE,
     "fill_live": FILL_LIVE_BUNDLE,
 }
@@ -421,6 +470,9 @@ def overnight_stress_costs(
     thin_mult: float = 1.0,
     thin_pctile: float = 0.0,
     ex_post_gap_k: float = 0.0,
+    dollar_adv: np.ndarray | None = None,
+    adv_borrow_k: float = 0.0,
+    adv_auction_k: float = 0.0,
 ) -> np.ndarray:
     """Per-date cost (fraction of NAV) for an overnight flatten book.
 
@@ -450,6 +502,9 @@ def overnight_stress_costs(
         thin_mult=thin_mult,
         thin_pctile=thin_pctile,
         ex_post_gap_k=ex_post_gap_k,
+        dollar_adv=dollar_adv,
+        adv_borrow_k=adv_borrow_k,
+        adv_auction_k=adv_auction_k,
     )["total"]
 
 
@@ -470,25 +525,40 @@ def overnight_cost_breakdown(
     thin_mult: float = 1.0,
     thin_pctile: float = 0.0,
     ex_post_gap_k: float = 0.0,
+    dollar_adv: np.ndarray | None = None,
+    adv_borrow_k: float = 0.0,
+    adv_auction_k: float = 0.0,
 ) -> dict[str, np.ndarray]:
     """Named per-date cost components (fraction of NAV) plus ``total``."""
+    from forecast.levers import adv_cost_scale
+
     w = np.asarray(weights, dtype=np.float64)
     if w.ndim == 1:
         w = w.reshape(1, -1)
     abs_w = np.abs(w)
     one_way = overnight_one_way_turnover(w)
     exit_leg = 0.5 * abs_w.sum(axis=1)
-    short_nav = np.clip(-w, 0.0, None).sum(axis=1)
+    short_nav = np.clip(-w, 0.0, None)
     rt = (float(round_trip_bps) * 1e-4) * one_way
     legacy_moo = (float(open_auction_bps) * 1e-4) * exit_leg
-    borrow = (float(borrow_bps) * 1e-4) * short_nav
     hedge = (float(hedge_cost_bps) * 1e-4) * np.ones_like(one_way)
+
+    borrow_scale = np.ones_like(abs_w)
+    auction_adv_scale = np.ones_like(abs_w)
+    if dollar_adv is not None:
+        if float(adv_borrow_k) > 0:
+            borrow_scale = adv_cost_scale(_as_2d(dollar_adv, w.shape), k=float(adv_borrow_k))
+        if float(adv_auction_k) > 0:
+            auction_adv_scale = adv_cost_scale(
+                _as_2d(dollar_adv, w.shape), k=float(adv_auction_k)
+            )
+    borrow = (float(borrow_bps) * 1e-4) * (short_nav * borrow_scale).sum(axis=1)
 
     thin_scale = np.ones_like(abs_w)
     if float(thin_pctile) > 0 and turnover_z is not None and float(thin_mult) > 1.0:
         thin = row_cs_thin_mask(_as_2d(turnover_z, w.shape), float(thin_pctile))
         thin_scale = np.where(thin, float(thin_mult), 1.0)
-    auction_notional = abs_w * thin_scale
+    auction_notional = abs_w * thin_scale * auction_adv_scale
     moc = (float(moc_bps) * 1e-4) * auction_notional.sum(axis=1)
     moo = (float(moo_bps) * 1e-4) * auction_notional.sum(axis=1)
     sess = (float(session_exit_bps) * 1e-4) * auction_notional.sum(axis=1)

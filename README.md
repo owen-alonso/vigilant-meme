@@ -162,8 +162,39 @@ python scripts/cs_regime_ablate.py --data-dir data --universe liquid
 python scripts/cs_shrink_ablate.py --data-dir data --universe liquid --also-labels
 python -m forecast.training --universe liquid --skip-only --label-return overnight
 python scripts/cs_overnight.py --data-dir data --universe liquid
+python scripts/cs_accuracy_levers.py --data-dir data --universe liquid \\
+    --out checkpoints/forecast_ridge_overnight/levers.json
 python scripts/ablate_cs.py
 python scripts/split_report.py data/AAPL_daily.parquet
+```
+
+Accuracy levers 1–6 and 8 are **off by default**. Promote only on locked val
+(≥0.003 CS IC lift, do not kill val-2017). Live long-only IR is the runnable
+book when it conflicts with CS IC. Lever 7 (vendor ingest) is a hook only.
+
+| lever | default | CUDA (Owen) |
+|---|---|---|
+| 1 regime / 2023 | `--ridge-year-stable train_recency` | trailing-IC **sizing** `--ic-shrink-lookback 63` |
+| 2 overnight labels + long-only skip | `--label-return overnight` (promoted y); `--ridge-objective long_only` | `--label-return open15` is a **separate** estimand |
+| 3 universe / ADV lock | `--train-adv-floor-pctile 0.67 --liquid-min-names 30` | eval CS IC **and** `--live-costs --long-only` |
+| 4 multi-factor residual | `--double-residual --size-residual --peer-residual` | leakage-tested; off until val-gate |
+| 5 ensemble | `--ensemble-mlp` | skip + tiny MLP **only if** val-gate clears |
+| 6 calibration | `--ic-shrink-lookback 63 --gap-risk-cap 0.02` | causal 15% vol; never headline `vol_target=1` |
+| 8 cost realism | `--cost-bundle live_adv` / `borrow_stress` / `auction_stress` | long-only remains first-class |
+
+```bash
+# overnight skip (promoted book)
+python -m forecast.training --universe liquid --interval daily --skip-only \\
+  --label-return overnight --checkpoint-dir checkpoints/forecast_ridge_overnight
+
+# levers vs locked overnight val (do not retarget test/2023)
+python scripts/cs_accuracy_levers.py --data-dir data --universe liquid \\
+  --out checkpoints/forecast_ridge_overnight/levers.json --try-fill 15
+
+# live long-only + ADV-scaled auction/borrow + trailing-IC flatten + gap cap
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
+  --holding overnight --cost-bundle live_adv --long-only \\
+  --ic-shrink-lookback 63 --gap-risk-cap 0.02
 ```
 
 Yahoo/Stooq daily caches are split-adjusted (`adjclose` is written into
@@ -178,11 +209,15 @@ Overnight (`--label-return overnight`) replaces \(r_{t+1}\) with
 \(\log(\mathrm{open}_{t+1})-\log(\mathrm{close}_t)\). Next open is a **label**,
 never a feature. Backtest `--holding overnight` flattens every open (MOC→MOO).
 `--live-costs` is the Owen-runnable pack (20 bp RT + name-level MOC/MOO +
-thin/vol impact + 5 bp borrow + 10 bp hedge). `--long-only` drops shorts and
+thin/vol impact + 5 bp borrow + 10 bp hedge). `--cost-bundle live_adv` scales
+borrow/auction with 1/ADV. `--long-only` drops shorts and
 borrow (no locate). `--locate-adv-pctile 0.3` blocks shorts in the bottom
-turnover tercile. `--adv-floor-pctile 0.67 --min-names 8` is the liquid
-sleeve (same skip, drop thin names before weights). `--compare-long-only`
-prints both books. Do not headline `vol_target=1`. Open+N fill
+turnover tercile. `--adv-floor-pctile 0.67 --min-names 8` is a **daily** CS
+sleeve; `--train-adv-floor-pctile` is the train-era locked protocol.
+`--compare-long-only`
+prints both books. `--ic-shrink-lookback 63` flattens leverage when trailing
+CS IC is dead (sizing, not a score cheat). `--gap-risk-cap` caps
+`sum(|w|*vol_level)`. Do not headline `vol_target=1`. Open+N fill
 (`--label-return open15`) is a **separate** estimand; it does not replace
 overnight `y` unless it wins the locked-val gate.
 

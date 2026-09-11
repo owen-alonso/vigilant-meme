@@ -101,6 +101,52 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_fill15/best.
   --holding open_fill --cost-bundle fill_live
 ```
 
+Accuracy levers 1–6 and 8 (overnight path; **off until locked val**). Do not
+enable from test or 2023. Close-to-close already lost bigger Mamba / Dynamic A.
+Live long-only ~IR 1.8 after name-level costs is the runnable book.
+
+| lever | flag | default | promote? |
+|---|---|---|---|
+| 0 overnight skip | `--label-return overnight --skip-only` | **on** (overnight book) | **yes** (PR #5) |
+| 1 year-stable / recency | `--ridge-year-stable train_recency` | off | only if val lift ≥0.003 and val-2017 ≥0.015 |
+| 1 trailing-IC sizing | `--ic-shrink-lookback 63` | off | sizing overlay; does not retarget 2023 |
+| 2 long-only skip | `--ridge-objective long_only` | off | only if live long-only IR also holds |
+| 2 open+15 / open+30 | `--label-return open15` | off | separate estimand; open+15 already lost vs overnight y |
+| 3 train-era ADV lock | `--train-adv-floor-pctile 0.67 --liquid-min-names 30` | off | eval CS IC **and** live long-only IR |
+| 4 size / peer residual | `--size-residual --peer-residual` | off | plus `--double-residual`; leakage-tested |
+| 5 skip+MLP ensemble | `--ensemble-mlp` | off | mix on late-train; **discard** unless val-gate |
+| 6 gap risk cap | `--gap-risk-cap 0.02` | off | causal `vol_level` known at t |
+| 8 ADV-scaled costs | `--cost-bundle live_adv` | off | `borrow_stress` / `auction_stress`; long-only first-class |
+| 7 vendor ingest | — | **not implemented** | drop vendor parquets into `data/` later |
+
+```bash
+# CUDA: overnight skip, then levers vs locked val (do not retarget test)
+python -m forecast.training --universe liquid --interval daily --skip-only \
+  --label-return overnight --checkpoint-dir checkpoints/forecast_ridge_overnight
+python scripts/cs_accuracy_levers.py --data-dir data --universe liquid \
+  --out checkpoints/forecast_ridge_overnight/levers.json --try-fill 15
+
+# optional: long-only-shaped skip (val-gate vs overnight skip)
+python -m forecast.training --universe liquid --interval daily --skip-only \
+  --label-return overnight --ridge-objective long_only \
+  --checkpoint-dir checkpoints/forecast_ridge_overnight_lo
+
+# optional: train-era liquid + size/peer residual (val-gate)
+python -m forecast.training --universe liquid --interval daily --skip-only \
+  --label-return overnight --double-residual --size-residual --peer-residual \
+  --train-adv-floor-pctile 0.67 --liquid-min-names 30 \
+  --checkpoint-dir checkpoints/forecast_ridge_overnight_mf
+
+# live long-only + ADV-scaled costs + trailing-IC flatten + gap cap
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --cost-bundle live_adv --long-only \
+  --ic-shrink-lookback 63 --ic-shrink-mode flatten_ic --gap-risk-cap 0.02
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --cost-bundle borrow_stress --compare-long-only
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --cost-bundle auction_stress --long-only
+```
+
 Overnight **live vs paper** (same flatten book, 15% causal vol):
 
 | bundle | meaning |
