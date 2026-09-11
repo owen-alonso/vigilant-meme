@@ -311,6 +311,17 @@ def trailing_mean_cs_ic(
     return prior.shift(1).rolling(w, min_periods=need).mean()
 
 
+def soft_ic_gross_scale(trail_ic: float, tau: float) -> float:
+    """``clip(trail_IC / τ, 0, 1)``. NaN warmup or τ≤0 → full gross (1)."""
+    t = float(tau)
+    if not np.isfinite(t) or t <= 1e-12:
+        return 1.0
+    x = float(trail_ic)
+    if not np.isfinite(x):
+        return 1.0
+    return float(np.clip(x / t, 0.0, 1.0))
+
+
 def quantile_weights(
     scores: pd.Series,
     *,
@@ -726,6 +737,9 @@ def book_pnl(
     ic_gate_tau: float = 0.0,
     ic_gate_kind: str = "pearson",
     ic_gate_trail: pd.Series | None = None,
+    ic_scale_window: int = 0,
+    ic_scale_tau: float = 0.0,
+    ic_scale_trail: pd.Series | None = None,
     weekday_mask: str = "always",
     disp_gate_trail: pd.Series | None = None,
     disp_gate_tau: float = float("nan"),
@@ -780,6 +794,22 @@ def book_pnl(
     kept: list[Any] = []
     n_gated = 0
     n_gate_dates = 0
+    scale_w = int(ic_scale_window or 0)
+    scale_tau = float(ic_scale_tau or 0.0)
+    trail_scale = ic_scale_trail
+    if trail_scale is None and scale_w > 0 and scale_tau > 1e-12:
+        trail_scale = trailing_mean_cs_ic(
+            pred,
+            realized,
+            window=scale_w,
+            min_names=int(min_names),
+            kind=str(ic_gate_kind or "pearson"),
+        )
+    scale_on = trail_scale is not None and scale_tau > 1e-12
+    scale_vals: list[float] = []
+    n_scale_partial = 0
+    n_scale_flat = 0
+    n_scale_dates = 0
     wd_kind = normalize_weekday_mask(weekday_mask)
     n_wd_flat = 0
     n_wd_dates = 0
@@ -858,6 +888,20 @@ def book_pnl(
             if np.isfinite(tval) and tval < float(ic_gate_tau):
                 w = w * 0.0
                 n_gated += 1
+        if scale_on:
+            n_scale_dates += 1
+            sval = (
+                float(trail_scale.loc[ts])
+                if ts in trail_scale.index
+                else float("nan")
+            )
+            s = soft_ic_gross_scale(sval, scale_tau)
+            scale_vals.append(s)
+            if s < 1.0 - 1e-12:
+                n_scale_partial += 1
+            if s <= 1e-12:
+                n_scale_flat += 1
+            w = w * s
         if wd_kind != "always":
             n_wd_dates += 1
             if weekday_mask_is_flat(ts, wd_kind):
@@ -1073,6 +1117,14 @@ def book_pnl(
         "ic_gate_coverage": (
             float(1.0 - n_gated / n_gate_dates) if n_gate_dates else float("nan")
         ),
+        "ic_scale_window": float(scale_w if scale_on else 0),
+        "ic_scale_tau": float(scale_tau if scale_on else 0.0),
+        "mean_ic_scale": (
+            float(np.mean(scale_vals)) if scale_vals else float("nan")
+        ),
+        "ic_scale_n_partial": float(n_scale_partial),
+        "ic_scale_n_flat": float(n_scale_flat),
+        "ic_scale_n_dates": float(n_scale_dates),
         "weekday_mask": wd_kind,
         "weekday_n_flat": float(n_wd_flat),
         "weekday_n_dates": float(n_wd_dates),
@@ -1139,6 +1191,13 @@ def format_report(stats: dict[str, Any], *, checkpoint: Path, test_start: Any) -
             f"τ={float(stats.get('ic_gate_tau') or 0):+.3f} "
             f"cover {100 * float(stats.get('ic_gate_coverage') or float('nan')):.0f}%"
             if float(stats.get("ic_gate_window") or 0) > 0
+            else ""
+        )
+        + (
+            f"  ic_scale W={int(stats.get('ic_scale_window') or 0)} "
+            f"τ={float(stats.get('ic_scale_tau') or 0):+.3f} "
+            f"mean_s {float(stats.get('mean_ic_scale') or float('nan')):.2f}"
+            if float(stats.get("ic_scale_window") or 0) > 0
             else ""
         )
         + (
@@ -1356,6 +1415,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="trade the overnight book only if trailing mean CS IC >= this "
         "(flat otherwise). Used with --ic-gate-window.",
+    )
+    p.add_argument(
+        "--ic-scale-window",
+        type=int,
+        default=0,
+        help="soft trailing CS-IC gross scale window (0=off). Causal dates < t. "
+        "Different from --ic-gate-window (binary flatten). Not the live default.",
+    )
+    p.add_argument(
+        "--ic-scale-tau",
+        type=float,
+        default=0.0,
+        help="s_t = clip(trail_IC / tau, 0, 1). tau>0 required. Used with "
+        "--ic-scale-window. Full gross when trail >= tau; flat when trail <= 0.",
     )
     p.add_argument(
         "--weekday-mask",
@@ -1635,6 +1708,8 @@ def main(argv: list[str] | None = None) -> int:
         conf_pctile=float(getattr(args, "conf_pctile", 0.0) or 0.0),
         ic_gate_window=int(getattr(args, "ic_gate_window", 0) or 0),
         ic_gate_tau=float(getattr(args, "ic_gate_tau", 0.0) or 0.0),
+        ic_scale_window=int(getattr(args, "ic_scale_window", 0) or 0),
+        ic_scale_tau=float(getattr(args, "ic_scale_tau", 0.0) or 0.0),
         weekday_mask=str(getattr(args, "weekday_mask", "always") or "always"),
         disp_gate_kind=str(getattr(args, "disp_gate_kind", "") or ""),
         disp_gate_window=int(getattr(args, "disp_gate_window", 0) or 0),

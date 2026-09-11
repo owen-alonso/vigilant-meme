@@ -12,6 +12,7 @@ from forecast.backtest import (
     causal_disp_series,
     name_membership_churn,
     quantile_weights,
+    soft_ic_gross_scale,
     rank_weights,
     resize_long_only,
     sticky_long_step,
@@ -469,4 +470,51 @@ def test_name_membership_churn_is_zero_when_holdings_never_change():
     assert out["mean_name_churn"] == pytest.approx((0.5 + 0 + 0 + 0 + 0) / 5)
     assert out["mean_n_held"] == pytest.approx(2.0)
     assert out["sticky_coverage"] == pytest.approx(1.0)
+
+
+def test_soft_ic_gross_scale_clips_and_warmup_is_full():
+    assert soft_ic_gross_scale(0.04, 0.04) == pytest.approx(1.0)
+    assert soft_ic_gross_scale(0.02, 0.04) == pytest.approx(0.5)
+    assert soft_ic_gross_scale(-0.01, 0.04) == pytest.approx(0.0)
+    assert soft_ic_gross_scale(0.10, 0.04) == pytest.approx(1.0)
+    assert soft_ic_gross_scale(float("nan"), 0.04) == pytest.approx(1.0)
+    assert soft_ic_gross_scale(0.02, 0.0) == pytest.approx(1.0)
+
+
+def test_ic_scale_halves_gross_when_trail_is_half_tau():
+    dates = pd.bdate_range("2022-01-03", periods=40)
+    names = [f"S{i}" for i in range(10)]
+    pred = pd.DataFrame(
+        np.tile(np.linspace(-1, 1, 10), (40, 1)), index=dates, columns=names
+    )
+    realized = pred * 0.02
+    trail = pd.Series(0.02, index=dates)
+    always = book_pnl(
+        pred,
+        realized,
+        holding="overnight",
+        hold_halflife=0.0,
+        vol_target=0.0,
+        causal_vol=False,
+        long_only=True,
+        min_names=8,
+        round_trip_bps=0.0,
+    )
+    scaled = book_pnl(
+        pred,
+        realized,
+        holding="overnight",
+        hold_halflife=0.0,
+        vol_target=0.0,
+        causal_vol=False,
+        long_only=True,
+        min_names=8,
+        round_trip_bps=0.0,
+        ic_scale_window=20,
+        ic_scale_tau=0.04,
+        ic_scale_trail=trail,
+    )
+    assert scaled["mean_ic_scale"] == pytest.approx(0.5)
+    assert scaled["mean_gross"] == pytest.approx(0.5 * always["mean_gross"], rel=1e-6)
+    assert scaled["n_dates"] == always["n_dates"]
 

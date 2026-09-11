@@ -145,6 +145,9 @@ python scripts/overnight_shorting.py --data-dir data --universe liquid \\
 # IDEA 6: sticky long-only enter/exit (TRAIN-chosen; default off / always-rebuild q20)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only --sticky-q-enter 0.15 --sticky-q-exit 0.40
+# IDEA 7: soft trailing CS-IC gross scale (TRAIN-chosen; default off)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
+  --holding overnight --live-costs --long-only --ic-scale-window 20 --ic-scale-tau 0.04
 """
 
 
@@ -218,6 +221,9 @@ def _run_overnight_book(
     ic_gate_window: int = 0,
     ic_gate_tau: float = 0.0,
     ic_gate_trail: pd.Series | None = None,
+    ic_scale_window: int = 0,
+    ic_scale_tau: float = 0.0,
+    ic_scale_trail: pd.Series | None = None,
     weekday_mask: str = "always",
     disp_gate_trail: pd.Series | None = None,
     disp_gate_tau: float = float("nan"),
@@ -249,6 +255,9 @@ def _run_overnight_book(
         ic_gate_window=int(ic_gate_window or 0),
         ic_gate_tau=float(ic_gate_tau or 0.0),
         ic_gate_trail=ic_gate_trail,
+        ic_scale_window=int(ic_scale_window or 0),
+        ic_scale_tau=float(ic_scale_tau or 0.0),
+        ic_scale_trail=ic_scale_trail,
         weekday_mask=str(weekday_mask or "always"),
         disp_gate_trail=disp_gate_trail,
         disp_gate_tau=float(disp_gate_tau),
@@ -671,6 +680,9 @@ def _lo_q20_book(
     ic_gate_window: int = 0,
     ic_gate_tau: float = 0.0,
     ic_gate_trail: pd.Series | None = None,
+    ic_scale_window: int = 0,
+    ic_scale_tau: float = 0.0,
+    ic_scale_trail: pd.Series | None = None,
     weekday_mask: str = "always",
     disp_gate_trail: pd.Series | None = None,
     disp_gate_tau: float = float("nan"),
@@ -696,6 +708,9 @@ def _lo_q20_book(
         ic_gate_window=int(ic_gate_window),
         ic_gate_tau=float(ic_gate_tau),
         ic_gate_trail=ic_gate_trail,
+        ic_scale_window=int(ic_scale_window or 0),
+        ic_scale_tau=float(ic_scale_tau or 0.0),
+        ic_scale_trail=ic_scale_trail,
         weekday_mask=str(weekday_mask or "always"),
         disp_gate_trail=disp_gate_trail,
         disp_gate_tau=float(disp_gate_tau),
@@ -843,6 +858,146 @@ def decide_ic_gate_promote(
         "dd_delta": dd_delta,
         "coverage": cover,
         "cover_min_val": IC_GATE_COVER_VAL,
+        "ir_lift": LO_IR_LIFT,
+    }
+
+
+IC_SCALE_WINDOWS = (20, 60, 120)
+IC_SCALE_TAUS = (0.02, 0.04, 0.06, 0.08)
+
+
+def fit_ic_scale_on_train(
+    df: pd.DataFrame,
+    *,
+    min_names: int,
+    vol_target: float = 0.15,
+) -> dict[str, Any]:
+    """Select soft-scale (W, τ) on TRAIN only. VAL/TEST must never enter."""
+    empty = {"rows": [], "chosen": {}, "baseline": {}, "fit_split": "train"}
+    if df.empty:
+        return empty
+    pred, y, r_on, tz, vol = _wide_from_frame(df)
+    if pred.empty or pred.shape[1] < 2:
+        return empty
+    base = _lo_q20_book(
+        pred, y, min_names=min_names, vol_target=vol_target,
+        overnight_r=r_on, turnover_z=tz, vol_level=vol,
+    )
+    rows: list[dict[str, Any]] = []
+    chosen: dict[str, Any] = {}
+    best_ir = -1e18
+    for window in IC_SCALE_WINDOWS:
+        for tau in IC_SCALE_TAUS:
+            stats = _lo_q20_book(
+                pred, y, min_names=min_names, vol_target=vol_target,
+                overnight_r=r_on, turnover_z=tz, vol_level=vol,
+                ic_scale_window=window, ic_scale_tau=tau,
+            )
+            ir = _as_float(stats.get("unlevered_net_ir"))
+            row = {
+                "name": f"ic_scale_W{window}_t{tau:.2f}",
+                "window": window,
+                "tau": tau,
+                "unlevered_net_ir": stats.get("unlevered_net_ir"),
+                "unlevered_max_dd": stats.get("unlevered_max_dd"),
+                "mean_cost_unlev_bp": stats.get("mean_cost_unlev_bp"),
+                "mean_ic_scale": stats.get("mean_ic_scale"),
+                "ic_scale_n_partial": stats.get("ic_scale_n_partial"),
+                "ic_scale_n_flat": stats.get("ic_scale_n_flat"),
+            }
+            rows.append(row)
+            if not np.isfinite(ir):
+                continue
+            if ir > best_ir + 1e-12:
+                best_ir = ir
+                chosen = dict(row)
+    rows.sort(
+        key=lambda r: (
+            -_as_float(r.get("unlevered_net_ir"), default=-1e9),
+            str(r.get("name")),
+        )
+    )
+    return {
+        "rows": rows,
+        "chosen": chosen,
+        "baseline": {
+            "name": "live_long_only_q20",
+            "unlevered_net_ir": base.get("unlevered_net_ir"),
+            "unlevered_max_dd": base.get("unlevered_max_dd"),
+            "mean_cost_unlev_bp": base.get("mean_cost_unlev_bp"),
+            "mean_ic_scale": 1.0,
+        },
+        "fit_split": "train",
+        "note": (
+            "s_t = clip(trail_IC_{t-}/τ, 0, 1); trade every night; "
+            "NaN warmup = full gross. Causal dates < t only."
+        ),
+    }
+
+
+def decide_ic_scale_promote(
+    *,
+    val_always: dict[str, Any],
+    val_scaled: dict[str, Any],
+    chosen: dict[str, Any],
+) -> dict[str, Any]:
+    """VAL-only vs ungated q20. TEST never enters."""
+    ir_on = _as_float(val_always.get("unlevered_net_ir"))
+    ir_g = _as_float(val_scaled.get("unlevered_net_ir"))
+    dd_on = _as_float(val_always.get("unlevered_max_dd"))
+    dd_g = _as_float(val_scaled.get("unlevered_max_dd"))
+    ir_delta = (
+        float(ir_g - ir_on) if np.isfinite(ir_g) and np.isfinite(ir_on) else float("nan")
+    )
+    dd_delta = (
+        float(dd_g - dd_on) if np.isfinite(dd_g) and np.isfinite(dd_on) else float("nan")
+    )
+    have_spec = bool(chosen.get("window"))
+    ir_ok = bool(np.isfinite(ir_delta) and ir_delta >= LO_IR_LIFT)
+    dd_ok = bool(not np.isfinite(dd_delta) or dd_delta >= -LO_DD_TOL)
+    promote = bool(have_spec and ir_ok and dd_ok)
+    if not have_spec:
+        reason = (
+            "NO PROMOTE: TRAIN did not select a soft-scale (W, τ). "
+            "Keep ungated q20."
+        )
+    elif not ir_ok:
+        reason = (
+            f"NO PROMOTE: IC scale W={chosen.get('window')} τ={chosen.get('tau'):.2f} "
+            f"VAL unlev net IR {ir_g:+.3f} vs ungated {ir_on:+.3f} "
+            f"(delta {ir_delta:+.3f} < {LO_IR_LIFT:.2f}). Keep ungated q20."
+        )
+    elif not dd_ok:
+        reason = (
+            f"NO PROMOTE: IC scale IR lift {ir_delta:+.3f} but VAL max DD "
+            f"{dd_g:+.3f} vs ungated {dd_on:+.3f} exceeds {LO_DD_TOL:.2f}. "
+            "Keep ungated q20."
+        )
+    else:
+        reason = (
+            f"PROMOTE IC scale W={chosen.get('window')} τ={chosen.get('tau'):.2f}: "
+            f"VAL IR {ir_g:+.3f} vs {ir_on:+.3f} (delta {ir_delta:+.3f}), "
+            f"max DD {dd_g:+.3f} vs {dd_on:+.3f}, "
+            f"mean_s {_as_float(val_scaled.get('mean_ic_scale')):.2f}."
+        )
+    return {
+        "promote_ic_scale": promote,
+        "gated_on": "val",
+        "fit_split": "train",
+        "reason": reason,
+        "spec": (
+            {"window": chosen.get("window", 0), "tau": chosen.get("tau", 0.0)}
+            if promote
+            else {"window": 0, "tau": 0.0}
+        ),
+        "chosen": chosen,
+        "ir_always": ir_on,
+        "ir_scaled": ir_g,
+        "ir_delta": ir_delta,
+        "dd_always": dd_on,
+        "dd_scaled": dd_g,
+        "dd_delta": dd_delta,
+        "mean_ic_scale": _as_float(val_scaled.get("mean_ic_scale")),
         "ir_lift": LO_IR_LIFT,
     }
 
@@ -2150,6 +2305,65 @@ def evaluate_overnight_shorting(
     ic_promo = decide_ic_gate_promote(
         val_always=ic_val_always, val_gated=ic_val_gated, chosen=ic_chosen
     )
+    ics_fit = fit_ic_scale_on_train(
+        frames["train"], min_names=min_names, vol_target=vol_target
+    )
+    ics_chosen = ics_fit.get("chosen") or {}
+    ics_W = int(ics_chosen.get("window") or 0)
+    ics_tau = float(ics_chosen.get("tau") or 0.0)
+
+    def _scaled_lo(split: str, hist: tuple[str, ...], window: int, tau: float) -> dict[str, Any]:
+        if frames[split].empty:
+            return {}
+        pred, y, r_on, tz, vol = _wide_from_frame(frames[split])
+        if pred.empty or pred.shape[1] < 2:
+            return {}
+        trail = None
+        if window > 0:
+            parts_p = [
+                frame_to_wide(frames[s], "pred")
+                for s in hist
+                if s in frames and not frames[s].empty
+            ]
+            parts_y = [
+                frame_to_wide(frames[s], "y")
+                for s in hist
+                if s in frames and not frames[s].empty
+            ]
+            if parts_p and parts_y:
+                hp = pd.concat(parts_p).sort_index().groupby(level=0).last()
+                hy = pd.concat(parts_y).sort_index().groupby(level=0).last()
+                trail = trailing_mean_cs_ic(
+                    hp, hy, window=window, min_names=min_names
+                )
+        return _lo_q20_book(
+            pred,
+            y,
+            min_names=min_names,
+            vol_target=vol_target,
+            overnight_r=r_on,
+            turnover_z=tz,
+            vol_level=vol,
+            ic_scale_window=window,
+            ic_scale_tau=tau,
+            ic_scale_trail=trail,
+        )
+
+    ics_val_always = _scaled_lo("val", ("train", "val"), 0, 0.0)
+    ics_val_scaled = (
+        _scaled_lo("val", ("train", "val"), ics_W, ics_tau)
+        if ics_W
+        else dict(ics_val_always)
+    )
+    ics_test_always = _scaled_lo("test", ("train", "val", "test"), 0, 0.0)
+    ics_test_scaled = (
+        _scaled_lo("test", ("train", "val", "test"), ics_W, ics_tau)
+        if ics_W
+        else dict(ics_test_always)
+    )
+    ics_promo = decide_ic_scale_promote(
+        val_always=ics_val_always, val_scaled=ics_val_scaled, chosen=ics_chosen
+    )
     disp_fit = fit_disp_gate_on_train(
         frames["train"], min_names=min_names, vol_target=vol_target
     )
@@ -2534,6 +2748,12 @@ def evaluate_overnight_shorting(
         "ic_gate_val_gated": ic_val_gated,
         "ic_gate_test_always": ic_test_always,
         "ic_gate_test_gated": ic_test_gated,
+        "ic_scale_fit": ics_fit,
+        "ic_scale_promotion": ics_promo,
+        "ic_scale_val_always": ics_val_always,
+        "ic_scale_val_scaled": ics_val_scaled,
+        "ic_scale_test_always": ics_test_always,
+        "ic_scale_test_scaled": ics_test_scaled,
         "disp_gate_fit": disp_fit,
         "disp_gate_promotion": disp_promo,
         "disp_gate_val_always": disp_val_always,
@@ -2584,6 +2804,8 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
         f"  {(payload.get('lo_refine_promotion') or {}).get('reason')}",
         "",
         _ic_gate_block(payload),
+        "",
+        _ic_scale_block(payload),
         "",
         _disp_gate_block(payload),
         "",
@@ -2673,6 +2895,45 @@ def _ic_gate_block(payload: dict[str, Any]) -> str:
         f"maxDD {_fmt(tg.get('unlevered_max_dd'), '+.3f')}  "
         f"cover {_cov(tg.get('ic_gate_coverage'))}  (report-only)",
     ]
+    return "\n".join(lines)
+
+
+def _ic_scale_block(payload: dict[str, Any]) -> str:
+    promo = payload.get("ic_scale_promotion") or {}
+    fit = payload.get("ic_scale_fit") or {}
+    chosen = fit.get("chosen") or promo.get("chosen") or {}
+    va = payload.get("ic_scale_val_always") or {}
+    vs = payload.get("ic_scale_val_scaled") or {}
+    ta = payload.get("ic_scale_test_always") or {}
+    ts = payload.get("ic_scale_test_scaled") or {}
+    lines = [
+        f"PROMOTE IC-SCALE? {'YES' if promo.get('promote_ic_scale') else 'NO'}",
+        f"  {fit.get('note')}",
+        f"  TRAIN chose W={chosen.get('window')} τ={chosen.get('tau')}  "
+        f"mean_s {_fmt(chosen.get('mean_ic_scale'), '.2f')}  "
+        f"(fit_split={fit.get('fit_split')})",
+        f"  {promo.get('reason')}",
+        f"  VAL ungated    IR {_fmt(va.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(va.get('unlevered_max_dd'), '+.3f')}",
+        f"  VAL scaled     IR {_fmt(vs.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(vs.get('unlevered_max_dd'), '+.3f')}  "
+        f"mean_s {_fmt(vs.get('mean_ic_scale'), '.2f')}  "
+        f"partial {int(_as_float(vs.get('ic_scale_n_partial'), 0.0))}/"
+        f"{int(_as_float(vs.get('ic_scale_n_dates'), 0.0))}",
+        f"  TEST ungated   IR {_fmt(ta.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(ta.get('unlevered_max_dd'), '+.3f')}  (report-only)",
+        f"  TEST scaled    IR {_fmt(ts.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(ts.get('unlevered_max_dd'), '+.3f')}  "
+        f"mean_s {_fmt(ts.get('mean_ic_scale'), '.2f')}  (report-only)",
+        "  TRAIN (W, τ) grid (fit):",
+    ]
+    for row in list(fit.get("rows") or [])[:8]:
+        lines.append(
+            f"  {str(row.get('name') or ''):22} "
+            f"IR {_fmt(row.get('unlevered_net_ir'), '+.3f')}  "
+            f"maxDD {_fmt(row.get('unlevered_max_dd'), '+.3f')}  "
+            f"mean_s {_fmt(row.get('mean_ic_scale'), '.2f')}"
+        )
     return "\n".join(lines)
 
 

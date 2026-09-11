@@ -14,6 +14,7 @@ from forecast.shorting import (
     IR_LIFT,
     SHORT_EXCESS_LIFT_PP,
     decide_ic_gate_promote,
+    decide_ic_scale_promote,
     decide_lo_promote,
     decide_weekday_promote,
     decide_sector_promote,
@@ -282,6 +283,32 @@ def test_decide_ic_gate_promote_is_val_only_and_needs_coverage():
 
     no_fit = decide_ic_gate_promote(val_always=always, val_gated=gated, chosen={})
     assert no_fit["promote_ic_gate"] is False
+
+
+def test_decide_ic_scale_promote_is_val_only():
+    always = {"unlevered_net_ir": 1.0, "unlevered_max_dd": -0.20}
+    scaled = {
+        "unlevered_net_ir": 1.20,
+        "unlevered_max_dd": -0.18,
+        "mean_ic_scale": 0.7,
+    }
+    juicy_test = {"unlevered_net_ir": 9.9}
+    yes = decide_ic_scale_promote(
+        val_always=always,
+        val_scaled=scaled,
+        chosen={"window": 20, "tau": 0.04},
+    )
+    assert yes["promote_ic_scale"] is True
+    assert yes["gated_on"] == "val"
+    assert juicy_test["unlevered_net_ir"] > yes["ir_scaled"]
+
+    no = decide_ic_scale_promote(
+        val_always=always,
+        val_scaled={**scaled, "unlevered_net_ir": 1.01},
+        chosen={"window": 20, "tau": 0.04},
+    )
+    assert no["promote_ic_scale"] is False
+    assert no["spec"]["window"] == 0
 
 
 def test_decide_weekday_promote_is_val_only_and_needs_coverage():
@@ -661,6 +688,9 @@ def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
     assert payload["lo_refine_promotion"]["gated_on"] == "val"
     assert payload["ic_gate_fit"]["fit_split"] == "train"
     assert payload["ic_gate_promotion"]["gated_on"] == "val"
+    assert payload["ic_scale_fit"]["fit_split"] == "train"
+    assert payload["ic_scale_promotion"]["gated_on"] == "val"
+    assert "PROMOTE IC-SCALE" in text
     assert payload["weekday_promotion"]["gated_on"] == "val"
     assert payload["sector_promotion"]["gated_on"] == "val"
     assert payload["sector_compare"]["n_sector_hedges"] > 0
