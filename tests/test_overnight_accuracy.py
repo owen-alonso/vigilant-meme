@@ -15,6 +15,7 @@ from forecast.accuracy import (
     apply_cond_dir_blend,
     apply_cs_left_veto,
     apply_decile_reliability,
+    apply_logistic_up,
     apply_drift_veto,
     apply_readout,
     cond_abs_mask,
@@ -22,6 +23,7 @@ from forecast.accuracy import (
     fit_confidence_blend,
     fit_cs_left_veto,
     fit_decile_reliability,
+    fit_logistic_up,
     fit_left_tail_l1,
     direction_hits,
     evaluate_overnight_accuracy,
@@ -248,6 +250,7 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert "cond_dir_blend" in names
     assert "decile_reliability" in names
     assert "cs_left_veto" in names
+    assert "logistic_up" in names
     promo = payload["promotion"]
     assert promo["cs_skip_unchanged"] is True
     # Promotion is VAL-only; test keys exist for the report but are not the gate.
@@ -492,6 +495,22 @@ def test_cs_left_veto_is_train_only_and_requires_cs_bottom():
     not_bottom = pct.to_numpy() > float(spec["q"])
     if int(not_bottom.sum()) >= 4:
         assert np.allclose(hat[not_bottom], spec["b_up"])
+
+
+def test_logistic_up_is_train_only():
+    rng = np.random.default_rng(8)
+    train_p = rng.normal(scale=0.01, size=500)
+    train_y = 0.8 * train_p + 0.001 + rng.normal(scale=0.002, size=500)
+    spec = fit_logistic_up(train_p, train_y)
+    later_p = rng.normal(loc=0.05, scale=0.02, size=200)
+    later_y = -later_p
+    leaked = fit_logistic_up(later_p, later_y)
+    assert spec["tau"] in (0.46, 0.48, 0.50, 0.52, 0.54, 0.56, 0.58, 0.60)
+    assert abs(float(spec["a"]) - float(leaked["a"])) > 0.1
+    hat = apply_logistic_up(train_p, spec["a"], spec["b"], spec["tau"], spec["mag"])
+    cal = apply_calibrate_spec(train_p, {"kind": "logistic_up", **spec})
+    assert np.allclose(hat, cal)
+    assert spec["mag"] > 0
 
 
 def test_apply_calibrate_spec_affine_and_veto():
