@@ -1314,6 +1314,13 @@ def fit_ridge_readout(
     rank_target: bool = False,
     feature_mask_bool: np.ndarray | None = None,
     date_halflife: float = 0.0,
+    y_winsor: float = 0.0,
+    feat_winsor: float = 0.0,
+    drop_disp_q: float = 0.0,
+    huber_delta: float = 0.0,
+    sign_constrain: bool = False,
+    drop_crashes: bool = False,
+    exclude_dates: set[int] | None = None,
 ) -> tuple[np.ndarray, float, float]:
     """Train-only ridge of target on normalized features. Returns weight, bias, IC.
 
@@ -1335,4 +1342,11 @@ def fit_ridge_readout(
         rank_target=rank_target,
         feature_mask_bool=feature_mask_bool,
         date_halflife=date_halflife,
+        y_winsor=y_winsor,
+        feat_winsor=feat_winsor,
+        drop_disp_q=drop_disp_q,
+        huber_delta=huber_delta,
+        sign_constrain=sign_constrain,
+        drop_crashes=drop_crashes,
+        exclude_dates=exclude_dates,
     )

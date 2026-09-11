@@ -44,7 +44,7 @@ from forecast.config import (
     interval_model_kwargs,
     validate_loss_head,
 )
-from forecast.data import FEATURE_NAMES, build_datasets, collate_forecast, fit_ridge_readout
+from forecast.data import FEATURE_NAMES, build_datasets, collate_forecast
 from forecast.model import ReturnForecaster
 from forecast.ridge import feature_mask, labelled_rows, walk_forward_predict, cs_stats
 from mamba_lm.model import format_dynamic_diagnostics
@@ -689,19 +689,19 @@ def apply_ridge_skip(
     """Copy a train-only ridge readout into ``model.skip``. Returns in-sample IC."""
     if (not model.config.linear_skip) or float(train_cfg.ridge_skip) <= 0:
         return float("nan")
-    weights, bias, ic = fit_ridge_readout(
+    from forecast.ridge import fit_skip_xy, labelled_rows
+
+    x, y, dates = labelled_rows(
         bundle["train_symbols"],
         bundle["feature_mean"],
         bundle["feature_std"],
-        ridge=float(train_cfg.ridge_skip),
-        cs_demean=bool(train_cfg.ridge_cs_demean),
+    )
+    weights, bias, ic = fit_skip_xy(
+        x,
+        y,
+        dates,
+        train_cfg,
         min_names=int(bundle.get("cs_min_names", 8)),
-        cs_zscore=bool(getattr(train_cfg, "ridge_cs_zscore", False)),
-        rank_target=bool(getattr(train_cfg, "ridge_rank_target", False)),
-        feature_mask_bool=feature_mask(
-            str(getattr(train_cfg, "ridge_features", "all") or "all")
-        ),
-        date_halflife=float(getattr(train_cfg, "ridge_date_halflife", 0.0) or 0.0),
     )
     with torch.no_grad():
         model.skip.weight.copy_(
@@ -781,6 +781,8 @@ def _train(
             f"dynamic_weights={model_cfg.dynamic_weights} "
             f"loss={train_cfg.loss} ic_loss_weight={train_cfg.ic_loss_weight} "
             f"ridge_skip={train_cfg.ridge_skip} "
+            f"ridge_rank_target={train_cfg.ridge_rank_target} "
+            f"ridge_objective={getattr(train_cfg, 'ridge_objective', 'ridge')} "
             f"heteroscedastic={model_cfg.heteroscedastic}"
         )
         autocast_context(device, train_cfg.precision, log_fn=log_fn)
@@ -883,6 +885,32 @@ def _train(
                     f"test cs_ic={test.get('cs_ic', float('nan')):+.4f} "
                     f"t={test.get('cs_ic_tstat', float('nan')):.2f}"
                 )
+        year_rows: dict[str, list[dict[str, float]]] = {}
+        if model.config.linear_skip:
+            from forecast.ridge import labelled_rows as _rows
+            from forecast.ridge import year_cs_ics
+
+            w = model.skip.weight.detach().cpu().numpy().reshape(-1).astype(np.float64)
+            b = float(model.skip.bias.detach().cpu().numpy().reshape(-1)[0])
+            for split in ("val", "test"):
+                xs, ys, ds = _rows(
+                    bundle[f"{split}_symbols"],
+                    bundle["feature_mean"],
+                    bundle["feature_std"],
+                )
+                if xs.size == 0:
+                    continue
+                pred = xs @ w + b
+                year_rows[split] = year_cs_ics(
+                    pred, ys, ds, min_names=int(bundle.get("cs_min_names", 8))
+                )
+                if log_fn:
+                    for row in year_rows[split]:
+                        log_fn(
+                            f"  {split} {int(row['year'])}: "
+                            f"cs_ic={row['cs_ic']:+.4f} t={row['cs_ic_tstat']:.2f} "
+                            f"n={int(row['cs_n_dates'])}"
+                        )
 
     if train_cfg.skip_only:
         save(ckpt_dir / "best.pt", 0, skip_only_val)
@@ -897,6 +925,7 @@ def _train(
             "skip_only_val": skip_only_val,
             "skip_only_test": skip_only_test,
             "walk_forward": walk_forward,
+            "cs_ic_by_year": year_rows,
             "interrupted": False,
             "last_step": 0,
             "n_params": n_params,
@@ -1310,14 +1339,54 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "--ridge-features",
         default="all",
-        choices=("all", "cs", "no_calendar"),
-        help="mask skip features: all, CS-only, or drop calendar/tod columns",
+        choices=("all", "cs", "no_calendar", "no_long_ts", "no_ohlc", "core"),
+        help="mask skip features: all, CS-only, drop calendar/long-TS/OHLC, or core",
     )
     g.add_argument(
         "--ridge-date-halflife",
         type=float,
         default=t.ridge_date_halflife,
         help="exp recency half-life in days for frozen ridge (0 = uniform)",
+    )
+    g.add_argument(
+        "--ridge-objective",
+        default=t.ridge_objective,
+        choices=("ridge", "listnet", "ranknet"),
+        help="frozen skip fitter: closed-form ridge or linear ListNet/RankNet",
+    )
+    g.add_argument(
+        "--ridge-y-winsor",
+        type=float,
+        default=t.ridge_y_winsor,
+        help="clip raw y at +/- k date-std before value-target ridge (0=off)",
+    )
+    g.add_argument(
+        "--ridge-feat-winsor",
+        type=float,
+        default=t.ridge_feat_winsor,
+        help="clip features at +/- k date-std in the skip design (0=off)",
+    )
+    g.add_argument(
+        "--ridge-drop-disp-q",
+        type=float,
+        default=t.ridge_drop_disp_q,
+        help="drop top quantile of train dates by residual std (0=off)",
+    )
+    g.add_argument(
+        "--ridge-huber",
+        type=float,
+        default=t.ridge_huber,
+        help="Huber IRLS delta in MAD units for the skip (0=closed-form)",
+    )
+    g.add_argument(
+        "--ridge-sign-constrain",
+        action="store_true",
+        help="zero skip weights that flip the train univariate CS IC sign",
+    )
+    g.add_argument(
+        "--ridge-drop-crashes",
+        action="store_true",
+        help="drop dot-com and GFC dates from the frozen skip fit",
     )
     g.add_argument(
         "--listnet-loss-weight",
@@ -1435,6 +1504,13 @@ def configs_from_cli(
         ridge_cs_zscore=args.ridge_cs_zscore,
         ridge_features=args.ridge_features,
         ridge_date_halflife=args.ridge_date_halflife,
+        ridge_objective=args.ridge_objective,
+        ridge_y_winsor=args.ridge_y_winsor,
+        ridge_feat_winsor=args.ridge_feat_winsor,
+        ridge_drop_disp_q=args.ridge_drop_disp_q,
+        ridge_huber=args.ridge_huber,
+        ridge_sign_constrain=args.ridge_sign_constrain,
+        ridge_drop_crashes=args.ridge_drop_crashes,
         listnet_loss_weight=args.listnet_loss_weight,
         sigma_aux_weight=(
             0.0

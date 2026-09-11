@@ -316,6 +316,20 @@ class ForecastTrainConfig:
     ridge_features: str = "all"
     # Exponential recency weights on train dates (0 = uniform).
     ridge_date_halflife: float = 0.0
+    # Winsorize raw y within date before the ridge (ignored when rank_target).
+    ridge_y_winsor: float = 0.0
+    # Winsorize features within date (in residual-std units).
+    ridge_feat_winsor: float = 0.0
+    # Drop the top this fraction of train dates by residual dispersion.
+    ridge_drop_disp_q: float = 0.0
+    # Huber IRLS delta in MAD units (0 = closed-form ridge only).
+    ridge_huber: float = 0.0
+    # Zero weights that flip the train univariate CS IC sign.
+    ridge_sign_constrain: bool = False
+    # Drop dot-com + GFC dates from the frozen skip fit.
+    ridge_drop_crashes: bool = False
+    # ``ridge`` / ``listnet`` / ``ranknet`` skip objective.
+    ridge_objective: str = "ridge"
     # ListNet (softmax CE) within date. 0 keeps RankNet-only ranking.
     listnet_loss_weight: float = 0.0
     # Residual-std head. Trained by gaussian NLL, or by sigma_aux_weight when

@@ -21,13 +21,23 @@ if str(_REPO_ROOT) not in sys.path:
 import numpy as np
 
 from forecast.config import DataConfig, interval_data_kwargs
-from forecast.data import build_datasets
+from forecast.data import FEATURE_NAMES, build_datasets
 from forecast.ridge import (
+    augment_cs_products,
     cs_stats,
     feature_mask,
+    fit_listnet_xy,
+    fit_ranknet_xy,
+    fit_regime_ridge,
+    fit_residual_mlp,
     fit_ridge_xy,
     labelled_rows,
+    predict_regime,
+    predict_residual_mlp,
+    stable_feature_mask,
+    univariate_cs_ics,
     walk_forward_predict,
+    year_cs_ics,
 )
 
 
@@ -89,6 +99,18 @@ def _eval(pred: np.ndarray, y: np.ndarray, d: np.ndarray, min_names: int) -> dic
     return cs_stats(pred[sel], y[sel], d[sel], min_names=min_names)
 
 
+def _train_slice(
+    cache: dict[str, Any], train_from_days: int | None
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    x_tr = cache["train_x"].astype(np.float64)
+    y_tr = cache["train_y"].astype(np.float64)
+    d_tr = cache["train_d"].astype(np.int64)
+    if train_from_days is not None:
+        keep = d_tr >= int(train_from_days)
+        x_tr, y_tr, d_tr = x_tr[keep], y_tr[keep], d_tr[keep]
+    return x_tr, y_tr, d_tr
+
+
 def _frozen(
     cache: dict[str, Any],
     *,
@@ -98,14 +120,17 @@ def _frozen(
     cs_zscore: bool,
     mask_mode: str,
     date_halflife: float,
+    y_winsor: float = 0.0,
+    feat_winsor: float = 0.0,
+    drop_disp_q: float = 0.0,
+    huber_delta: float = 0.0,
+    sign_constrain: bool = False,
+    drop_crashes: bool = False,
+    feature_mask_bool: np.ndarray | None = None,
 ) -> dict[str, Any]:
     min_names = int(cache["cs_min_names"])
-    x_tr = cache["train_x"].astype(np.float64)
-    y_tr = cache["train_y"].astype(np.float64)
-    d_tr = cache["train_d"].astype(np.int64)
-    if train_from_days is not None:
-        keep = d_tr >= int(train_from_days)
-        x_tr, y_tr, d_tr = x_tr[keep], y_tr[keep], d_tr[keep]
+    x_tr, y_tr, d_tr = _train_slice(cache, train_from_days)
+    mask = feature_mask(mask_mode) if feature_mask_bool is None else feature_mask_bool
     w, b, train_ic = fit_ridge_xy(
         x_tr,
         y_tr,
@@ -115,8 +140,14 @@ def _frozen(
         cs_demean=True,
         cs_zscore=cs_zscore,
         rank_target=rank_target,
-        feature_mask_bool=feature_mask(mask_mode),
+        feature_mask_bool=mask,
         date_halflife=date_halflife,
+        y_winsor=y_winsor,
+        feat_winsor=feat_winsor,
+        drop_disp_q=drop_disp_q,
+        huber_delta=huber_delta,
+        sign_constrain=sign_constrain,
+        drop_crashes=drop_crashes,
     )
     row: dict[str, Any] = {"train_is_cs_ic": train_ic, "n_train": int(y_tr.size)}
     for split in ("val", "test"):
@@ -124,8 +155,9 @@ def _frozen(
         y = cache[f"{split}_y"].astype(np.float64)
         d = cache[f"{split}_d"].astype(np.int64)
         pred = x @ w.astype(np.float64) + b
-        stats = cs_stats(pred, y, d, min_names=min_names)
-        row[split] = stats
+        row[split] = cs_stats(pred, y, d, min_names=min_names)
+    row["_w"] = w
+    row["_b"] = b
     return row
 
 
@@ -171,21 +203,40 @@ def main(argv: list[str] | None = None) -> int:
         ("frozen_hl504", dict(train_from_days=ymd(1999), date_halflife=504.0)),
         ("frozen_hl1260", dict(train_from_days=ymd(1999), date_halflife=1260.0)),
         ("frozen_2004_rank_cs", dict(train_from_days=ymd(2004), rank_target=True, mask_mode="cs")),
+        ("frozen_rank_lam10", dict(train_from_days=ymd(1999), rank_target=True, ridge=10.0)),
+        ("frozen_rank_lam100", dict(train_from_days=ymd(1999), rank_target=True, ridge=100.0)),
+        ("frozen_rank_huber", dict(train_from_days=ymd(1999), rank_target=True, ridge=10.0, huber_delta=1.0)),
+        ("frozen_rank_crashes", dict(train_from_days=ymd(1999), rank_target=True, ridge=10.0, drop_crashes=True)),
+        ("frozen_rank_sign", dict(train_from_days=ymd(1999), rank_target=True, ridge=10.0, sign_constrain=True)),
+        ("frozen_rank_disp10", dict(train_from_days=ymd(1999), rank_target=True, ridge=10.0, drop_disp_q=0.10)),
+        ("frozen_rank_fwinsor", dict(train_from_days=ymd(1999), rank_target=True, ridge=10.0, feat_winsor=3.0)),
+        ("frozen_rank_core", dict(train_from_days=ymd(1999), rank_target=True, ridge=10.0, mask_mode="core")),
+        ("frozen_rank_nolong", dict(train_from_days=ymd(1999), rank_target=True, ridge=10.0, mask_mode="no_long_ts")),
+        ("frozen_rank_noohlc", dict(train_from_days=ymd(1999), rank_target=True, ridge=10.0, mask_mode="no_ohlc")),
+        ("frozen_value_winsor", dict(train_from_days=ymd(1999), rank_target=False, ridge=10.0, y_winsor=3.0)),
     ]
     base = dict(ridge=1.0, rank_target=False, cs_zscore=False, mask_mode="all", date_halflife=0.0)
     print(f"{'case':<28} {'val':>8} {'val_t':>7} {'test':>8} {'test_t':>7} {'ntr':>8}")
-    for name, kw in frozen_cases:
-        cfg = {**base, **kw}
-        stats = _frozen(cache, **cfg)
+    def _public(row: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in row.items() if not str(k).startswith("_")}
+
+    def _emit(stats: dict[str, Any], name: str, kind: str) -> dict[str, Any]:
+        stats = dict(stats)
         stats["name"] = name
-        stats["kind"] = "frozen"
-        rows.append(stats)
+        stats["kind"] = kind
+        rows.append(_public(stats))
         val, test = stats["val"], stats["test"]
+        ntr = stats.get("n_train", "na")
         print(
             f"{name:<28} {val['cs_ic']:+8.4f} {val['cs_ic_tstat']:7.2f} "
-            f"{test['cs_ic']:+8.4f} {test['cs_ic_tstat']:7.2f} {stats['n_train']:8d}",
+            f"{test['cs_ic']:+8.4f} {test['cs_ic_tstat']:7.2f} {ntr:>8}",
             flush=True,
         )
+        return stats
+
+    for name, kw in frozen_cases:
+        cfg = {**base, **kw}
+        _emit(_frozen(cache, **cfg), name, "frozen")
 
     x = np.concatenate([cache["train_x"], cache["val_x"], cache["test_x"]], axis=0).astype(np.float64)
     y = np.concatenate([cache["train_y"], cache["val_y"], cache["test_y"]], axis=0).astype(np.float64)
@@ -220,19 +271,209 @@ def main(argv: list[str] | None = None) -> int:
         val_sel = np.isin(d, val_dates)
         test_sel = np.isin(d, test_dates)
         stats = {
-            "name": name,
-            "kind": "walk_forward",
             "lookback_days": lookback,
             "val": _eval(pred[val_sel], y[val_sel], d[val_sel], min_names),
             "test": _eval(pred[test_sel], y[test_sel], d[test_sel], min_names),
         }
-        rows.append(stats)
-        val, test = stats["val"], stats["test"]
-        print(
-            f"{name:<28} {val['cs_ic']:+8.4f} {val['cs_ic_tstat']:7.2f} "
-            f"{test['cs_ic']:+8.4f} {test['cs_ic_tstat']:7.2f} {'wf':>8}",
-            flush=True,
+        _emit(stats, name, "walk_forward")
+
+    # --- round 2: ranking objectives, stable mask, regime, residual, products ---
+    x_tr, y_tr, d_tr = _train_slice(cache, ymd(1999))
+    uni_tr = univariate_cs_ics(x_tr, y_tr, d_tr, min_names=min_names)
+    uni_va = univariate_cs_ics(
+        cache["val_x"].astype(np.float64),
+        cache["val_y"].astype(np.float64),
+        cache["val_d"].astype(np.int64),
+        min_names=min_names,
+    )
+    print("univariate CS IC train vs val:", flush=True)
+    for i, name in enumerate(FEATURE_NAMES):
+        print(f"  {name:<14} train={uni_tr[i]:+.4f} val={uni_va[i]:+.4f}", flush=True)
+    x_va = cache["val_x"].astype(np.float64)
+    y_va = cache["val_y"].astype(np.float64)
+    d_va = cache["val_d"].astype(np.int64)
+    x_te = cache["test_x"].astype(np.float64)
+    y_te = cache["test_y"].astype(np.float64)
+    d_te = cache["test_d"].astype(np.int64)
+
+    def _score_w(w: np.ndarray, b: float = 0.0) -> dict[str, Any]:
+        return {
+            "n_train": int(y_tr.size),
+            "val": cs_stats(x_va @ w + b, y_va, d_va, min_names=min_names),
+            "test": cs_stats(x_te @ w + b, y_te, d_te, min_names=min_names),
+        }
+
+    w_ln, b_ln, ic_ln = fit_listnet_xy(
+        x_tr, y_tr, d_tr, ridge=10.0, min_names=min_names, rank_target=True
+    )
+    row = _score_w(w_ln.astype(np.float64), b_ln)
+    row["train_is_cs_ic"] = ic_ln
+    _emit(row, "listnet_rank_lam10", "listnet")
+
+    w_rn, b_rn, ic_rn = fit_ranknet_xy(
+        x_tr, y_tr, d_tr, ridge=10.0, min_names=min_names, rank_target=True, steps=80
+    )
+    row = _score_w(w_rn.astype(np.float64), b_rn)
+    row["train_is_cs_ic"] = ic_rn
+    _emit(row, "ranknet_rank_lam10", "ranknet")
+
+    keep = stable_feature_mask(x_tr, y_tr, d_tr, x_va, y_va, d_va, min_names=min_names)
+    row = _frozen(
+        cache,
+        train_from_days=ymd(1999),
+        ridge=10.0,
+        rank_target=True,
+        cs_zscore=False,
+        mask_mode="all",
+        date_halflife=0.0,
+        feature_mask_bool=keep,
+    )
+    row["n_keep"] = int(keep.sum())
+    _emit(row, "frozen_rank_stable", "frozen")
+
+    names = list(FEATURE_NAMES)
+    mkt_i = names.index("mkt_ret_1") if "mkt_ret_1" in names else 0
+    vol_i = names.index("vol_level") if "vol_level" in names else 0
+    for tag, col in (("mktabs", mkt_i), ("vol", vol_i)):
+        w_lo, w_hi, split, tr_ic = fit_regime_ridge(
+            x_tr, y_tr, d_tr, x_tr[:, col], ridge=10.0, min_names=min_names, rank_target=True
         )
+        pred_va = predict_regime(x_va, d_va, x_va[:, col], w_lo, w_hi, split)
+        pred_te = predict_regime(x_te, d_te, x_te[:, col], w_lo, w_hi, split)
+        _emit(
+            {
+                "train_is_cs_ic": tr_ic,
+                "n_train": int(y_tr.size),
+                "split": split,
+                "val": cs_stats(pred_va, y_va, d_va, min_names=min_names),
+                "test": cs_stats(pred_te, y_te, d_te, min_names=min_names),
+            },
+            f"regime_{tag}",
+            "regime",
+        )
+
+    pair_names = [n for n in ("cs_ret_1", "cs_rank_1", "cs_vol", "idio_sector") if n in names]
+    cols = [names.index(n) for n in pair_names]
+    x_tr_i = augment_cs_products(x_tr, cols)
+    x_va_i = augment_cs_products(x_va, cols)
+    x_te_i = augment_cs_products(x_te, cols)
+    w_i, b_i, ic_i = fit_ridge_xy(
+        x_tr_i, y_tr, d_tr, ridge=10.0, min_names=min_names, rank_target=True
+    )
+    _emit(
+        {
+            "train_is_cs_ic": ic_i,
+            "n_train": int(y_tr.size),
+            "val": cs_stats(x_va_i @ w_i + b_i, y_va, d_va, min_names=min_names),
+            "test": cs_stats(x_te_i @ w_i + b_i, y_te, d_te, min_names=min_names),
+        },
+        "frozen_rank_products",
+        "frozen",
+    )
+
+    base_fit = _frozen(
+        cache,
+        train_from_days=ymd(1999),
+        ridge=10.0,
+        rank_target=True,
+        cs_zscore=False,
+        mask_mode="all",
+        date_halflife=0.0,
+    )
+    w0 = base_fit["_w"].astype(np.float64)
+    pred_tr = x_tr @ w0
+    resid = y_tr - pred_tr
+    w1, b1, w2 = fit_residual_mlp(x_tr, resid, d_tr, hidden=8, ridge=25.0, steps=160)
+    resid_va = predict_residual_mlp(x_va, d_va, w1, b1, w2)
+    resid_te = predict_residual_mlp(x_te, d_te, w1, b1, w2)
+    skip_va = x_va @ w0
+    skip_te = x_te @ w0
+    best_a, best_val = 0.0, -1e9
+    for a in (0.0, 0.15, 0.3, 0.5, 0.8, 1.0):
+        st = cs_stats(skip_va + a * resid_va, y_va, d_va, min_names=min_names)
+        if st["cs_ic"] > best_val:
+            best_val = float(st["cs_ic"])
+            best_a = a
+    _emit(
+        {
+            "n_train": int(y_tr.size),
+            "blend": best_a,
+            "val": cs_stats(skip_va + best_a * resid_va, y_va, d_va, min_names=min_names),
+            "test": cs_stats(skip_te + best_a * resid_te, y_te, d_te, min_names=min_names),
+        },
+        f"ensemble_mlp_a{best_a:.2f}",
+        "ensemble",
+    )
+
+    # Greedy drop of one feature at a time on val (start from rank+lam10).
+    mask = np.ones(x_tr.shape[1], dtype=bool)
+    best_mask = mask.copy()
+    best_val_ic = float(base_fit["val"]["cs_ic"])
+    improved = True
+    while improved:
+        improved = False
+        cand_best = best_val_ic
+        cand_j = -1
+        for j in np.flatnonzero(best_mask):
+            trial = best_mask.copy()
+            trial[j] = False
+            if not bool(trial.any()):
+                continue
+            w, b, _ = fit_ridge_xy(
+                x_tr,
+                y_tr,
+                d_tr,
+                ridge=10.0,
+                min_names=min_names,
+                rank_target=True,
+                feature_mask_bool=trial,
+            )
+            st = cs_stats(x_va @ w + b, y_va, d_va, min_names=min_names)
+            if st["cs_ic"] > cand_best + 1e-5:
+                cand_best = float(st["cs_ic"])
+                cand_j = int(j)
+        if cand_j >= 0:
+            best_mask[cand_j] = False
+            best_val_ic = cand_best
+            improved = True
+    w_g, b_g, ic_g = fit_ridge_xy(
+        x_tr, y_tr, d_tr, ridge=10.0, min_names=min_names, rank_target=True, feature_mask_bool=best_mask
+    )
+    dropped = [names[j] for j, keep in enumerate(best_mask) if not keep]
+    _emit(
+        {
+            "train_is_cs_ic": ic_g,
+            "n_train": int(y_tr.size),
+            "dropped": dropped,
+            "val": cs_stats(x_va @ w_g + b_g, y_va, d_va, min_names=min_names),
+            "test": cs_stats(x_te @ w_g + b_g, y_te, d_te, min_names=min_names),
+        },
+        "greedy_drop_val",
+        "frozen",
+    )
+
+    promoted = _frozen(
+        cache,
+        train_from_days=ymd(1999),
+        ridge=10.0,
+        rank_target=True,
+        cs_zscore=False,
+        mask_mode="all",
+        date_halflife=0.0,
+    )
+    years = {
+        "val": year_cs_ics(x_va @ promoted["_w"] + promoted["_b"], y_va, d_va, min_names=min_names),
+        "test": year_cs_ics(x_te @ promoted["_w"] + promoted["_b"], y_te, d_te, min_names=min_names),
+    }
+    print("year CS IC (rank+lam10):", flush=True)
+    for split in ("val", "test"):
+        for row in years[split]:
+            print(
+                f"  {split} {int(row['year'])}: cs_ic={row['cs_ic']:+.4f} "
+                f"t={row['cs_ic_tstat']:.2f} n={int(row['cs_n_dates'])}",
+                flush=True,
+            )
+    rows.append({"name": "year_cs_ic_rank_lam10", "kind": "diagnostic", **years})
 
     out_path = Path(args.out)
     out_path.write_text(json.dumps(rows, indent=2, default=str))
