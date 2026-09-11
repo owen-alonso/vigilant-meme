@@ -53,7 +53,13 @@ python -m forecast.download --universe liquid --source yahoo --replace --interva
 
 ```bash
 python -m forecast.training --universe liquid --interval daily --skip-only --checkpoint-dir checkpoints/forecast_ridge
-# optional: --no-sector-residual --no-equities-only --no-train-from
+# optional: --no-sector-residual --no-equities-only --no-train-from --no-ridge-rank-target
+```
+
+The skip defaults to **within-date rank-target ridge** with ``ridge=10`` (val-selected). Do **not** enable walk-forward / later ``train_from`` from test: those lost on locked val.
+
+```bash
+python scripts/cs_collapse_ablate.py --data-dir data --universe liquid
 ```
 
 3. Optional tiny frozen-skip encoder (do **not** scale Mamba / Dynamic A / IC-loss weight to chase 0.14):

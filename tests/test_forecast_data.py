@@ -508,7 +508,8 @@ def test_weekly_cli_uses_week_scale_context():
     assert train_cfg.ic_loss_weight == pytest.approx(2.0)
     assert train_cfg.rank_loss_weight == pytest.approx(1.0)
     assert train_cfg.early_stop_evals == 24
-    assert train_cfg.ridge_skip == pytest.approx(1.0)
+    assert train_cfg.ridge_skip == pytest.approx(10.0)
+    assert train_cfg.ridge_rank_target is True
     assert train_cfg.freeze_skip is True
     assert train_cfg.ridge_cs_demean is True
     assert train_cfg.cs_center_loss is True

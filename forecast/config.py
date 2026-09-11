@@ -294,7 +294,7 @@ class ForecastTrainConfig:
     pred_std_weight: float = 0.5
     # Closed-form ridge readout copied into the linear skip at step 0.
     # 0 keeps Xavier init.
-    ridge_skip: float = 1.0
+    ridge_skip: float = 10.0
     # Date-demean features/targets before ridge (the CS linear baseline).
     ridge_cs_demean: bool = True
     # Huber/MSE/NLL on within-date demeaned pred/target when a date has breadth.
@@ -309,7 +309,7 @@ class ForecastTrainConfig:
     # Trailing calendar days for rolling ridge. Ignored when window=frozen.
     ridge_lookback_days: int = 1260
     # Fit ridge on within-date ranks of y (the CS trading object).
-    ridge_rank_target: bool = False
+    ridge_rank_target: bool = True
     # Within-date z-score features in the ridge design (kills calendar constants).
     ridge_cs_zscore: bool = False
     # ``all`` / ``cs`` / ``no_calendar`` feature mask for the skip.

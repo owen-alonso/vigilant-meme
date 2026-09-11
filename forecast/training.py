@@ -1298,9 +1298,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="fit the ridge skip, log last-bar train/val/test IC, write best.pt, exit",
     )
     g.add_argument(
-        "--ridge-rank-target",
+        "--no-ridge-rank-target",
         action="store_true",
-        help="fit the skip on within-date ranks of y (CS ranking object)",
+        help="fit the skip on residual values instead of within-date ranks",
     )
     g.add_argument(
         "--ridge-cs-zscore",
@@ -1431,7 +1431,7 @@ def configs_from_cli(
         ridge_cs_demean=not args.no_ridge_cs_demean,
         cs_center_loss=not args.no_cs_center,
         skip_only=args.skip_only,
-        ridge_rank_target=args.ridge_rank_target,
+        ridge_rank_target=not args.no_ridge_rank_target,
         ridge_cs_zscore=args.ridge_cs_zscore,
         ridge_features=args.ridge_features,
         ridge_date_halflife=args.ridge_date_halflife,
