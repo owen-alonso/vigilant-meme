@@ -18,6 +18,7 @@ from forecast.shorting import (
     format_shorting_report,
     frame_to_wide,
     split_shorting_metrics,
+    val_knob_grid,
 )
 from forecast.synthetic import write_cs_overnight_universe
 
@@ -195,6 +196,11 @@ def test_split_shorting_metrics_ls_has_borrow_and_short_nav():
     assert lo["borrow_bps"] == pytest.approx(0.0)
     assert float((ls.get("cost_parts") or {}).get("borrow") or 0.0) > 0
     assert float((lo.get("cost_parts") or {}).get("borrow") or 0.0) == pytest.approx(0.0)
+    grid = val_knob_grid(df, min_names=6, vol_target=0.0)
+    assert grid["rows"]
+    kinds = {r["kind"] for r in grid["rows"]}
+    assert "long_only" in kinds and "live_locate" in kinds
+    assert grid["lo_best"]["kind"] == "long_only"
 
 
 def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):

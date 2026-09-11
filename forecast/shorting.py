@@ -143,6 +143,136 @@ def _bundle_costs(bundle: dict[str, Any]) -> dict[str, float]:
     return {k: float(bundle[k]) for k in _BOOK_COST_KEYS if k in bundle}
 
 
+def _run_overnight_book(
+    pred: pd.DataFrame,
+    y: pd.DataFrame,
+    *,
+    bundle: dict[str, Any],
+    long_only: bool,
+    min_names: int,
+    vol_target: float,
+    overnight_r: pd.DataFrame | None = None,
+    turnover_z: pd.DataFrame | None = None,
+    vol_level: pd.DataFrame | None = None,
+    quantile: float = 0.2,
+    locate_haircut: float = 1.0,
+    locate_frac: float = 1.0,
+    max_short_gross: float = 0.5,
+) -> dict[str, Any]:
+    stats = book_pnl(
+        pred,
+        y,
+        quantile=float(quantile),
+        holding="overnight",
+        hold_halflife=0.0,
+        vol_target=float(vol_target),
+        causal_vol=True,
+        lever_cap=3.0,
+        min_names=int(min_names),
+        long_only=bool(long_only),
+        locate_haircut=float(locate_haircut),
+        locate_frac=float(locate_frac),
+        max_short_gross=float(max_short_gross),
+        overnight_r=overnight_r,
+        turnover_z=turnover_z,
+        vol_level=vol_level,
+        **_bundle_costs(bundle),
+    )
+    return scalar_book(stats)
+
+
+def val_knob_grid(
+    df: pd.DataFrame,
+    *,
+    min_names: int,
+    vol_target: float = 0.15,
+) -> dict[str, Any]:
+    """VAL-only quantile / locate / short-gross grid. TEST never enters."""
+    empty = {"rows": [], "best": {}, "best_ls": {}, "lo_best": {}}
+    if df.empty:
+        return empty
+    pred = frame_to_wide(df, "pred")
+    y = frame_to_wide(df, "y")
+    r_on = frame_to_wide(df, "r_on")
+    tz = frame_to_wide(df, "turnover_z") if "turnover_z" in df.columns else None
+    vol = frame_to_wide(df, "vol_level") if "vol_level" in df.columns else None
+    if pred.empty or pred.shape[1] < 2:
+        return empty
+    rows: list[dict[str, Any]] = []
+    for q in (0.15, 0.20, 0.30):
+        lo = _run_overnight_book(
+            pred,
+            y,
+            bundle=LIVE_LONG_ONLY_BUNDLE,
+            long_only=True,
+            min_names=min_names,
+            vol_target=vol_target,
+            overnight_r=r_on,
+            turnover_z=tz,
+            vol_level=vol,
+            quantile=q,
+        )
+        rows.append(
+            {
+                "name": f"live_long_only_q{int(100 * q)}",
+                "kind": "long_only",
+                "quantile": q,
+                "locate_haircut": 0.0,
+                "max_short_gross": 0.0,
+                "unlevered_net_ir": lo.get("unlevered_net_ir"),
+                "unlevered_max_dd": lo.get("unlevered_max_dd"),
+                "mean_cost_unlev_bp": lo.get("mean_cost_unlev_bp"),
+                "mean_short_nav": lo.get("mean_short_nav"),
+            }
+        )
+        for haircut in (0.5, 1.0):
+            for cap in (0.30, 0.50):
+                ls = _run_overnight_book(
+                    pred,
+                    y,
+                    bundle=LIVE_LOCATE_BUNDLE,
+                    long_only=False,
+                    min_names=min_names,
+                    vol_target=vol_target,
+                    overnight_r=r_on,
+                    turnover_z=tz,
+                    vol_level=vol,
+                    quantile=q,
+                    locate_haircut=haircut,
+                    max_short_gross=cap,
+                )
+                rows.append(
+                    {
+                        "name": (
+                            f"live_locate_q{int(100 * q)}"
+                            f"_h{haircut:.1f}_s{cap:.2f}"
+                        ),
+                        "kind": "live_locate",
+                        "quantile": q,
+                        "locate_haircut": haircut,
+                        "max_short_gross": cap,
+                        "unlevered_net_ir": ls.get("unlevered_net_ir"),
+                        "unlevered_max_dd": ls.get("unlevered_max_dd"),
+                        "mean_cost_unlev_bp": ls.get("mean_cost_unlev_bp"),
+                        "mean_short_nav": ls.get("mean_short_nav"),
+                    }
+                )
+    rows.sort(
+        key=lambda r: (
+            -_as_float(r.get("unlevered_net_ir"), default=-1e9),
+            str(r.get("name")),
+        )
+    )
+    lo_rows = [r for r in rows if r.get("kind") == "long_only"]
+    ls_rows = [r for r in rows if r.get("kind") == "live_locate"]
+    return {
+        "rows": rows,
+        "best": dict(rows[0]) if rows else {},
+        "best_ls": dict(ls_rows[0]) if ls_rows else {},
+        "lo_best": dict(lo_rows[0]) if lo_rows else {},
+    }
+
+
 def split_shorting_metrics(
     df: pd.DataFrame,
     *,
@@ -173,23 +303,17 @@ def split_shorting_metrics(
     books: dict[str, Any] = {}
     if len(pred) and pred.shape[1] >= 2:
         for name, long_only, bundle in BOOK_VARIANTS:
-            stats = book_pnl(
+            books[name] = _run_overnight_book(
                 pred,
                 y,
-                quantile=0.2,
-                holding="overnight",
-                hold_halflife=0.0,
-                vol_target=float(vol_target),
-                causal_vol=True,
-                lever_cap=3.0,
-                min_names=int(min_names),
+                bundle=bundle,
                 long_only=bool(long_only),
+                min_names=int(min_names),
+                vol_target=float(vol_target),
                 overnight_r=r_on,
                 turnover_z=tz,
                 vol_level=vol,
-                **_bundle_costs(bundle),
             )
-            books[name] = scalar_book(stats)
     short20 = book.get("short_bottom20") or {}
     direction = scored.get("direction") or {}
     return {
@@ -298,6 +422,7 @@ def evaluate_overnight_shorting(
     val = split_shorting_metrics(frames["val"], min_names=min_names, vol_target=vol_target)
     test = split_shorting_metrics(frames["test"], min_names=min_names, vol_target=vol_target)
     promo = decide_ls_promote(val)
+    grid = val_knob_grid(frames["val"], min_names=min_names, vol_target=vol_target)
     cuts: dict[str, Any] = {}
     if bundle.get("meta"):
         cuts = {
@@ -319,6 +444,7 @@ def evaluate_overnight_shorting(
         "train_cs_ic": float(train_ic),
         "val": val,
         "test": test,
+        "val_grid": grid,
         "promotion": promo,
         "desktop_commands": DESKTOP_COMMANDS,
     }
@@ -337,6 +463,8 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
         f"PROMOTE? {'YES' if promo.get('promote_ls') else 'NO'}",
         f"  default live book = {promo.get('default_book')}",
         f"  {promo.get('reason')}",
+        "",
+        _grid_block(payload.get("val_grid") or {}),
         "",
         _split_block("LOCKED TEST (report-only; not a gate)", payload.get("test") or {}),
         "",
@@ -406,6 +534,36 @@ def _split_block(title: str, split: dict[str, Any]) -> str:
             f"{'':>8}  "
             f"{_fmt(d_bp, '+.1f'):>7}"
         )
+    return "\n".join(lines)
+
+
+def _grid_block(grid: dict[str, Any]) -> str:
+    rows = list(grid.get("rows") or [])
+    best = grid.get("best") or {}
+    best_ls = grid.get("best_ls") or {}
+    lo_best = grid.get("lo_best") or {}
+    lines = [
+        "VAL KNOB GRID (quantile / locate haircut / max short NAV; not a TEST look)",
+        f"  best overall = {best.get('name')}  "
+        f"unlev net IR {_fmt(best.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(best.get('unlevered_max_dd'), '+.3f')}  "
+        f"cost {_fmt(best.get('mean_cost_unlev_bp'), '.1f')} bp",
+        f"  best long-only = {lo_best.get('name')}  "
+        f"IR {_fmt(lo_best.get('unlevered_net_ir'), '+.3f')}",
+        f"  best live_locate = {best_ls.get('name')}  "
+        f"IR {_fmt(best_ls.get('unlevered_net_ir'), '+.3f')}",
+        "  name                          IR      maxDD   cost bp  short NAV",
+    ]
+    for row in rows[:8]:
+        lines.append(
+            f"  {str(row.get('name')):<28}  "
+            f"{_fmt(row.get('unlevered_net_ir'), '+.3f'):>7}  "
+            f"{_fmt(row.get('unlevered_max_dd'), '+.3f'):>7}  "
+            f"{_fmt(row.get('mean_cost_unlev_bp'), '.1f'):>7}  "
+            f"{_fmt(row.get('mean_short_nav'), '.3f'):>9}"
+        )
+    if len(rows) > 8:
+        lines.append(f"  ... {len(rows) - 8} more rows in JSON")
     return "\n".join(lines)
 
 
