@@ -304,6 +304,20 @@ class ForecastTrainConfig:
     freeze_skip: bool = True
     # Apply ridge, log last-bar train/val/test IC, write best.pt, exit (no AdamW).
     skip_only: bool = False
+    # Frozen skip vs causal expanding/rolling refit (walk-forward uses labels < t).
+    ridge_window: str = "frozen"
+    # Trailing calendar days for rolling ridge. Ignored when window=frozen.
+    ridge_lookback_days: int = 1260
+    # Fit ridge on within-date ranks of y (the CS trading object).
+    ridge_rank_target: bool = False
+    # Within-date z-score features in the ridge design (kills calendar constants).
+    ridge_cs_zscore: bool = False
+    # ``all`` / ``cs`` / ``no_calendar`` feature mask for the skip.
+    ridge_features: str = "all"
+    # Exponential recency weights on train dates (0 = uniform).
+    ridge_date_halflife: float = 0.0
+    # ListNet (softmax CE) within date. 0 keeps RankNet-only ranking.
+    listnet_loss_weight: float = 0.0
     # Residual-std head. Trained by gaussian NLL, or by sigma_aux_weight when
     # the mean loss is Huber/MSE. Default 0 matches heteroscedastic=False.
     sigma_aux_weight: float = 0.0
@@ -339,6 +353,7 @@ def validate_loss_head(model_cfg: ForecastModelConfig, train_cfg: ForecastTrainC
         "ic_loss_weight",
         "sign_loss_weight",
         "rank_loss_weight",
+        "listnet_loss_weight",
         "pred_std_weight",
         "ridge_skip",
         "skip_lr_mult",

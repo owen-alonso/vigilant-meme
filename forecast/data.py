@@ -1310,6 +1310,10 @@ def fit_ridge_readout(
     ridge: float = 1.0,
     cs_demean: bool = False,
     min_names: int = 8,
+    cs_zscore: bool = False,
+    rank_target: bool = False,
+    feature_mask_bool: np.ndarray | None = None,
+    date_halflife: float = 0.0,
 ) -> tuple[np.ndarray, float, float]:
     """Train-only ridge of target on normalized features. Returns weight, bias, IC.
 
@@ -1317,100 +1321,18 @@ def fit_ridge_readout(
     still applies ``w·x + b`` without demeaning: within-date Pearson is invariant
     to a per-date additive shift, so CS IC matches the demeaned fit.
     """
-    n_features = int(np.asarray(feature_mean).shape[0])
-    mean = np.asarray(feature_mean, dtype=np.float64)
-    std = np.asarray(feature_std, dtype=np.float64)
-    rows_x: list[np.ndarray] = []
-    rows_y: list[np.ndarray] = []
-    rows_d: list[np.ndarray] = []
-    have_dates = True
-    for sym in symbols:
-        if not bool(sym.valid.any()):
-            continue
-        raw = sym.features[sym.valid].astype(np.float64, copy=False)
-        rows_x.append((raw - mean) / std)
-        rows_y.append(sym.target[sym.valid].astype(np.float64, copy=False))
-        if sym.dates is None:
-            have_dates = False
-            rows_d.append(np.full(int(sym.valid.sum()), -1, dtype=np.int64))
-        else:
-            rows_d.append(sym.dates[sym.valid].astype(np.int64, copy=False))
-    if not rows_x:
-        return np.zeros(n_features, dtype=np.float32), 0.0, float("nan")
+    from forecast.ridge import fit_ridge_xy, labelled_rows
 
-    x_all = np.concatenate(rows_x, axis=0)
-    y_all = np.concatenate(rows_y, axis=0)
-    d_all = np.concatenate(rows_d, axis=0)
-    x, y = x_all, y_all
-    used_cs = False
-    if cs_demean and have_dates:
-        xs: list[np.ndarray] = []
-        ys: list[np.ndarray] = []
-        for key in np.unique(d_all):
-            sel = d_all == key
-            if int(sel.sum()) < int(min_names):
-                continue
-            xd = x_all[sel]
-            yd = y_all[sel]
-            xs.append(xd - xd.mean(axis=0, keepdims=True))
-            ys.append(yd - yd.mean())
-        if xs:
-            x = np.concatenate(xs, axis=0)
-            y = np.concatenate(ys, axis=0)
-            used_cs = True
-    design = np.concatenate([x, np.ones((x.shape[0], 1), dtype=np.float64)], axis=1)
-    lam = max(0.0, float(ridge))
-    xtx = design.T @ design
-    xtx.flat[:: xtx.shape[0] + 1] += lam
-    try:
-        coef = np.linalg.solve(xtx, design.T @ y)
-    except np.linalg.LinAlgError:
-        coef = np.linalg.lstsq(xtx, design.T @ y, rcond=None)[0]
-    weights = coef[:-1].astype(np.float32)
-    bias = float(coef[-1])
-    pred_fit = x @ coef[:-1] + coef[-1]
-    ic = float("nan")
-    if pred_fit.size >= 2:
-        pc = pred_fit - pred_fit.mean()
-        yc = y - y.mean()
-        denom = float(np.sqrt((pc * pc).sum() * (yc * yc).sum()))
-        if denom > 1e-12:
-            ic = float((pc * yc).sum() / denom)
-    pred_std = float(pred_fit.std())
-    y_std = float(y.std())
-    if pred_std > 1e-8 and y_std > 1e-8 and np.isfinite(ic):
-        amp = abs(ic) * y_std / pred_std
-        weights = (weights * amp).astype(np.float32)
-        bias = float(bias * amp)
-    if used_cs and have_dates:
-        pred_raw = x_all @ weights.astype(np.float64) + bias
-        cs_ics: list[float] = []
-        demeaned_p: list[np.ndarray] = []
-        demeaned_y: list[np.ndarray] = []
-        for key in np.unique(d_all):
-            sel = d_all == key
-            if int(sel.sum()) < int(min_names):
-                continue
-            a = pred_raw[sel]
-            b = y_all[sel]
-            a_c = a - a.mean()
-            b_c = b - b.mean()
-            demeaned_p.append(a_c)
-            demeaned_y.append(b_c)
-            denom = float(np.sqrt((a_c * a_c).sum() * (b_c * b_c).sum()))
-            if denom > 1e-12:
-                cs_ics.append(float((a_c * b_c).sum() / denom))
-        if cs_ics:
-            ic = float(np.mean(cs_ics))
-        if demeaned_p:
-            p_cat = np.concatenate(demeaned_p)
-            y_cat = np.concatenate(demeaned_y)
-            p_std = float(p_cat.std())
-            y_std_cs = float(y_cat.std())
-            if p_std > 1e-8 and y_std_cs > 1e-8 and np.isfinite(ic):
-                amp = abs(ic) * y_std_cs / p_std
-                weights = (weights * amp).astype(np.float32)
-                bias = float(bias * amp)
-        # Drop the global intercept: CS scores are relative.
-        bias = 0.0
-    return weights, bias, ic
+    x, y, dates = labelled_rows(symbols, feature_mean, feature_std)
+    return fit_ridge_xy(
+        x,
+        y,
+        dates,
+        ridge=ridge,
+        min_names=min_names,
+        cs_demean=cs_demean,
+        cs_zscore=cs_zscore,
+        rank_target=rank_target,
+        feature_mask_bool=feature_mask_bool,
+        date_halflife=date_halflife,
+    )

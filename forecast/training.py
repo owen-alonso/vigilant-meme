@@ -46,6 +46,7 @@ from forecast.config import (
 )
 from forecast.data import FEATURE_NAMES, build_datasets, collate_forecast, fit_ridge_readout
 from forecast.model import ReturnForecaster
+from forecast.ridge import feature_mask, labelled_rows, walk_forward_predict, cs_stats
 from mamba_lm.model import format_dynamic_diagnostics
 from mamba_lm.paths import anchor_to_repo
 from mamba_lm.reporting import clip_grad_norm_unique
@@ -147,6 +148,10 @@ def masked_loss(
         rank_term = masked_pairwise_rank_loss(mean, target, mask, date_ids=date_ids)
         if torch.isfinite(rank_term):
             total = total + cfg.rank_loss_weight * rank_term
+    if float(getattr(cfg, "listnet_loss_weight", 0.0) or 0.0) > 0:
+        list_term = masked_listnet_loss(mean, target, mask, date_ids=date_ids)
+        if torch.isfinite(list_term):
+            total = total + float(cfg.listnet_loss_weight) * list_term
     if cfg.pred_std_weight > 0:
         scale_term = masked_pred_std_loss(mean, target, mask)
         if torch.isfinite(scale_term):
@@ -246,6 +251,42 @@ def masked_sign_loss(
         mean / scale, labels, reduction="none"
     )
     return (per_bar * weights).sum() / denom
+
+
+def masked_listnet_loss(
+    mean: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    date_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Softmax cross-entropy of scores vs labels, within date (ListNet)."""
+    dates = _expand_date_ids(date_ids, mask)
+    sel = mask.bool()
+    pred = mean[sel]
+    y = target[sel]
+    if dates is None:
+        if int(pred.numel()) < 3:
+            return mean.new_zeros(())
+        return _listnet(pred, y)
+    keys = dates[sel]
+    parts: list[torch.Tensor] = []
+    for key in keys.unique():
+        m = keys == key
+        if int(m.sum()) < 3:
+            continue
+        parts.append(_listnet(pred[m], y[m]))
+    if not parts:
+        return mean.new_zeros(())
+    return torch.stack(parts).mean()
+
+
+def _listnet(pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    p_scale = pred.detach().std(unbiased=False).clamp(min=1.0)
+    y_scale = y.detach().std(unbiased=False).clamp(min=1.0)
+    log_p = torch.log_softmax(pred / p_scale, dim=0)
+    q = torch.softmax(y / y_scale, dim=0)
+    return -(q * log_p).sum()
 
 
 def _ranknet(pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -582,6 +623,63 @@ def _tag_skip_lr_mult(
     optimizer.param_groups = new_groups
 
 
+def walk_forward_split_metrics(
+    bundle: dict[str, Any],
+    train_cfg: ForecastTrainConfig,
+) -> dict[str, Any]:
+    """Causal expanding/rolling CS ridge on labelled last bars (no same-day y)."""
+    min_names = int(bundle.get("cs_min_names", 8))
+    mask = feature_mask(str(getattr(train_cfg, "ridge_features", "all") or "all"))
+    kwargs = dict(
+        ridge=float(train_cfg.ridge_skip),
+        min_names=min_names,
+        cs_demean=bool(train_cfg.ridge_cs_demean),
+        cs_zscore=bool(getattr(train_cfg, "ridge_cs_zscore", False)),
+        rank_target=bool(getattr(train_cfg, "ridge_rank_target", False)),
+        feature_mask_bool=mask,
+        min_train_dates=60,
+    )
+    chunks = []
+    split_dates: dict[str, np.ndarray] = {}
+    for split in ("train", "val", "test"):
+        x, y, d = labelled_rows(
+            bundle[f"{split}_symbols"],
+            bundle["feature_mean"],
+            bundle["feature_std"],
+        )
+        chunks.append((x, y, d))
+        split_dates[split] = np.unique(d) if d.size else np.zeros((0,), dtype=np.int64)
+    if not chunks or chunks[0][0].size == 0:
+        return {}
+    x = np.concatenate([c[0] for c in chunks if c[0].size], axis=0)
+    y = np.concatenate([c[1] for c in chunks if c[1].size], axis=0)
+    d = np.concatenate([c[2] for c in chunks if c[2].size], axis=0)
+    windows = {
+        "expanding": None,
+        "rolling_2y": 504,
+        "rolling_5y": 1260,
+        "rolling_8y": 2016,
+    }
+    cfg_window = str(getattr(train_cfg, "ridge_window", "frozen") or "frozen").lower()
+    if cfg_window == "rolling":
+        windows["rolling_cfg"] = int(getattr(train_cfg, "ridge_lookback_days", 1260) or 1260)
+    elif cfg_window == "expanding":
+        windows["expanding_cfg"] = None
+    out: dict[str, Any] = {}
+    score_dates = np.unique(np.concatenate([split_dates["val"], split_dates["test"]]))
+    for name, lookback in windows.items():
+        pred = walk_forward_predict(
+            x, y, d, score_dates=score_dates, lookback_days=lookback, **kwargs
+        )
+        row: dict[str, Any] = {"lookback_days": lookback}
+        for split in ("val", "test"):
+            keys = split_dates[split]
+            sel = np.isin(d, keys) & np.isfinite(pred)
+            row[split] = cs_stats(pred[sel], y[sel], d[sel], min_names=min_names)
+        out[name] = row
+    return out
+
+
 def apply_ridge_skip(
     model: ReturnForecaster,
     bundle: dict[str, Any],
@@ -598,6 +696,12 @@ def apply_ridge_skip(
         ridge=float(train_cfg.ridge_skip),
         cs_demean=bool(train_cfg.ridge_cs_demean),
         min_names=int(bundle.get("cs_min_names", 8)),
+        cs_zscore=bool(getattr(train_cfg, "ridge_cs_zscore", False)),
+        rank_target=bool(getattr(train_cfg, "ridge_rank_target", False)),
+        feature_mask_bool=feature_mask(
+            str(getattr(train_cfg, "ridge_features", "all") or "all")
+        ),
+        date_halflife=float(getattr(train_cfg, "ridge_date_halflife", 0.0) or 0.0),
     )
     with torch.no_grad():
         model.skip.weight.copy_(
@@ -764,6 +868,21 @@ def _train(
         log_fn(f"  skip-only train: {_fmt(skip_only_train)}")
         log_fn(f"  skip-only val: {_fmt(skip_only_val)}")
         log_fn(f"  skip-only test: {_fmt(skip_only_test)}")
+    walk_forward: dict[str, Any] = {}
+    if train_cfg.skip_only:
+        walk_forward = walk_forward_split_metrics(bundle, train_cfg)
+        if log_fn:
+            for name, row in walk_forward.items():
+                if not isinstance(row, dict) or "val" not in row:
+                    continue
+                val = row["val"]
+                test = row["test"]
+                log_fn(
+                    f"  walk-forward {name}: val cs_ic={val.get('cs_ic', float('nan')):+.4f} "
+                    f"t={val.get('cs_ic_tstat', float('nan')):.2f}  "
+                    f"test cs_ic={test.get('cs_ic', float('nan')):+.4f} "
+                    f"t={test.get('cs_ic_tstat', float('nan')):.2f}"
+                )
 
     if train_cfg.skip_only:
         save(ckpt_dir / "best.pt", 0, skip_only_val)
@@ -777,6 +896,7 @@ def _train(
             "skip_only_train": skip_only_train,
             "skip_only_val": skip_only_val,
             "skip_only_test": skip_only_test,
+            "walk_forward": walk_forward,
             "interrupted": False,
             "last_step": 0,
             "n_params": n_params,
@@ -1177,6 +1297,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="fit the ridge skip, log last-bar train/val/test IC, write best.pt, exit",
     )
+    g.add_argument(
+        "--ridge-rank-target",
+        action="store_true",
+        help="fit the skip on within-date ranks of y (CS ranking object)",
+    )
+    g.add_argument(
+        "--ridge-cs-zscore",
+        action="store_true",
+        help="z-score features within date in the ridge design",
+    )
+    g.add_argument(
+        "--ridge-features",
+        default="all",
+        choices=("all", "cs", "no_calendar"),
+        help="mask skip features: all, CS-only, or drop calendar/tod columns",
+    )
+    g.add_argument(
+        "--ridge-date-halflife",
+        type=float,
+        default=t.ridge_date_halflife,
+        help="exp recency half-life in days for frozen ridge (0 = uniform)",
+    )
+    g.add_argument(
+        "--listnet-loss-weight",
+        type=float,
+        default=t.listnet_loss_weight,
+        help="within-date ListNet (softmax CE); 0 disables",
+    )
     g.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default=t.precision)
     g.add_argument("--seed", type=int, default=t.seed)
     g.add_argument("--eval-interval", type=int, default=t.eval_interval)
@@ -1283,6 +1431,11 @@ def configs_from_cli(
         ridge_cs_demean=not args.no_ridge_cs_demean,
         cs_center_loss=not args.no_cs_center,
         skip_only=args.skip_only,
+        ridge_rank_target=args.ridge_rank_target,
+        ridge_cs_zscore=args.ridge_cs_zscore,
+        ridge_features=args.ridge_features,
+        ridge_date_halflife=args.ridge_date_halflife,
+        listnet_loss_weight=args.listnet_loss_weight,
         sigma_aux_weight=(
             0.0
             if (not heteroscedastic or args.loss == "gaussian")
