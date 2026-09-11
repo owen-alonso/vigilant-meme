@@ -8,6 +8,7 @@ converts that to an implied overnight log-return ``pred * sigma`` (same as
 - excess hit rate vs the unconditional overnight-up drift (always-long)
 - implied next-open vs actual next open
 - long-only book up-rate on the within-date top residual names
+- book-aligned sleeve overnight-up (TRAIN q / |pred| grid, VAL-gated)
 - short-sleeve overnight down-rate on the within-date bottom residual names
 
 Default recipe is the PR #5 overnight skip (rank-target ridge, ``no_long_ts``).
@@ -51,6 +52,12 @@ from forecast.ridge import (
 
 # Accuracy readout gates (locked VAL). CS IC gate stays VAL_LIFT / VAL_2017_KEEP.
 DIR_LIFT = 0.002  # 0.2 pp hit-rate vs the residual*sigma baseline
+# IDEA E: book-aligned sleeve overnight-up (pp, not fractions).
+BOOK_ALIGN_QS = (0.70, 0.80, 0.90)  # top 30/20/10%
+BOOK_ALIGN_ABS_QS = (0.0, 0.50, 0.70)  # 0 = no |pred| floor
+BOOK_UP_FLOOR_PP = 0.50
+BOOK_UP_BASE_PP = 0.20
+BOOK_ALIGN_COVER = 0.05
 TURNOVER_COL = FEATURE_NAMES.index("turnover_z") if "turnover_z" in FEATURE_NAMES else None
 VOL_LEVEL_COL = FEATURE_NAMES.index("vol_level") if "vol_level" in FEATURE_NAMES else None
 # PR #8 locked-TEST residual*sigma print (do not retarget; compare on the same window).
@@ -498,6 +505,292 @@ def long_only_book_block(
     )
 
 
+def cs_top_abs_mask(
+    df: pd.DataFrame,
+    *,
+    q: float,
+    abs_tau: float = 0.0,
+    score_col: str = "pred",
+    min_names: int = 3,
+) -> np.ndarray:
+    """Within-date top residual names, optional causal |pred| floor.
+
+    ``q=0.80`` is the top 20%. ``abs_tau`` is a TRAIN quantile of ``|pred|``
+    (0 = off). Next open is never used.
+    """
+    n = len(df)
+    out = np.zeros(n, dtype=bool)
+    if df.empty or score_col not in df.columns:
+        return out
+    dates = df["date"].to_numpy(dtype=np.int64)
+    score = df[score_col].to_numpy(dtype=np.float64)
+    mag = np.abs(score)
+    tau = float(abs_tau)
+    for key in np.unique(dates):
+        sel = dates == key
+        row = score[sel]
+        finite = np.isfinite(row)
+        if int(finite.sum()) < int(min_names):
+            continue
+        cut = float(np.nanquantile(row, float(q)))
+        keep = finite & (row >= cut)
+        if tau > 0.0:
+            keep = keep & (mag[sel] >= tau)
+        out[sel] = keep
+    return out
+
+
+def score_book_aligned_sleeve(
+    df: pd.DataFrame,
+    *,
+    q: float,
+    abs_tau: float = 0.0,
+    min_names: int = 3,
+) -> dict[str, Any]:
+    """Overnight up-rate + sleeve MAE on the CS top-q residual names."""
+    top_pct = float(100.0 * (1.0 - float(q)))
+    name = f"book_top{int(round(top_pct))}"
+    if float(abs_tau) > 0.0:
+        name = f"{name}_abs"
+    empty = {
+        "name": name,
+        "q": float(q),
+        "abs_tau": float(abs_tau),
+        "top_pct": top_pct,
+        "up_pct": float("nan"),
+        "uncond_up_pct": float("nan"),
+        "excess_pp": float("nan"),
+        "n": 0.0,
+        "n_dates": 0.0,
+        "coverage": float("nan"),
+        "mae_usd": float("nan"),
+        "mae_pct": float("nan"),
+        "full_mae_usd": float("nan"),
+        "full_mae_pct": float("nan"),
+        "paper_ir": float("nan"),
+    }
+    if df.empty or "pred" not in df.columns or "r_on" not in df.columns:
+        return empty
+    mask = cs_top_abs_mask(
+        df, q=float(q), abs_tau=float(abs_tau), score_col="pred", min_names=min_names
+    )
+    r = df["r_on"].to_numpy(dtype=np.float64)
+    dates = df["date"].to_numpy(dtype=np.int64)
+    moved = mask & np.isfinite(r) & (r != 0.0)
+    uncond = r[np.isfinite(r) & (r != 0.0)]
+    uncond_up = float((uncond > 0).mean()) if uncond.size else float("nan")
+    n_dates = float(pd.Series(dates[mask]).nunique()) if int(mask.sum()) else 0.0
+    cover = float(mask.mean()) if mask.size else float("nan")
+    empty["n"] = float(int(moved.sum()))
+    empty["n_dates"] = n_dates
+    empty["coverage"] = cover
+    empty["uncond_up_pct"] = (
+        float(100.0 * uncond_up) if np.isfinite(uncond_up) else float("nan")
+    )
+    if "close" in df.columns and "next_open" in df.columns:
+        close = df["close"].to_numpy(dtype=np.float64)
+        nxt = df["next_open"].to_numpy(dtype=np.float64)
+        if "implied_open" in df.columns:
+            implied = df["implied_open"].to_numpy(dtype=np.float64)
+        else:
+            implied = close
+        ok = np.isfinite(close) & np.isfinite(nxt) & (close > 0)
+        if int(ok.sum()):
+            empty["full_mae_usd"] = float(np.mean(np.abs(implied[ok] - nxt[ok])))
+            empty["full_mae_pct"] = float(
+                np.mean(np.abs(implied[ok] - nxt[ok]) / close[ok])
+            )
+        sleeve_ok = mask & ok
+        if int(sleeve_ok.sum()):
+            empty["mae_usd"] = float(np.mean(np.abs(implied[sleeve_ok] - nxt[sleeve_ok])))
+            empty["mae_pct"] = float(
+                np.mean(np.abs(implied[sleeve_ok] - nxt[sleeve_ok]) / close[sleeve_ok])
+            )
+    if int(moved.sum()) == 0:
+        return empty
+    up = float((r[moved] > 0).mean())
+    daily = (
+        pd.DataFrame({"date": dates[mask], "r": r[mask]})
+        .groupby("date")["r"]
+        .mean()
+        .to_numpy(dtype=np.float64)
+    )
+    daily = daily[np.isfinite(daily)]
+    paper_ir = float("nan")
+    if daily.size >= 5:
+        sd = float(daily.std(ddof=1)) if daily.size > 1 else 0.0
+        if sd > 1e-12:
+            paper_ir = float(daily.mean() / sd * math.sqrt(252.0))
+    return {
+        **empty,
+        "up_pct": float(100.0 * up),
+        "excess_pp": (
+            float(100.0 * (up - uncond_up)) if np.isfinite(uncond_up) else float("nan")
+        ),
+        "paper_ir": paper_ir,
+    }
+
+
+def fit_book_aligned_on_train(
+    df: pd.DataFrame,
+    *,
+    min_names: int,
+) -> dict[str, Any]:
+    """Select (q, |pred| floor) on TRAIN only. VAL/TEST never enter."""
+    mag = np.abs(df["pred"].to_numpy(dtype=np.float64)) if not df.empty else np.array([])
+    mag = mag[np.isfinite(mag)]
+    rows: list[dict[str, Any]] = []
+    for q in BOOK_ALIGN_QS:
+        for aq in BOOK_ALIGN_ABS_QS:
+            tau = 0.0 if float(aq) <= 0.0 else float(np.quantile(mag, float(aq))) if mag.size else 0.0
+            row = score_book_aligned_sleeve(
+                df, q=float(q), abs_tau=tau, min_names=min_names
+            )
+            row["abs_q"] = float(aq)
+            if not np.isfinite(_as_float(row.get("up_pct"))):
+                continue
+            cover = _as_float(row.get("coverage"))
+            if np.isfinite(cover) and cover < BOOK_ALIGN_COVER:
+                continue
+            rows.append(row)
+    chosen: dict[str, Any] = {}
+    best_key = (-1e18, -1e18, -1.0)
+    for row in rows:
+        xs = _as_float(row.get("excess_pp"))
+        up = _as_float(row.get("up_pct"))
+        q = _as_float(row.get("q"))
+        if not np.isfinite(xs):
+            continue
+        key = (xs, up, q)
+        if key > best_key:
+            best_key = key
+            chosen = dict(row)
+    baseline = score_book_aligned_sleeve(df, q=0.80, abs_tau=0.0, min_names=min_names)
+    baseline["abs_q"] = 0.0
+    if not chosen:
+        chosen = dict(baseline)
+    return {
+        "rows": rows,
+        "chosen": chosen,
+        "baseline": baseline,
+        "fit_split": "train",
+        "qs": list(BOOK_ALIGN_QS),
+        "abs_qs": list(BOOK_ALIGN_ABS_QS),
+        "note": (
+            "Overnight up-rate of within-date top-q residual skip names "
+            "(optional TRAIN |pred| floor). q=0.80 is the liquid top-20% book. "
+            "Pooled TS direction is report-only."
+        ),
+    }
+
+
+def book_aligned_grid(
+    df: pd.DataFrame,
+    *,
+    train_pred: np.ndarray,
+    min_names: int,
+) -> list[dict[str, Any]]:
+    """Score the q × |pred| grid with TRAIN-only magnitude thresholds."""
+    mag = np.abs(np.asarray(train_pred, dtype=np.float64))
+    mag = mag[np.isfinite(mag)]
+    rows: list[dict[str, Any]] = []
+    for q in BOOK_ALIGN_QS:
+        for aq in BOOK_ALIGN_ABS_QS:
+            tau = (
+                0.0
+                if float(aq) <= 0.0
+                else (float(np.quantile(mag, float(aq))) if mag.size else 0.0)
+            )
+            row = score_book_aligned_sleeve(
+                df, q=float(q), abs_tau=tau, min_names=min_names
+            )
+            row["abs_q"] = float(aq)
+            rows.append(row)
+    return rows
+
+
+def decide_book_aligned_promote(
+    *,
+    val_chosen: dict[str, Any],
+    val_top20: dict[str, Any],
+    chosen: dict[str, Any],
+) -> dict[str, Any]:
+    """VAL-only vs uncond overnight-up floor and the q=0.80 top-20% sleeve."""
+    scored = dict(val_chosen or {})
+    base = dict(val_top20 or {})
+    up = _as_float(scored.get("up_pct"))
+    floor = _as_float(scored.get("uncond_up_pct"))
+    xs = _as_float(scored.get("excess_pp"))
+    if not np.isfinite(xs) and np.isfinite(up) and np.isfinite(floor):
+        xs = float(up - floor)
+    up20 = _as_float(base.get("up_pct"))
+    cover = _as_float(scored.get("coverage"))
+    q = _as_float((chosen or {}).get("q"), default=0.80)
+    abs_tau = _as_float((chosen or {}).get("abs_tau"), default=0.0)
+    abs_q = _as_float((chosen or {}).get("abs_q"), default=0.0)
+    same = abs(q - 0.80) < 1e-12 and abs(abs_tau) <= 1e-15
+    floor_ok = bool(np.isfinite(xs) and xs >= BOOK_UP_FLOOR_PP)
+    vs_base = bool(np.isfinite(up) and np.isfinite(up20) and up >= up20 + BOOK_UP_BASE_PP)
+    cover_ok = bool(not np.isfinite(cover) or cover >= BOOK_ALIGN_COVER)
+    promote = bool((not same) and floor_ok and vs_base and cover_ok)
+    if same:
+        reason = (
+            "NO PROMOTE: TRAIN chose q=0.80 / no |pred| floor "
+            f"(current top-20% book). VAL up {up:+.2f}% vs floor {floor:.2f}% "
+            f"(xs {xs:+.2f} pp)."
+        )
+    elif not cover_ok:
+        reason = (
+            f"NO PROMOTE: TRAIN q={q:.2f} abs_q={abs_q:.2f} but VAL cover "
+            f"{100 * cover:.1f}% < {100 * BOOK_ALIGN_COVER:.0f}%."
+        )
+    elif not floor_ok:
+        reason = (
+            f"NO PROMOTE: TRAIN q={q:.2f} VAL up {up:.2f}% vs floor {floor:.2f}% "
+            f"(xs {xs:+.2f} pp < +{BOOK_UP_FLOOR_PP:.1f} pp)."
+        )
+    elif not vs_base:
+        reason = (
+            f"NO PROMOTE: TRAIN q={q:.2f} VAL up {up:.2f}% vs top-20% "
+            f"{up20:.2f}% (delta {up - up20:+.2f} pp < +{BOOK_UP_BASE_PP:.1f} pp)."
+        )
+    else:
+        reason = (
+            f"PROMOTE book-aligned q={q:.2f} abs_q={abs_q:.2f}: VAL up {up:.2f}% "
+            f"vs floor {floor:.2f}% (xs {xs:+.2f} pp) and vs top-20% {up20:.2f}% "
+            f"(delta {up - up20:+.2f} pp)."
+        )
+    return {
+        "promote_book_aligned": promote,
+        "gated_on": "val",
+        "reason": reason,
+        "spec": (
+            {"q": float(q), "abs_tau": float(abs_tau), "abs_q": float(abs_q)}
+            if promote
+            else {"q": 0.80, "abs_tau": 0.0, "abs_q": 0.0}
+        ),
+        "chosen": scored,
+        "baseline": base,
+        "train_q": float(q),
+        "train_abs_q": float(abs_q),
+        "val_up": up,
+        "val_floor": floor,
+        "val_excess_pp": xs,
+        "val_top20_up": up20,
+        "val_vs_top20_pp": (
+            float(up - up20) if np.isfinite(up) and np.isfinite(up20) else float("nan")
+        ),
+        "coverage": cover,
+        "floor_lift_pp": BOOK_UP_FLOOR_PP,
+        "base_lift_pp": BOOK_UP_BASE_PP,
+        "mae_usd": _as_float(scored.get("mae_usd")),
+        "mae_pct": _as_float(scored.get("mae_pct")),
+        "full_mae_usd": _as_float(scored.get("full_mae_usd")),
+        "full_mae_pct": _as_float(scored.get("full_mae_pct")),
+        "paper_ir": _as_float(scored.get("paper_ir")),
+    }
+
+
 def _restrict_cs_dates(df: pd.DataFrame, min_names: int) -> pd.DataFrame:
     if df.empty:
         return df
@@ -872,6 +1165,9 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         log_txt = format_logistic_up_block(ablate, payload.get("promotion") or {})
         if log_txt:
             lines.extend(["", log_txt])
+        book_txt = format_book_aligned_block(payload)
+        if book_txt:
+            lines.extend(["", book_txt])
     conf = payload.get("confidence")
     if conf:
         lines.extend(["", format_confidence_block(conf)])
@@ -2500,6 +2796,75 @@ def format_logistic_up_block(
     )
 
 
+def _fmt_book_sleeve(row: Mapping[str, Any] | None) -> str:
+    r = dict(row or {})
+    return (
+        f"up {_as_float(r.get('up_pct')):.2f}%  "
+        f"floor {_as_float(r.get('uncond_up_pct')):.2f}%  "
+        f"xs {_as_float(r.get('excess_pp')):+.2f}pp  "
+        f"cover {100.0 * _as_float(r.get('coverage')):.1f}%  "
+        f"n={int(_as_float(r.get('n'), 0.0))}  "
+        f"dates={int(_as_float(r.get('n_dates'), 0.0))}  "
+        f"MAE ${_as_float(r.get('mae_usd')):.4f} / "
+        f"{100.0 * _as_float(r.get('mae_pct')):.4f}%  "
+        f"(full ${_as_float(r.get('full_mae_usd')):.4f} / "
+        f"{100.0 * _as_float(r.get('full_mae_pct')):.4f}%)  "
+        f"paperIR {_as_float(r.get('paper_ir')):+.3f}"
+    )
+
+
+def format_book_aligned_block(payload: dict[str, Any]) -> str:
+    """VAL-gated overnight-up of TRAIN-chosen top-q residual names."""
+    promo = payload.get("book_aligned_promotion") or {}
+    fit = payload.get("book_aligned_fit") or {}
+    cmp = payload.get("book_aligned_compare") or {}
+    if not promo and not fit:
+        return ""
+    yes = bool(promo.get("promote_book_aligned"))
+    chosen = fit.get("chosen") or {}
+    tr = (cmp.get("train") or {}).get("chosen") or chosen
+    va = (cmp.get("val") or {}).get("chosen") or {}
+    te = (cmp.get("test") or {}).get("chosen") or {}
+    va20 = (cmp.get("val") or {}).get("top20") or {}
+    te20 = (cmp.get("test") or {}).get("top20") or {}
+    q = _as_float(chosen.get("q"), default=0.80)
+    abs_q = _as_float(chosen.get("abs_q"), default=0.0)
+    abs_tau = _as_float(chosen.get("abs_tau"), default=0.0)
+    grid = (cmp.get("val") or {}).get("grid") or []
+    grid_lines = []
+    for row in grid:
+        grid_lines.append(
+            f"    q={_as_float(row.get('q')):.2f} abs_q={_as_float(row.get('abs_q')):.2f}  "
+            f"{_fmt_book_sleeve(row)}"
+        )
+    if not grid_lines:
+        grid_lines = ["    (empty)"]
+    return "\n".join(
+        [
+            f"PROMOTE BOOK-ALIGNED? {'YES' if yes else 'NO'}",
+            "  Primary object = overnight up-rate of within-date top-q residual "
+            "skip names (sector-overnight skip pred) vs unconditional overnight-up. "
+            "Pooled TS direction stays report-only. TEST is report-only. "
+            "MAE on the sleeve vs full tape is secondary. Live book CLI unchanged.",
+            f"  TRAIN pick q={q:.2f} (top {100.0 * (1.0 - q):.0f}%)  "
+            f"abs_q={abs_q:.2f}  |pred|>={abs_tau:.5f}  "
+            f"fit_split={fit.get('fit_split')!r}",
+            f"  TRAIN chosen  {_fmt_book_sleeve(tr)}",
+            f"  VAL   chosen  {_fmt_book_sleeve(va)}",
+            f"  VAL   top-20% {_fmt_book_sleeve(va20)}",
+            f"  VAL   vs floor {_as_float(promo.get('val_excess_pp')):+.2f}pp  "
+            f"(need ≥+{BOOK_UP_FLOOR_PP:.1f}pp)  vs top-20% "
+            f"{_as_float(promo.get('val_vs_top20_pp')):+.2f}pp  "
+            f"(need ≥+{BOOK_UP_BASE_PP:.1f}pp)",
+            f"  TEST  chosen  {_fmt_book_sleeve(te)}  (report-only)",
+            f"  TEST  top-20% {_fmt_book_sleeve(te20)}  (report-only)",
+            f"  {promo.get('reason') or 'no decision'}",
+            "  VAL grid (report-only; |pred| τ from TRAIN):",
+            *grid_lines,
+        ]
+    )
+
+
 def format_confidence_block(conf: dict[str, Any]) -> str:
     lines = [
         "CONFIDENCE ( |pred_r| vs TRAIN quantiles; scored on locked TEST )",
@@ -2649,6 +3014,7 @@ def evaluate_overnight_accuracy(
         tr["date"].to_numpy(dtype=np.int64),
     )
     logit_up = fit_logistic_up(train_pred_r, train_r)
+    book_aligned_fit = fit_book_aligned_on_train(tr, min_names=min_names)
     dow_table, dow_default = fit_group_median(
         train_r, weekday_of_dates(tr["date"].to_numpy(dtype=np.int64))
     )
@@ -3189,6 +3555,16 @@ def evaluate_overnight_accuracy(
             "decile_reliability": decile_rel,
             "cs_left_veto": cs_veto,
             "logistic_up": logit_up,
+            "book_aligned": {
+                "q": float((book_aligned_fit.get("chosen") or {}).get("q") or 0.80),
+                "abs_tau": float(
+                    (book_aligned_fit.get("chosen") or {}).get("abs_tau") or 0.0
+                ),
+                "abs_q": float(
+                    (book_aligned_fit.get("chosen") or {}).get("abs_q") or 0.0
+                ),
+                "fit_split": "train",
+            },
             "piecewise_l1": piecewise_spec,
             "bin_calibrate": bin_spec,
             "dow_gap": dow_spec,
@@ -3290,10 +3666,61 @@ def evaluate_overnight_accuracy(
     )
     payload["year_slices"] = _year_direction(te)
     payload["year_slices_readout"] = _year_direction(apply_readout(te, default_pr_test))
+    chosen_ba = book_aligned_fit.get("chosen") or {}
+    q_hat = float(chosen_ba.get("q") or 0.80)
+    abs_tau_hat = float(chosen_ba.get("abs_tau") or 0.0)
+    train_pred_cs = tr["pred"].to_numpy(dtype=np.float64)
+    val_chosen_ba = score_book_aligned_sleeve(
+        va, q=q_hat, abs_tau=abs_tau_hat, min_names=min_names
+    )
+    test_chosen_ba = score_book_aligned_sleeve(
+        te, q=q_hat, abs_tau=abs_tau_hat, min_names=min_names
+    )
+    val_top20_ba = score_book_aligned_sleeve(
+        va, q=0.80, abs_tau=0.0, min_names=min_names
+    )
+    test_top20_ba = score_book_aligned_sleeve(
+        te, q=0.80, abs_tau=0.0, min_names=min_names
+    )
+    book_aligned_promotion = decide_book_aligned_promote(
+        val_chosen=val_chosen_ba,
+        val_top20=val_top20_ba,
+        chosen=chosen_ba,
+    )
+    payload["book_aligned_fit"] = book_aligned_fit
+    payload["book_aligned_compare"] = {
+        "train": {
+            "chosen": book_aligned_fit.get("chosen"),
+            "top20": book_aligned_fit.get("baseline"),
+            "grid": book_aligned_fit.get("rows"),
+        },
+        "val": {
+            "chosen": val_chosen_ba,
+            "top20": val_top20_ba,
+            "grid": book_aligned_grid(
+                va, train_pred=train_pred_cs, min_names=min_names
+            ),
+        },
+        "test": {
+            "chosen": test_chosen_ba,
+            "top20": test_top20_ba,
+            "grid": book_aligned_grid(
+                te, train_pred=train_pred_cs, min_names=min_names
+            ),
+        },
+        "note": (
+            "Primary object = overnight up-rate of within-date top-q residual "
+            "skip names vs unconditional overnight-up. Pooled TS dir is "
+            "report-only. TEST is report-only. Sleeve MAE vs full tape is secondary."
+        ),
+    }
+    payload["book_aligned_promotion"] = book_aligned_promotion
     if log_fn:
         log_fn(
             f"accuracy default={default_name!r}  "
             f"promote_dir={promotion.get('direction')!r}  "
-            f"promote_mae={promotion.get('price')!r}"
+            f"promote_mae={promotion.get('price')!r}  "
+            f"promote_book_aligned="
+            f"{bool(book_aligned_promotion.get('promote_book_aligned'))}"
         )
     return payload

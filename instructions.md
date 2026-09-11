@@ -73,6 +73,7 @@ python -m forecast.training --universe liquid --interval daily --skip-only \
 # decile_reliability = keep residual*sigma only in TRAIN-reliable pred_r bins
 # cs_left_veto = always-up except CS-bottom ∩ TS left tail (TRAIN q, τ)
 # logistic_up = TRAIN logistic P(up|pred_r) with TRAIN-chosen τ
+# book_aligned = overnight up-rate of TRAIN-chosen top-q residual names vs uncond floor
 python scripts/overnight_accuracy.py --data-dir data --universe liquid \
     --json checkpoints/forecast_ridge_overnight/accuracy.json \
     --calibrate-json checkpoints/forecast_ridge_overnight/overnight_calibrate.json

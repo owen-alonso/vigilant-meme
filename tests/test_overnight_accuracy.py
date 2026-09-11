@@ -19,12 +19,16 @@ from forecast.accuracy import (
     apply_drift_veto,
     apply_readout,
     cond_abs_mask,
+    cs_top_abs_mask,
+    decide_book_aligned_promote,
+    fit_book_aligned_on_train,
     fit_cond_dir_blend,
     fit_confidence_blend,
     fit_cs_left_veto,
     fit_decile_reliability,
     fit_logistic_up,
     fit_left_tail_l1,
+    format_accuracy_report,
     direction_hits,
     evaluate_overnight_accuracy,
     evaluate_overnight_skip,
@@ -35,6 +39,7 @@ from forecast.accuracy import (
     hit_rate_inference,
     hit_rate_vs_p0,
     long_only_book_block,
+    score_book_aligned_sleeve,
     score_eval_frame,
     slim_accuracy,
     two_sided_normal_p,
@@ -304,6 +309,17 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert dec_row["fit"] == "train"
     assert int((dec_row["params"] or {}).get("n_bins") or 0) >= 3
     assert "keep" in (dec_row["params"] or {})
+    ba_fit = payload["book_aligned_fit"]
+    assert ba_fit["fit_split"] == "train"
+    assert "chosen" in ba_fit and "baseline" in ba_fit
+    ba_cmp = payload["book_aligned_compare"]
+    assert "chosen" in ba_cmp["val"] and "top20" in ba_cmp["val"]
+    assert "chosen" in ba_cmp["test"] and "grid" in ba_cmp["val"]
+    ba_promo = payload["book_aligned_promotion"]
+    assert ba_promo["gated_on"] == "val"
+    assert "promote_book_aligned" in ba_promo
+    report = format_accuracy_report(payload)
+    assert "PROMOTE BOOK-ALIGNED" in report
 
 
 def test_zero_move_direction_is_zero_not_nan():
@@ -526,6 +542,80 @@ def test_apply_calibrate_spec_affine_and_veto():
     # Empty spec is residual*sigma passthrough (generate.py with no overlay).
     raw = apply_calibrate_spec(p, {})
     assert np.allclose(raw, p)
+
+
+def test_cs_top_abs_mask_selects_top_and_abs_floor():
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "date": [1, 1, 1, 1, 2, 2, 2, 2],
+            "pred": [0.0, 0.5, 1.0, 2.0, 0.0, 0.1, 0.2, 3.0],
+        }
+    )
+    mask = cs_top_abs_mask(df, q=0.75, abs_tau=0.0, min_names=3)
+    assert mask.tolist() == [False, False, False, True, False, False, False, True]
+    mask_floor = cs_top_abs_mask(df, q=0.75, abs_tau=2.5, min_names=3)
+    assert mask_floor.tolist() == [False, False, False, False, False, False, False, True]
+
+
+def test_fit_book_aligned_on_train_is_train_only():
+    import pandas as pd
+
+    rng = np.random.default_rng(0)
+    dates = np.repeat(np.arange(20, dtype=np.int64), 10)
+    pred = rng.normal(size=dates.size)
+    # TRAIN: higher pred -> more often up. Later window: reverse that.
+    r_train = np.where(pred > np.quantile(pred, 0.80), 0.02, -0.01)
+    r_later = np.where(pred > np.quantile(pred, 0.80), -0.02, 0.01)
+    train = pd.DataFrame({"date": dates, "pred": pred, "r_on": r_train})
+    later = pd.DataFrame({"date": dates + 100, "pred": pred, "r_on": r_later})
+    spec = fit_book_aligned_on_train(train, min_names=3)
+    leaked = fit_book_aligned_on_train(later, min_names=3)
+    assert spec["fit_split"] == "train"
+    assert leaked["fit_split"] == "train"
+    assert spec["chosen"]["q"] != leaked["chosen"]["q"] or spec["chosen"]["abs_tau"] != leaked["chosen"]["abs_tau"] or spec["chosen"]["excess_pp"] != leaked["chosen"]["excess_pp"]
+    scored = score_book_aligned_sleeve(train, q=0.80, abs_tau=0.0, min_names=3)
+    assert scored["n"] > 0
+    assert np.isfinite(scored["up_pct"])
+    assert np.isfinite(scored["excess_pp"])
+
+
+def test_decide_book_aligned_promote_is_val_only():
+    chosen = {"q": 0.90, "abs_tau": 0.0, "abs_q": 0.0}
+    val_ok = {
+        "up_pct": 56.5,
+        "uncond_up_pct": 54.0,
+        "excess_pp": 2.5,
+        "coverage": 0.10,
+    }
+    d = decide_book_aligned_promote(
+        val_chosen=val_ok, val_top20={"up_pct": 56.0}, chosen=chosen
+    )
+    assert d["promote_book_aligned"] is True
+    assert d["gated_on"] == "val"
+    val_fail = {
+        "up_pct": 56.05,
+        "uncond_up_pct": 54.0,
+        "excess_pp": 2.05,
+        "coverage": 0.10,
+    }
+    d2 = decide_book_aligned_promote(
+        val_chosen=val_fail, val_top20={"up_pct": 56.0}, chosen=chosen
+    )
+    assert d2["promote_book_aligned"] is False
+    same = {"q": 0.80, "abs_tau": 0.0, "abs_q": 0.0}
+    juicy = {
+        "up_pct": 70.0,
+        "uncond_up_pct": 50.0,
+        "excess_pp": 20.0,
+        "coverage": 0.20,
+    }
+    d3 = decide_book_aligned_promote(
+        val_chosen=juicy, val_top20={"up_pct": 50.0}, chosen=same
+    )
+    assert d3["promote_book_aligned"] is False
+    assert d3["gated_on"] == "val"
 
 
 def test_long_only_book_block_selects_within_date_top_pred():
