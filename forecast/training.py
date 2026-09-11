@@ -433,27 +433,42 @@ def mean_cs_stats(
     dates: np.ndarray,
     *,
     min_names: int = 3,
+    flat_as_zero: bool = False,
 ) -> dict[str, float]:
-    """Mean CS Pearson / Spearman, t-stat, and coverage over dates."""
+    """Mean CS Pearson / Spearman, t-stat, and coverage over dates.
+
+    ``flat_as_zero`` counts degenerate (zero-variance) predictions as IC=0
+    instead of dropping the date. Needed when a timing overlay flattens a day.
+    """
     empty = {
         "cs_ic": float("nan"),
         "cs_ic_spearman": float("nan"),
         "cs_ic_tstat": float("nan"),
         "cs_n_dates": 0.0,
         "cs_mean_n": float("nan"),
+        "cs_n_flat": 0.0,
     }
     if pred.size == 0 or dates.size != pred.size:
         return empty
     ics: list[float] = []
     spears: list[float] = []
     ns: list[float] = []
+    n_flat = 0
     for key in np.unique(dates):
         sel = dates == key
         n = int(sel.sum())
         if n < min_names:
             continue
-        rho = _pearson(pred[sel], target[sel])
-        sp = _spearman(pred[sel], target[sel])
+        p = pred[sel]
+        y = target[sel]
+        if flat_as_zero and float(np.std(p)) < 1e-12:
+            ics.append(0.0)
+            spears.append(0.0)
+            ns.append(float(n))
+            n_flat += 1
+            continue
+        rho = _pearson(p, y)
+        sp = _spearman(p, y)
         if np.isfinite(rho):
             ics.append(rho)
             spears.append(sp if np.isfinite(sp) else float("nan"))
@@ -474,6 +489,7 @@ def mean_cs_stats(
         "cs_ic_tstat": tstat,
         "cs_n_dates": float(arr.size),
         "cs_mean_n": float(np.mean(ns)),
+        "cs_n_flat": float(n_flat),
     }
 
 
@@ -1270,6 +1286,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="add a mapped industry ETF as a third residual factor when present",
     )
     g.add_argument(
+        "--label-return",
+        default=d.label_return,
+        choices=("close", "overnight", "session"),
+        help="residual label: close-to-close (default), overnight gap, or next-session open-to-close",
+    )
+    g.add_argument(
         "--no-equities-only",
         action="store_true",
         help="keep index/sector/macro ETFs in the trading book",
@@ -1523,6 +1545,7 @@ def configs_from_cli(
         double_residual=args.double_residual,
         residualize_features=args.residualize_features,
         industry_residual=args.industry_residual,
+        label_return=str(args.label_return or "close"),
     )
     model_cfg = ForecastModelConfig(
         n_features=len(FEATURE_NAMES),

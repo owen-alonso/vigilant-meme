@@ -329,3 +329,108 @@ def test_late_train_holdout_is_disjoint_and_last():
     assert not bool((fit & sel).any())
     assert bool(fit.any()) and bool(sel.any())
     assert int(dates[sel].min()) > int(dates[fit].max())
+
+
+def test_trailing_skip_ic_does_not_use_same_day_label():
+    from forecast.ridge import apply_skip_ic_shrink, trailing_skip_ic_stats
+
+    n_dates, n_names = 80, 12
+    rng = np.random.default_rng(12)
+    dates = np.repeat(np.arange(n_dates, dtype=np.int64), n_names)
+    pred = rng.normal(size=n_dates * n_names)
+    y = pred + 0.3 * rng.normal(size=n_dates * n_names)
+    keys, mu, tt, _n = trailing_skip_ic_stats(
+        pred, y, dates, lookback_days=20, min_names=8, min_obs=8
+    )
+    y2 = y.copy()
+    last = dates == dates.max()
+    y2[last] = rng.normal(size=int(last.sum()))
+    keys2, mu2, tt2, _n2 = trailing_skip_ic_stats(
+        pred, y2, dates, lookback_days=20, min_names=8, min_obs=8
+    )
+    assert np.array_equal(keys, keys2)
+    assert np.allclose(mu, mu2, equal_nan=True)
+    assert np.allclose(tt, tt2, equal_nan=True)
+    # Yesterday's IC is in today's window; mutating the last date must not
+    # change shrink factors on any date, including the last.
+    shrunk = apply_skip_ic_shrink(
+        pred, dates, date_keys=keys, trailing_ic=mu, trailing_t=tt, train_ic=0.2, mode="scale"
+    )
+    shrunk2 = apply_skip_ic_shrink(
+        pred, dates, date_keys=keys2, trailing_ic=mu2, trailing_t=tt2, train_ic=0.2, mode="scale"
+    )
+    assert np.allclose(shrunk, shrunk2, equal_nan=True)
+
+
+def test_trailing_skip_ic_window_is_left_closed():
+    from forecast.ridge import trailing_skip_ic_stats
+    from forecast.training import _pearson
+
+    n_names = 12
+    # Three dates. Date 0 IC = +1, date 1 IC = -1, date 2 unused.
+    pred = np.concatenate(
+        [
+            np.linspace(-1, 1, n_names),
+            np.linspace(-1, 1, n_names),
+            np.linspace(-1, 1, n_names),
+        ]
+    )
+    y = np.concatenate(
+        [
+            np.linspace(-1, 1, n_names),
+            np.linspace(1, -1, n_names),
+            np.zeros(n_names),
+        ]
+    )
+    dates = np.repeat(np.array([10, 20, 30], dtype=np.int64), n_names)
+    keys, mu, _tt, n_obs = trailing_skip_ic_stats(
+        pred, y, dates, lookback_days=15, min_names=8, min_obs=1
+    )
+    # Date 20 window is [5, 20) → only date 10, IC=+1.
+    i20 = int(np.where(keys == 20)[0][0])
+    i30 = int(np.where(keys == 30)[0][0])
+    assert n_obs[i20] == 1
+    assert mu[i20] == pytest.approx(1.0, abs=1e-6)
+    # Date 30 window is [15, 30) → only date 20 (lookback 15), IC=-1.
+    assert n_obs[i30] == 1
+    assert mu[i30] == pytest.approx(-1.0, abs=1e-6)
+    # Date 10 has no prior dates in window.
+    i10 = int(np.where(keys == 10)[0][0])
+    assert n_obs[i10] == 0
+    assert not np.isfinite(mu[i10])
+    assert _pearson(pred[:n_names], y[:n_names]) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_flatten_tstat_zeros_when_trailing_ic_is_dead():
+    from forecast.ridge import apply_skip_ic_shrink, trailing_skip_ic_stats
+    from forecast.training import mean_cs_stats
+
+    n_dates, n_names = 60, 12
+    rng = np.random.default_rng(13)
+    dates = np.repeat(np.arange(n_dates, dtype=np.int64), n_names)
+    signal = rng.normal(size=n_dates * n_names)
+    pred = signal.copy()
+    y = signal.copy()
+    # Second half: skip is anti-aligned.
+    later = dates >= 30
+    y[later] = -signal[later]
+    keys, mu, tt, _n = trailing_skip_ic_stats(
+        pred, y, dates, lookback_days=25, min_names=8, min_obs=8
+    )
+    flat = apply_skip_ic_shrink(
+        pred,
+        dates,
+        date_keys=keys,
+        trailing_ic=mu,
+        trailing_t=tt,
+        train_ic=0.5,
+        mode="flatten_tstat",
+    )
+    # Late dates should see a negative trailing IC and flatten.
+    late_pred = flat[dates == n_dates - 1]
+    assert float(np.std(late_pred)) < 1e-12
+    stats = mean_cs_stats(flat, y, dates, min_names=8, flat_as_zero=True)
+    raw = mean_cs_stats(pred, y, dates, min_names=8, flat_as_zero=True)
+    # Flattening the dead half should beat (or match) always-on skip.
+    assert stats["cs_ic"] + 1e-9 >= raw["cs_ic"]
+    assert stats["cs_n_flat"] > 0

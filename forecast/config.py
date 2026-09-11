@@ -106,6 +106,10 @@ class DataConfig:
     residualize_features: bool = False
     # Optional third factor vs a mapped industry ETF when that parquet exists.
     industry_residual: bool = False
+    # Which forward log-return the residual label uses. ``close`` is close_t →
+    # close_{t+h} (the locked estimand). ``overnight`` is close_t → open_{t+h};
+    # ``session`` is open_{t+h} → close_{t+h}. Features stay at close t.
+    label_return: str = "close"
 
     def is_daily(self) -> bool:
         return self.interval == "daily"
@@ -139,6 +143,8 @@ class DataConfig:
             payload["residualize_features"] = False
         if "industry_residual" not in payload:
             payload["industry_residual"] = False
+        if "label_return" not in payload:
+            payload["label_return"] = "close"
         return cls(**filter_dataclass_fields(cls, payload))
 
 

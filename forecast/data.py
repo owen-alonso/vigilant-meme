@@ -364,6 +364,23 @@ def _gap_limit_days(cfg: DataConfig) -> int:
     return cfg.max_session_gap_days
 
 
+def _forward_log_return(out: pd.DataFrame, log_close: pd.Series, cfg: DataConfig) -> pd.Series:
+    """Causal label return. Features never see these future prices."""
+    kind = str(getattr(cfg, "label_return", "close") or "close").strip().lower()
+    h = int(cfg.horizon)
+    if kind in ("", "close", "close_close", "cc"):
+        return log_close.shift(-h) - log_close
+    open_px = out["open"].astype(np.float64).clip(lower=1e-12)
+    log_open = np.log(open_px)
+    if kind in ("overnight", "on", "gap", "close_open"):
+        return log_open.shift(-h) - log_close
+    if kind in ("session", "oc", "open_close", "intraday"):
+        return log_close.shift(-h) - log_open.shift(-h)
+    raise ValueError(
+        f"unknown label_return {kind!r}; expected close, overnight, or session"
+    )
+
+
 def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     """Attach features, the forward-return target, its scale, and a validity mask."""
     out = grid.copy()
@@ -446,7 +463,7 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     out["dow_frac"] = out["datetime"].dt.dayofweek.astype(np.float64) / 4.0
 
     # Target: log return realized `horizon` bars later, in volatility units.
-    forward = log_close.shift(-cfg.horizon) - log_close
+    forward = _forward_log_return(out, log_close, cfg)
     out["target_raw"] = forward
     out["target"] = forward / out["scale"]
     horizon_traded = out["traded"].shift(-cfg.horizon)

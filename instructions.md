@@ -56,13 +56,16 @@ python -m forecast.training --universe liquid --interval daily --skip-only --che
 # optional: --no-sector-residual --no-equities-only --no-train-from --no-ridge-rank-target
 ```
 
-The skip defaults to **within-date rank-target ridge** with ``ridge=10``, feature winsor 3, and ``--ridge-features no_long_ts``, plus same-bar CS product features (val-selected). Do **not** enable walk-forward / later ``train_from`` / ListNet-skip / crash-date drop / year-balance / year-stable mask / double residual / feature residualization / industry residual / ``liquid_wide`` / regime heads / ``no_vol_products`` / trailing readout windows as the default from test: those lost or were a dead heat on locked val.
+The skip defaults to **within-date rank-target ridge** with ``ridge=10``, feature winsor 3, and ``--ridge-features no_long_ts``, plus same-bar CS product features (val-selected). Do **not** enable walk-forward / later ``train_from`` / ListNet-skip / crash-date drop / year-balance / year-stable mask / double residual / feature residualization / industry residual / ``liquid_wide`` / regime heads / ``no_vol_products`` / trailing readout windows / trailing skip-IC shrink / ``--label-return overnight|session`` as the default from test: those lost or were a dead heat on locked val (shrink/labels: val-gate before promoting).
 
 Optional next levers (val-gate; do not promote from test):
 
 ```bash
 # regime heads / surgical vol+CS-product drop / trailing readout window (all lost on val)
 python scripts/cs_regime_ablate.py --data-dir data --universe liquid
+# causal trailing skip-IC shrink (choose L on train only); optional overnight/session labels
+python scripts/cs_shrink_ablate.py --data-dir data --universe liquid
+python scripts/cs_shrink_ablate.py --data-dir data --universe liquid --also-labels
 # ~170-equity 2018-era book (Yahoo extras; --skip-existing reuses the 85-name cache)
 python -m forecast.download --universe liquid_wide --source yahoo --interval daily --skip-existing
 python -m forecast.training --universe liquid_wide --interval daily --skip-only

@@ -378,10 +378,13 @@ def cs_stats(
     dates: np.ndarray,
     *,
     min_names: int = 3,
+    flat_as_zero: bool = False,
 ) -> dict[str, float]:
     from forecast.training import mean_cs_stats
 
-    return mean_cs_stats(pred, target, dates, min_names=min_names)
+    return mean_cs_stats(
+        pred, target, dates, min_names=min_names, flat_as_zero=flat_as_zero
+    )
 
 
 def date_ics(
@@ -405,6 +408,120 @@ def date_ics(
     return np.asarray(rows, dtype=np.float64)
 
 
+def trailing_skip_ic_stats(
+    pred: np.ndarray,
+    target: np.ndarray,
+    dates: np.ndarray,
+    *,
+    lookback_days: int,
+    min_names: int = 8,
+    min_obs: int = 20,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Causal trailing mean CS IC of a *frozen* skip.
+
+    For each unique date ``t`` in ``dates``, the mean and t-stat use per-date
+    CS ICs on ``d`` in ``[t - lookback_days, t)``. The label on ``d`` realizes
+    at ``d+1``, so ``d < t`` is known at close ``t``. Date ``t``'s own ``y``
+    is never in the window.
+
+    Returns ``keys, mean_ic, tstat, n_obs`` aligned to sorted unique dates.
+    Insufficient history is NaN (caller should leave those preds unscaled).
+    """
+    all_keys = np.unique(np.asarray(dates, dtype=np.int64))
+    n_all = int(all_keys.size)
+    mean_out = np.full(n_all, np.nan, dtype=np.float64)
+    t_out = np.full(n_all, np.nan, dtype=np.float64)
+    n_out = np.zeros(n_all, dtype=np.int64)
+    ics = date_ics(pred, target, dates, min_names=min_names)
+    if ics.size == 0 or n_all == 0:
+        return all_keys, mean_out, t_out, n_out
+    ic_keys = ics[:, 0].astype(np.int64)
+    ic_vals = ics[:, 1].astype(np.float64)
+    order = np.argsort(ic_keys, kind="mergesort")
+    ic_keys = ic_keys[order]
+    ic_vals = ic_vals[order]
+    finite = np.isfinite(ic_vals)
+    ic_keys = ic_keys[finite]
+    ic_vals = ic_vals[finite]
+    if ic_keys.size == 0:
+        return all_keys, mean_out, t_out, n_out
+    csum = np.cumsum(ic_vals)
+    csum2 = np.cumsum(ic_vals * ic_vals)
+    span = max(1, int(lookback_days))
+    need = max(1, int(min_obs))
+    for i, t in enumerate(all_keys):
+        lo_val = int(t) - span
+        lo = int(np.searchsorted(ic_keys, lo_val, side="left"))
+        hi = int(np.searchsorted(ic_keys, int(t), side="left"))
+        n = hi - lo
+        n_out[i] = n
+        if n < need:
+            continue
+        s = float(csum[hi - 1] - (csum[lo - 1] if lo > 0 else 0.0))
+        s2 = float(csum2[hi - 1] - (csum2[lo - 1] if lo > 0 else 0.0))
+        mu = s / n
+        var = (s2 - s * s / n) / max(n - 1, 1)
+        se = float(np.sqrt(max(var, 0.0)) / np.sqrt(n))
+        mean_out[i] = mu
+        t_out[i] = mu / se if se > 1e-12 else float("nan")
+    return all_keys, mean_out, t_out, n_out
+
+
+def apply_skip_ic_shrink(
+    pred: np.ndarray,
+    dates: np.ndarray,
+    *,
+    date_keys: np.ndarray,
+    trailing_ic: np.ndarray,
+    trailing_t: np.ndarray,
+    train_ic: float,
+    mode: str = "scale",
+) -> np.ndarray:
+    """Scale or flatten frozen-skip scores from causal trailing CS IC.
+
+    ``scale`` / ``scale_cap``: ``max(0, trailing_ic / train_ic)`` (cap clips at 1).
+    Positive scale is a no-op for Pearson CS IC; flattening (factor=0) is the
+    timing overlay. ``flatten_tstat`` zeros dates with trailing t-stat < 0;
+    ``flatten_weak`` zeros trailing t-stat < 1.
+    Dates without enough trailing history keep the raw skip.
+    """
+    dates_i = np.asarray(dates, dtype=np.int64)
+    keys = np.asarray(date_keys, dtype=np.int64)
+    out = np.asarray(pred, dtype=np.float64).copy()
+    if dates_i.size == 0 or keys.size == 0:
+        return out
+    loc = np.searchsorted(keys, dates_i)
+    loc = np.clip(loc, 0, keys.size - 1)
+    match = keys[loc] == dates_i
+    mu = np.full(dates_i.shape[0], np.nan, dtype=np.float64)
+    tt = np.full(dates_i.shape[0], np.nan, dtype=np.float64)
+    mu[match] = np.asarray(trailing_ic, dtype=np.float64)[loc[match]]
+    tt[match] = np.asarray(trailing_t, dtype=np.float64)[loc[match]]
+    have = np.isfinite(mu)
+    train = float(train_ic)
+    if (not np.isfinite(train)) or abs(train) < 1e-8:
+        train = 1.0
+    raw = (mode or "scale").strip().lower()
+    factor = np.ones(out.shape[0], dtype=np.float64)
+    if raw in ("scale", "shrink"):
+        factor = np.where(have, np.maximum(0.0, mu / train), 1.0)
+    elif raw in ("scale_cap", "cap"):
+        factor = np.where(have, np.clip(mu / train, 0.0, 1.0), 1.0)
+    elif raw in ("flatten_tstat", "flatten"):
+        dead = have & np.isfinite(tt) & (tt < 0.0)
+        dead |= have & (~np.isfinite(tt)) & (mu <= 0.0)
+        factor = np.where(dead, 0.0, 1.0)
+    elif raw in ("flatten_weak", "weak"):
+        dead = have & ((~np.isfinite(tt)) | (tt < 1.0))
+        factor = np.where(dead, 0.0, 1.0)
+    elif raw in ("flatten_ic",):
+        factor = np.where(have & (mu <= 0.0), 0.0, 1.0)
+    else:
+        raise ValueError(f"unknown skip-IC shrink mode {mode!r}")
+    out *= factor
+    return out
+
+
 def univariate_cs_ics(
     x: np.ndarray,
     y: np.ndarray,
@@ -426,6 +543,7 @@ def year_cs_ics(
     dates: np.ndarray,
     *,
     min_names: int = 3,
+    flat_as_zero: bool = False,
 ) -> list[dict[str, float]]:
     """Mean CS IC / t-stat grouped by calendar year of ``dates`` (days since epoch)."""
     if pred.size == 0:
@@ -434,7 +552,13 @@ def year_cs_ics(
     rows: list[dict[str, float]] = []
     for year in sorted(set(int(v) for v in yr)):
         sel = yr == year
-        stats = cs_stats(pred[sel], target[sel], dates[sel], min_names=min_names)
+        stats = cs_stats(
+            pred[sel],
+            target[sel],
+            dates[sel],
+            min_names=min_names,
+            flat_as_zero=flat_as_zero,
+        )
         stats["year"] = float(year)
         rows.append(stats)
     return rows

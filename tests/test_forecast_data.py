@@ -552,6 +552,7 @@ def test_weekly_cli_uses_week_scale_context():
     assert data_cfg.double_residual is False
     assert data_cfg.residualize_features is False
     assert data_cfg.industry_residual is False
+    assert data_cfg.label_return == "close"
     assert train_cfg.ridge_year_balance is False
     assert train_cfg.ridge_year_stable == ""
 
@@ -636,6 +637,58 @@ def test_residual_target_uses_future_spy_in_label_not_features():
         float(alt["AAPL"]["mkt_ret_1"].iloc[t])
     )
     assert base["AAPL"]["target"].iloc[t] != pytest.approx(float(alt["AAPL"]["target"].iloc[t]))
+
+
+def test_overnight_label_uses_next_open_not_next_close():
+    cfg_cc = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+        residual_target=False,
+        label_return="close",
+    )
+    cfg_on = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+        residual_target=False,
+        label_return="overnight",
+    )
+    cfg_oc = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+        residual_target=False,
+        label_return="session",
+    )
+    grid = _daily_grid(40)
+    grid["open"] = grid["close"] * 0.99
+    grid.loc[grid.index[20], "open"] = float(grid["close"].iloc[19]) * 1.05
+    grid.loc[grid.index[20], "close"] = float(grid["close"].iloc[19]) * 1.01
+    cc = compute_features(grid.copy(), cfg_cc)
+    on = compute_features(grid.copy(), cfg_on)
+    oc = compute_features(grid.copy(), cfg_oc)
+    t = 19
+    log_c = np.log(grid["close"].astype(float))
+    log_o = np.log(grid["open"].astype(float))
+    assert cc["target_raw"].iloc[t] == pytest.approx(float(log_c.iloc[t + 1] - log_c.iloc[t]))
+    assert on["target_raw"].iloc[t] == pytest.approx(float(log_o.iloc[t + 1] - log_c.iloc[t]))
+    assert oc["target_raw"].iloc[t] == pytest.approx(float(log_c.iloc[t + 1] - log_o.iloc[t + 1]))
+    assert on["target_raw"].iloc[t] != pytest.approx(float(cc["target_raw"].iloc[t]))
+    spiked = grid.copy()
+    spiked.loc[spiked.index[20], "close"] = float(spiked["close"].iloc[20]) * 1.2
+    on2 = compute_features(spiked, cfg_on)
+    assert on["target_raw"].iloc[t] == pytest.approx(float(on2["target_raw"].iloc[t]))
+    assert on["ret_1"].iloc[t] == pytest.approx(float(on2["ret_1"].iloc[t]))
 
 
 def test_mean_cs_ic_averages_per_date_pearson():
