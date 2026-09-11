@@ -1068,6 +1068,17 @@ def main(argv: list[str] | None = None) -> int:
             or float(sleeve_2017["cs_ic"]) >= float(VAL_2017_KEEP)
         )
         promote_sleeve = np.isfinite(lift) and lift >= float(VAL_LIFT) and keep_2017
+        sleeve_live = next(
+            (r for r in payload["stress"] if r["name"] == "live_liquid_sleeve"), None
+        )
+        full_live = next((r for r in payload["stress"] if r["name"] == "live"), None)
+        sleeve_ir = float((sleeve_live or {}).get("unlevered_net_ir") or float("nan"))
+        full_ir = float((full_live or {}).get("unlevered_net_ir") or float("nan"))
+        ir_wins = (
+            np.isfinite(sleeve_ir)
+            and np.isfinite(full_ir)
+            and sleeve_ir >= full_ir + 0.05
+        )
         payload["liquid_sleeve"] = {
             "adv_floor_pctile": floor,
             "cs_min_names": _sleeve_min_names(min_names, floor),
@@ -1077,10 +1088,14 @@ def main(argv: list[str] | None = None) -> int:
             "test_2023": sleeve_2023,
             "val_lift": float(lift),
             "promote": bool(promote_sleeve),
+            "live_unlev_ir": sleeve_ir,
+            "full_live_unlev_ir": full_ir,
+            "replace_default_live_book": bool(promote_sleeve and ir_wins),
             "note": (
                 "same overnight skip w; trade only top CS turnover_z tercile. "
-                "Known at t. Not a new model. Live long-only sleeve can have "
-                "worse causal-vol DD than the full long-only book (lumpier)."
+                "Known at t. Not a new model. CS-IC gate can promote the filter; "
+                "do not replace the default live book unless live IR also wins. "
+                "Long-only sleeve is lumpier under causal vol (worse lev DD)."
             ),
         }
         print(
@@ -1088,7 +1103,8 @@ def main(argv: list[str] | None = None) -> int:
             f"lift={lift:+.4f} val2017={float(sleeve_2017.get('cs_ic', float('nan'))):+.4f} "
             f"test={float(sleeve_test.get('cs_ic', float('nan'))):+.4f} "
             f"2023={float(sleeve_2023.get('cs_ic', float('nan'))):+.4f} "
-            f"{'PROMOTE live sleeve' if promote_sleeve else 'no'}",
+            f"{'PROMOTE sleeve filter' if promote_sleeve else 'no'}"
+            f"{' (also replaces live book)' if ir_wins else ' (keep full-universe live IR)'}",
             flush=True,
         )
     if not args.no_stability:

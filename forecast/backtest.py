@@ -449,7 +449,7 @@ def book_pnl(
         turnover = pd.Series(overnight_one_way_turnover(w_arr), index=w_panel.index)
         parts = overnight_cost_breakdown(weights=w_arr, **cost_kwargs)
         cost_unlev = pd.Series(parts["total"], index=w_panel.index)
-        cost_parts = {k: float(np.mean(v)) for k, v in parts.items()}
+        cost_parts = {k: float(np.nanmean(v)) for k, v in parts.items()}
     else:
         prev = w_panel.shift(1).fillna(0.0)
         turnover = 0.5 * (w_panel - prev).abs().sum(axis=1)
@@ -472,7 +472,7 @@ def book_pnl(
             extra_kw["round_trip_bps"] = 0.0
             parts = overnight_cost_breakdown(weights=w_arr, **extra_kw)
             cost_unlev = cost_unlev + parts["total"]
-        cost_parts = {k: float(np.mean(v)) for k, v in parts.items()} if parts else {}
+        cost_parts = {k: float(np.nanmean(v)) for k, v in parts.items()} if parts else {}
         cost_parts["total"] = float(cost_unlev.mean()) if len(cost_unlev) else float("nan")
         cost_parts["round_trip"] = float(
             ((float(round_trip_bps) * 1e-4) * turnover).mean()

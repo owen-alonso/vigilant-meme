@@ -496,6 +496,8 @@ def overnight_cost_breakdown(
     impact = np.zeros_like(one_way)
     if float(impact_vol_k) and vol_level is not None:
         vol = np.clip(_as_2d(vol_level, w.shape), 0.0, None)
+        # Missing vol is "no extra impact", not a NaN date that pandas IR then drops.
+        vol = np.nan_to_num(vol, nan=0.0, posinf=0.0, neginf=0.0)
         impact = (float(impact_vol_k) * 1e-4) * (vol * abs_w).sum(axis=1)
 
     ex_post = np.zeros_like(one_way)

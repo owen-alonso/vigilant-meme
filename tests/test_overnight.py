@@ -757,6 +757,20 @@ def test_sleeve_cs_stays_finite_when_protocol_min_names_exceeds_sleeve():
     assert stats["cs_n_dates"] > 0
 
 
+def test_missing_vol_level_does_not_nan_impact_cost():
+    w = np.array([[-0.5, 0.5]])
+    vol = np.array([[np.nan, 0.02]])
+    parts = overnight_cost_breakdown(
+        weights=w,
+        round_trip_bps=0.0,
+        impact_vol_k=8.0,
+        vol_level=vol,
+    )
+    assert np.isfinite(parts["impact"][0])
+    assert np.isfinite(parts["total"][0])
+    assert parts["impact"][0] == pytest.approx(8e-4 * 0.02 * 0.5)
+
+
 def test_moc_moo_charge_full_notional_not_exit_half():
     w = np.array([[-0.5, 0.5]])
     legacy = overnight_cost_breakdown(
