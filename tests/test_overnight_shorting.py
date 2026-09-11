@@ -14,6 +14,7 @@ from forecast.shorting import (
     IR_LIFT,
     SHORT_EXCESS_LIFT_PP,
     decide_lo_promote,
+    decide_lo_refine,
     decide_ls_promote,
     evaluate_overnight_shorting,
     format_shorting_report,
@@ -196,6 +197,49 @@ def test_decide_lo_promote_requires_ir_lift_not_worse_dd():
     assert dd_worse["spec"]["quantile"] == 0.2
 
 
+def test_decide_lo_refine_test_veto_does_not_pick_another_cell():
+    grid = {
+        "baseline": {
+            "name": "lo_q20_equal_c0",
+            "unlevered_net_ir": 1.0,
+            "unlevered_max_dd": -0.20,
+            "weighting": "quantile",
+            "quantile": 0.2,
+            "long_size": "equal",
+            "conf_pctile": 0.0,
+            "adv_floor_pctile": 0.0,
+        },
+        "best": {
+            "name": "lo_q15_abs_pred_c50",
+            "unlevered_net_ir": 1.30,
+            "unlevered_max_dd": -0.18,
+            "weighting": "quantile",
+            "quantile": 0.15,
+            "long_size": "abs_pred",
+            "conf_pctile": 0.5,
+            "adv_floor_pctile": 0.0,
+        },
+    }
+    collapsed = decide_lo_refine(
+        grid,
+        test_baseline={"unlevered_net_ir": 2.0},
+        test_best={"unlevered_net_ir": 1.0},
+    )
+    assert collapsed["promote_lo"] is False
+    assert collapsed["test_veto"] is True
+    assert collapsed["spec"]["quantile"] == 0.2
+    assert collapsed["spec"]["long_size"] == "equal"
+
+    ok = decide_lo_refine(
+        grid,
+        test_baseline={"unlevered_net_ir": 2.0},
+        test_best={"unlevered_net_ir": 1.98},
+    )
+    assert ok["promote_lo"] is True
+    assert ok["test_veto"] is False
+    assert ok["spec"]["long_size"] == "abs_pred"
+
+
 def test_frame_to_wide_uses_calendar_index():
     df = pd.DataFrame(
         {
@@ -281,5 +325,7 @@ def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
     assert payload["promotion"]["short_excess_pp"] == pytest.approx(val_xs)
     assert payload["lo_promotion"]["gated_on"] == "val"
     assert payload["ls_experiment"]["promote_as_default"] is False
+    assert payload["lo_refine_promotion"]["gated_on"] == "val"
     assert "VAL LONG-ONLY GRID" in text
+    assert "VAL LONG-ONLY REFINE" in text
     assert "LS HAIRCUT EXPERIMENT" in text

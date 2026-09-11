@@ -313,6 +313,58 @@ def date_weights(
     return quantile_weights(scores, quantile=quantile, long_only=long_only)
 
 
+def resize_long_only(
+    weights: pd.Series,
+    scores: pd.Series,
+    *,
+    vol: pd.Series | None = None,
+    long_size: str = "equal",
+    conf_pctile: float = 0.0,
+) -> pd.Series:
+    """Causal long-only resize known at close t. Does not use labels.
+
+    ``conf_pctile`` drops longs whose ``|pred|`` is below that CS percentile
+    of ``|pred|`` on the same date. ``long_size`` reweights remaining longs:
+    equal, ``abs_pred``, or ``inv_vol`` (missing vol → date median).
+    """
+    out = weights.astype(np.float64).copy()
+    long = out > 1e-12
+    if not bool(long.any()):
+        return out
+    p = float(np.clip(conf_pctile, 0.0, 0.95))
+    if p > 0:
+        mag = scores.reindex(out.index).abs()
+        finite = mag.notna() & np.isfinite(mag)
+        if int(finite.sum()) >= 3:
+            cut = float(np.nanpercentile(mag[finite], 100.0 * p))
+            keep = long & finite & (mag >= cut)
+            out.loc[long & ~keep] = 0.0
+            long = out > 1e-12
+    if not bool(long.any()):
+        return out * 0.0
+    mode = str(long_size or "equal").strip().lower()
+    if mode == "abs_pred":
+        mag = scores.reindex(out.index).abs()
+        mag = mag.where(long & np.isfinite(mag), 0.0)
+        tot = float(mag.sum())
+        if tot > 1e-12:
+            return mag / tot
+    elif mode == "inv_vol" and vol is not None:
+        v = pd.to_numeric(vol.reindex(out.index), errors="coerce")
+        finite = v.notna() & np.isfinite(v) & (v > 1e-8)
+        if bool(finite.any()):
+            fill = float(np.nanmedian(v[finite].to_numpy()))
+            inv = 1.0 / v.where(finite, fill)
+            inv = inv.where(long, 0.0)
+            tot = float(inv.sum())
+            if tot > 1e-12:
+                return inv / tot
+    n = int(long.sum())
+    out.loc[long] = 1.0 / n
+    out.loc[~long] = 0.0
+    return out
+
+
 def _renorm_row(w: np.ndarray, *, long_only: bool) -> np.ndarray:
     out = np.asarray(w, dtype=np.float64).copy()
     if long_only:
@@ -406,6 +458,8 @@ def book_pnl(
     vol_level: pd.DataFrame | None = None,
     overnight_r: pd.DataFrame | None = None,
     adv_floor_pctile: float = 0.0,
+    long_size: str = "equal",
+    conf_pctile: float = 0.0,
 ) -> dict[str, Any]:
     """Cost-aware long-short with optional rank weights, hold smoothing, causal vol.
 
@@ -458,6 +512,19 @@ def book_pnl(
             quantile=quantile,
             long_only=long_only,
         )
+        if long_only and (
+            str(long_size or "equal").lower() != "equal" or float(conf_pctile) > 0
+        ):
+            vol_row = None
+            if vol_level is not None and ts in vol_level.index:
+                vol_row = vol_level.loc[ts].reindex(w.index)
+            w = resize_long_only(
+                w,
+                pair_all["p"].reindex(w.index),
+                vol=vol_row,
+                long_size=str(long_size or "equal"),
+                conf_pctile=float(conf_pctile),
+            )
         r = pair_all["r"].reindex(w.index)
         pair = pd.concat([w, r], axis=1, keys=["w", "r"]).dropna()
         if len(pair) < 2:
@@ -647,6 +714,8 @@ def book_pnl(
         "locate_frac": float(locate_frac) if not long_only else 0.0,
         "max_short_gross": float(max_short_gross) if not long_only else 0.0,
         "adv_floor_pctile": float(adv_floor_pctile),
+        "long_size": str(long_size or "equal"),
+        "conf_pctile": float(conf_pctile),
         "ex_post_gap_k": float(ex_post_gap_k),
         "mean_long_nav": sides["mean_long_nav"],
         "mean_short_nav": sides["mean_short_nav"],
@@ -854,6 +923,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="drop names below this CS turnover_z percentile before forming weights "
         "(0.67 = top tercile liquid sleeve)",
+    )
+    p.add_argument(
+        "--long-size",
+        choices=("equal", "abs_pred", "inv_vol"),
+        default="equal",
+        help="long-only resize among the selected sleeve (equal default; "
+        "abs_pred / inv_vol are causal). Ignored unless --long-only.",
+    )
+    p.add_argument(
+        "--conf-pctile",
+        type=float,
+        default=0.0,
+        help="long-only: drop sleeve names with |pred| below this CS percentile "
+        "(0=off, 0.5=date-median conviction). Causal; ignored unless --long-only.",
     )
     p.add_argument(
         "--locate-adv-pctile",
@@ -1085,6 +1168,8 @@ def main(argv: list[str] | None = None) -> int:
         vol_level=vol,
         overnight_r=on_r,
         adv_floor_pctile=float(args.adv_floor_pctile or 0.0),
+        long_size=str(getattr(args, "long_size", "equal") or "equal"),
+        conf_pctile=float(getattr(args, "conf_pctile", 0.0) or 0.0),
     )
     stats = book_pnl(pred, realized, long_only=args.long_only, **book_kw)
     print(format_report(stats, checkpoint=ckpt_path, test_start=start))

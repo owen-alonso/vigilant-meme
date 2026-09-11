@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from forecast.backtest import book_pnl, quantile_weights, rank_weights
+from forecast.backtest import book_pnl, quantile_weights, rank_weights, resize_long_only
 
 
 def test_quantile_weights_two_name_spread():
@@ -22,6 +22,24 @@ def test_quantile_weights_long_short_equal_notional():
     w = quantile_weights(s, quantile=0.2)
     assert w[w > 0].sum() == pytest.approx(0.5)
     assert w[w < 0].sum() == pytest.approx(-0.5)
+
+
+def test_resize_long_only_conf_drops_low_abs_pred():
+    scores = pd.Series({"A": 0.01, "B": 1.0, "C": 0.8, "D": -0.5})
+    w = pd.Series({"A": 0.5, "B": 0.5, "C": 0.0, "D": 0.0})
+    out = resize_long_only(w, scores, long_size="equal", conf_pctile=0.5)
+    assert out["A"] == pytest.approx(0.0)
+    assert out["B"] == pytest.approx(1.0)
+    assert out.sum() == pytest.approx(1.0)
+
+
+def test_resize_long_only_inv_vol_prefers_quiet_names():
+    scores = pd.Series({"A": 1.0, "B": 1.0})
+    w = pd.Series({"A": 0.5, "B": 0.5})
+    vol = pd.Series({"A": 0.4, "B": 0.1})
+    out = resize_long_only(w, scores, vol=vol, long_size="inv_vol")
+    assert out["B"] > out["A"]
+    assert out.sum() == pytest.approx(1.0)
 
 
 def test_quantile_weights_long_only_sums_to_one():

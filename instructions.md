@@ -99,6 +99,12 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/be
 # long-only, no locate, borrow=0 — default live book after LS failed VAL
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --live-costs --long-only
+# VAL-promoted long-only spec on synthetic (rank vs q20); confirm on liquid VAL
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --long-only --weighting rank
+# long-only conviction / inv-vol resize (VAL-gated; default remains equal q20)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --long-only --long-size inv_vol --conf-pctile 0.5
 # optional liquid sleeve (top CS turnover tercile; same skip w; use a lower min-names)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --live-costs --long-only --adv-floor-pctile 0.67 --min-names 8

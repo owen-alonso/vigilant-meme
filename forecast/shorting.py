@@ -45,6 +45,8 @@ IR_LIFT = 0.05
 # Long-only book: VAL IR lift vs live_long_only q20, and max-DD not much worse.
 LO_IR_LIFT = 0.05
 LO_DD_TOL = 0.05
+# TEST veto only: promoted VAL spec may not fall this far below q20 TEST IR.
+TEST_COLLAPSE = 0.05
 
 _BOOK_COST_KEYS = (
     "round_trip_bps",
@@ -93,9 +95,12 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/be
 # unconstrained shorts (old live; not the honest default)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --cost-bundle live --compare-long-only
-# long-only live (no locate, borrow=0) — this is the default live book
+# long-only live (no locate, borrow=0) — default live book after LS failed VAL
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only
+# VAL-promoted long-only spec on synthetic (rank vs q20); confirm on liquid VAL
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
+  --holding overnight --live-costs --long-only --weighting rank
 # VAL-gated LS haircut experiment (NOT default): HTB shorts at half size, short NAV 0.30
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --ls-haircut-experiment
@@ -167,6 +172,8 @@ def _run_overnight_book(
     max_short_gross: float = 0.5,
     weighting: str = "quantile",
     adv_floor_pctile: float = 0.0,
+    long_size: str = "equal",
+    conf_pctile: float = 0.0,
 ) -> dict[str, Any]:
     stats = book_pnl(
         pred,
@@ -184,6 +191,8 @@ def _run_overnight_book(
         locate_frac=float(locate_frac),
         max_short_gross=float(max_short_gross),
         adv_floor_pctile=float(adv_floor_pctile),
+        long_size=str(long_size or "equal"),
+        conf_pctile=float(conf_pctile),
         overnight_r=overnight_r,
         turnover_z=turnover_z,
         vol_level=vol_level,
@@ -429,6 +438,147 @@ def decide_lo_promote(grid: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def val_long_only_refine(
+    df: pd.DataFrame,
+    *,
+    min_names: int,
+    vol_target: float = 0.15,
+) -> dict[str, Any]:
+    """VAL-only q-width × conviction × inv-vol. Overnight hold_hl stays 0."""
+    empty = {"rows": [], "best": {}, "baseline": {}}
+    if df.empty:
+        return empty
+    pred = frame_to_wide(df, "pred")
+    y = frame_to_wide(df, "y")
+    r_on = frame_to_wide(df, "r_on")
+    tz = frame_to_wide(df, "turnover_z") if "turnover_z" in df.columns else None
+    vol = frame_to_wide(df, "vol_level") if "vol_level" in df.columns else None
+    if pred.empty or pred.shape[1] < 2:
+        return empty
+    rows: list[dict[str, Any]] = []
+    baseline: dict[str, Any] = {}
+    for q in (0.10, 0.15, 0.20, 0.30):
+        for size in ("equal", "abs_pred", "inv_vol"):
+            for conf in (0.0, 0.5):
+                stats = _run_overnight_book(
+                    pred,
+                    y,
+                    bundle=LIVE_LONG_ONLY_BUNDLE,
+                    long_only=True,
+                    min_names=min_names,
+                    vol_target=vol_target,
+                    overnight_r=r_on,
+                    turnover_z=tz,
+                    vol_level=vol,
+                    quantile=q,
+                    weighting="quantile",
+                    long_size=size,
+                    conf_pctile=conf,
+                )
+                row = {
+                    "name": f"lo_q{int(100 * q)}_{size}_c{int(100 * conf)}",
+                    "kind": "long_only",
+                    "weighting": "quantile",
+                    "quantile": q,
+                    "long_size": size,
+                    "conf_pctile": conf,
+                    "unlevered_net_ir": stats.get("unlevered_net_ir"),
+                    "unlevered_max_dd": stats.get("unlevered_max_dd"),
+                    "mean_cost_unlev_bp": stats.get("mean_cost_unlev_bp"),
+                    "n_dates": stats.get("n_dates"),
+                }
+                rows.append(row)
+                if (
+                    abs(q - 0.2) < 1e-12
+                    and size == "equal"
+                    and conf == 0.0
+                ):
+                    baseline = dict(row)
+    rows.sort(
+        key=lambda r: (
+            -_as_float(r.get("unlevered_net_ir"), default=-1e9),
+            _as_float(r.get("unlevered_max_dd"), default=-1e9),
+            str(r.get("name")),
+        )
+    )
+    return {
+        "rows": rows,
+        "best": dict(rows[0]) if rows else {},
+        "baseline": baseline,
+        "note": "overnight flatten forces hold_halflife=0; not a live knob",
+    }
+
+
+def decide_lo_refine(
+    grid: dict[str, Any],
+    *,
+    test_baseline: dict[str, Any] | None = None,
+    test_best: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """VAL selects. TEST vetoes collapse. TEST is never used to pick a winner."""
+    val_promo = decide_lo_promote(grid)
+    spec = dict(val_promo.get("spec") or {})
+    spec.setdefault("long_size", (grid.get("baseline") or {}).get("long_size", "equal"))
+    spec.setdefault("conf_pctile", (grid.get("baseline") or {}).get("conf_pctile", 0.0))
+    best = dict(grid.get("best") or {})
+    if val_promo.get("promote_lo"):
+        spec["long_size"] = best.get("long_size", "equal")
+        spec["conf_pctile"] = best.get("conf_pctile", 0.0)
+    test_base_ir = _as_float((test_baseline or {}).get("unlevered_net_ir"))
+    test_best_ir = _as_float((test_best or {}).get("unlevered_net_ir"))
+    test_delta = (
+        float(test_best_ir - test_base_ir)
+        if np.isfinite(test_best_ir) and np.isfinite(test_base_ir)
+        else float("nan")
+    )
+    collapse = bool(
+        val_promo.get("promote_lo")
+        and np.isfinite(test_delta)
+        and test_delta < -TEST_COLLAPSE
+    )
+    promote = bool(val_promo.get("promote_lo") and not collapse)
+    if not val_promo.get("promote_lo"):
+        reason = val_promo.get("reason")
+        spec = {
+            "weighting": "quantile",
+            "quantile": 0.2,
+            "long_size": "equal",
+            "conf_pctile": 0.0,
+            "adv_floor_pctile": 0.0,
+        }
+    elif collapse:
+        reason = (
+            f"NO PROMOTE: VAL liked {best.get('name')} "
+            f"(delta {val_promo.get('ir_delta'):+.3f}) but TEST collapsed "
+            f"({test_best_ir:+.3f} vs q20 {test_base_ir:+.3f}, "
+            f"delta {test_delta:+.3f} < -{TEST_COLLAPSE:.2f}). Keep q20 equal."
+        )
+        spec = {
+            "weighting": "quantile",
+            "quantile": 0.2,
+            "long_size": "equal",
+            "conf_pctile": 0.0,
+            "adv_floor_pctile": 0.0,
+        }
+    else:
+        reason = (
+            f"{val_promo.get('reason')} TEST veto passed "
+            f"({test_best_ir:+.3f} vs q20 {test_base_ir:+.3f}, "
+            f"delta {test_delta:+.3f} >= -{TEST_COLLAPSE:.2f})."
+        )
+    return {
+        **val_promo,
+        "promote_lo": promote,
+        "test_veto": collapse,
+        "test_ir_delta": test_delta,
+        "test_collapse": TEST_COLLAPSE,
+        "reason": reason,
+        "spec": spec,
+        "test_baseline_ir": test_base_ir,
+        "test_best_ir": test_best_ir,
+    }
+
+
 def decide_ls_experiment(val: dict[str, Any], experiment_book: dict[str, Any]) -> dict[str, Any]:
     """VAL-only haircut experiment. Never changes the default live book."""
     lo = (val.get("books") or {}).get("live_long_only") or {}
@@ -624,6 +774,7 @@ def evaluate_overnight_shorting(
     grid = val_knob_grid(frames["val"], min_names=min_names, vol_target=vol_target)
     lo_grid = val_long_only_grid(frames["val"], min_names=min_names, vol_target=vol_target)
     lo_promo = decide_lo_promote(lo_grid)
+    lo_refine = val_long_only_refine(frames["val"], min_names=min_names, vol_target=vol_target)
     exp_book = {}
     if not frames["val"].empty:
         pred = frame_to_wide(frames["val"], "pred")
@@ -648,8 +799,10 @@ def evaluate_overnight_shorting(
             )
     ls_exp = decide_ls_experiment(val, exp_book)
     test_lo_promoted = {}
+    test_refine_base: dict[str, Any] = {}
+    test_refine_best: dict[str, Any] = {}
     spec = lo_promo.get("spec") or {}
-    if frames["test"].empty is False and spec:
+    if frames["test"].empty is False:
         pred_t = frame_to_wide(frames["test"], "pred")
         y_t = frame_to_wide(frames["test"], "y")
         r_t = frame_to_wide(frames["test"], "r_on")
@@ -664,7 +817,22 @@ def evaluate_overnight_shorting(
             else None
         )
         if len(pred_t) and pred_t.shape[1] >= 2:
-            test_lo_promoted = _run_overnight_book(
+            if spec:
+                test_lo_promoted = _run_overnight_book(
+                    pred_t,
+                    y_t,
+                    bundle=LIVE_LONG_ONLY_BUNDLE,
+                    long_only=True,
+                    min_names=min_names,
+                    vol_target=vol_target,
+                    overnight_r=r_t,
+                    turnover_z=tz_t,
+                    vol_level=vol_t,
+                    quantile=float(spec.get("quantile") or 0.2),
+                    weighting=str(spec.get("weighting") or "quantile"),
+                    adv_floor_pctile=float(spec.get("adv_floor_pctile") or 0.0),
+                )
+            test_refine_base = _run_overnight_book(
                 pred_t,
                 y_t,
                 bundle=LIVE_LONG_ONLY_BUNDLE,
@@ -674,10 +842,30 @@ def evaluate_overnight_shorting(
                 overnight_r=r_t,
                 turnover_z=tz_t,
                 vol_level=vol_t,
-                quantile=float(spec.get("quantile") or 0.2),
-                weighting=str(spec.get("weighting") or "quantile"),
-                adv_floor_pctile=float(spec.get("adv_floor_pctile") or 0.0),
+                quantile=0.2,
+                weighting="quantile",
+                long_size="equal",
+                conf_pctile=0.0,
             )
+            best_ref = lo_refine.get("best") or {}
+            test_refine_best = _run_overnight_book(
+                pred_t,
+                y_t,
+                bundle=LIVE_LONG_ONLY_BUNDLE,
+                long_only=True,
+                min_names=min_names,
+                vol_target=vol_target,
+                overnight_r=r_t,
+                turnover_z=tz_t,
+                vol_level=vol_t,
+                quantile=float(best_ref.get("quantile") or 0.2),
+                weighting="quantile",
+                long_size=str(best_ref.get("long_size") or "equal"),
+                conf_pctile=float(best_ref.get("conf_pctile") or 0.0),
+            )
+    lo_refine_promo = decide_lo_refine(
+        lo_refine, test_baseline=test_refine_base, test_best=test_refine_best
+    )
     cuts: dict[str, Any] = {}
     if bundle.get("meta"):
         cuts = {
@@ -701,10 +889,13 @@ def evaluate_overnight_shorting(
         "test": test,
         "val_grid": grid,
         "val_long_only_grid": lo_grid,
+        "val_long_only_refine": lo_refine,
         "promotion": promo,
         "lo_promotion": lo_promo,
+        "lo_refine_promotion": lo_refine_promo,
         "ls_experiment": ls_exp,
         "test_long_only_promoted": test_lo_promoted,
+        "test_long_only_refine_best": test_refine_best,
         "desktop_commands": DESKTOP_COMMANDS,
     }
 
@@ -728,6 +919,16 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
         f"PROMOTE LONG-ONLY KNOBS? {'YES' if lo_promo.get('promote_lo') else 'NO'}",
         f"  spec = {lo_promo.get('spec')}",
         f"  {lo_promo.get('reason')}",
+        "",
+        f"PROMOTE LONG-ONLY REFINE (q/size/conf, TEST veto)? "
+        f"{'YES' if (payload.get('lo_refine_promotion') or {}).get('promote_lo') else 'NO'}",
+        f"  spec = {(payload.get('lo_refine_promotion') or {}).get('spec')}",
+        f"  {(payload.get('lo_refine_promotion') or {}).get('reason')}",
+        "",
+        _lo_refine_block(
+            payload.get("val_long_only_refine") or {},
+            payload.get("lo_refine_promotion") or {},
+        ),
         "",
         _lo_grid_block(payload.get("val_long_only_grid") or {}),
         "",
@@ -766,6 +967,37 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
             DESKTOP_COMMANDS.rstrip(),
         ]
     )
+    return "\n".join(lines)
+
+
+def _lo_refine_block(grid: dict[str, Any], promo: dict[str, Any]) -> str:
+    rows = list(grid.get("rows") or [])
+    best = grid.get("best") or {}
+    base = grid.get("baseline") or {}
+    lines = [
+        "VAL LONG-ONLY REFINE (q10/15/20/30 × equal/abs_pred/inv_vol × conf; hold_hl=0)",
+        f"  {grid.get('note')}",
+        f"  baseline = {base.get('name')}  "
+        f"IR {_fmt(base.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(base.get('unlevered_max_dd'), '+.3f')}",
+        f"  VAL-best = {best.get('name')}  "
+        f"IR {_fmt(best.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(best.get('unlevered_max_dd'), '+.3f')}",
+        f"  TEST veto  best {_fmt(promo.get('test_best_ir'), '+.3f')} vs "
+        f"q20 {_fmt(promo.get('test_baseline_ir'), '+.3f')}  "
+        f"delta {_fmt(promo.get('test_ir_delta'), '+.3f')}  "
+        f"collapse={promo.get('test_veto')}",
+        "  name                           IR      maxDD   cost bp",
+    ]
+    for row in rows[:8]:
+        lines.append(
+            f"  {str(row.get('name')):<28}  "
+            f"{_fmt(row.get('unlevered_net_ir'), '+.3f'):>7}  "
+            f"{_fmt(row.get('unlevered_max_dd'), '+.3f'):>7}  "
+            f"{_fmt(row.get('mean_cost_unlev_bp'), '.1f'):>7}"
+        )
+    if len(rows) > 8:
+        lines.append(f"  ... {len(rows) - 8} more rows in JSON")
     return "\n".join(lines)
 
 
