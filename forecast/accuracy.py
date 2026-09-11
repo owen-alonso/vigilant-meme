@@ -13,6 +13,7 @@ converts that to an implied overnight log-return ``pred * sigma`` (same as
 - long-half absolute overnight-up (pred > CS median) vs the up-floor
 - H∩E stack (long-half ∩ TRAIN top-q) relative / absolute / live-IR gates
 - short-sleeve overnight down-rate on the within-date bottom residual names
+- book-aligned short sleeve overnight-down (TRAIN bottom-q / |pred| grid, VAL-gated)
 
 Default recipe is the PR #5 overnight skip (rank-target ridge, ``no_long_ts``).
 PR #7 levers stay off unless a checkpoint documents them.
@@ -74,6 +75,10 @@ STACK_QS = BOOK_ALIGN_QS
 STACK_ABS_QS = BOOK_ALIGN_ABS_QS
 STACK_IR_LIFT = 0.05
 STACK_DD_TOL = 0.05
+# IDEA J: short-sleeve overnight-down (bottom-q, mirror of E).
+SHORT_ALIGN_QS = (0.10, 0.20, 0.30)  # bottom 10/20/30%
+SHORT_ALIGN_ABS_QS = BOOK_ALIGN_ABS_QS
+SHORT_IR_LIFT = 0.05
 TURNOVER_COL = FEATURE_NAMES.index("turnover_z") if "turnover_z" in FEATURE_NAMES else None
 VOL_LEVEL_COL = FEATURE_NAMES.index("vol_level") if "vol_level" in FEATURE_NAMES else None
 # PR #8 locked-TEST residual*sigma print (do not retarget; compare on the same window).
@@ -803,6 +808,346 @@ def decide_book_aligned_promote(
         "mae_pct": _as_float(scored.get("mae_pct")),
         "full_mae_usd": _as_float(scored.get("full_mae_usd")),
         "full_mae_pct": _as_float(scored.get("full_mae_pct")),
+        "paper_ir": _as_float(scored.get("paper_ir")),
+    }
+
+
+def cs_bottom_abs_mask(
+    df: pd.DataFrame,
+    *,
+    q: float,
+    abs_tau: float = 0.0,
+    score_col: str = "pred",
+    min_names: int = 3,
+) -> np.ndarray:
+    """Within-date bottom residual names, optional causal |pred| floor.
+
+    ``q=0.20`` is the bottom 20%. ``abs_tau`` is a TRAIN quantile of ``|pred|``
+    (0 = off). Next open is never used.
+    """
+    n = len(df)
+    out = np.zeros(n, dtype=bool)
+    if df.empty or score_col not in df.columns:
+        return out
+    dates = df["date"].to_numpy(dtype=np.int64)
+    score = df[score_col].to_numpy(dtype=np.float64)
+    mag = np.abs(score)
+    tau = float(abs_tau)
+    for key in np.unique(dates):
+        sel = dates == key
+        row = score[sel]
+        finite = np.isfinite(row)
+        if int(finite.sum()) < int(min_names):
+            continue
+        cut = float(np.nanquantile(row, float(q)))
+        keep = finite & (row <= cut)
+        if tau > 0.0:
+            keep = keep & (mag[sel] >= tau)
+        out[sel] = keep
+    return out
+
+
+def score_short_aligned_sleeve(
+    df: pd.DataFrame,
+    *,
+    q: float,
+    abs_tau: float = 0.0,
+    min_names: int = 3,
+) -> dict[str, Any]:
+    """Overnight down-rate + sleeve MAE on the CS bottom-q residual names."""
+    bot_pct = float(100.0 * float(q))
+    name = f"book_bottom{int(round(bot_pct))}"
+    if float(abs_tau) > 0.0:
+        name = f"{name}_abs"
+    empty = {
+        "name": name,
+        "q": float(q),
+        "abs_tau": float(abs_tau),
+        "bottom_pct": bot_pct,
+        "down_pct": float("nan"),
+        "uncond_down_pct": float("nan"),
+        "excess_pp": float("nan"),
+        "n": 0.0,
+        "n_dates": 0.0,
+        "coverage": float("nan"),
+        "mae_usd": float("nan"),
+        "mae_pct": float("nan"),
+        "full_mae_usd": float("nan"),
+        "full_mae_pct": float("nan"),
+        "paper_ir": float("nan"),
+    }
+    if df.empty or "pred" not in df.columns or "r_on" not in df.columns:
+        return empty
+    mask = cs_bottom_abs_mask(
+        df, q=float(q), abs_tau=float(abs_tau), score_col="pred", min_names=min_names
+    )
+    r = df["r_on"].to_numpy(dtype=np.float64)
+    dates = df["date"].to_numpy(dtype=np.int64)
+    moved = mask & np.isfinite(r) & (r != 0.0)
+    uncond = r[np.isfinite(r) & (r != 0.0)]
+    uncond_down = float((uncond < 0).mean()) if uncond.size else float("nan")
+    n_dates = float(pd.Series(dates[mask]).nunique()) if int(mask.sum()) else 0.0
+    cover = float(mask.mean()) if mask.size else float("nan")
+    empty["n"] = float(int(moved.sum()))
+    empty["n_dates"] = n_dates
+    empty["coverage"] = cover
+    empty["uncond_down_pct"] = (
+        float(100.0 * uncond_down) if np.isfinite(uncond_down) else float("nan")
+    )
+    if "close" in df.columns and "next_open" in df.columns:
+        close = df["close"].to_numpy(dtype=np.float64)
+        nxt = df["next_open"].to_numpy(dtype=np.float64)
+        if "implied_open" in df.columns:
+            implied = df["implied_open"].to_numpy(dtype=np.float64)
+        else:
+            implied = close
+        ok = np.isfinite(close) & np.isfinite(nxt) & (close > 0)
+        if int(ok.sum()):
+            empty["full_mae_usd"] = float(np.mean(np.abs(implied[ok] - nxt[ok])))
+            empty["full_mae_pct"] = float(
+                np.mean(np.abs(implied[ok] - nxt[ok]) / close[ok])
+            )
+        sleeve_ok = mask & ok
+        if int(sleeve_ok.sum()):
+            empty["mae_usd"] = float(np.mean(np.abs(implied[sleeve_ok] - nxt[sleeve_ok])))
+            empty["mae_pct"] = float(
+                np.mean(np.abs(implied[sleeve_ok] - nxt[sleeve_ok]) / close[sleeve_ok])
+            )
+    if int(moved.sum()) == 0:
+        return empty
+    down = float((r[moved] < 0).mean())
+    daily = (
+        pd.DataFrame({"date": dates[mask], "r": -r[mask]})
+        .groupby("date")["r"]
+        .mean()
+        .to_numpy(dtype=np.float64)
+    )
+    daily = daily[np.isfinite(daily)]
+    paper_ir = float("nan")
+    if daily.size >= 5:
+        sd = float(daily.std(ddof=1)) if daily.size > 1 else 0.0
+        if sd > 1e-12:
+            paper_ir = float(daily.mean() / sd * math.sqrt(252.0))
+    return {
+        **empty,
+        "down_pct": float(100.0 * down),
+        "excess_pp": (
+            float(100.0 * (down - uncond_down))
+            if np.isfinite(uncond_down)
+            else float("nan")
+        ),
+        "paper_ir": paper_ir,
+    }
+
+
+def fit_short_aligned_on_train(
+    df: pd.DataFrame,
+    *,
+    min_names: int,
+) -> dict[str, Any]:
+    """Select (bottom-q, |pred| floor) on TRAIN only. VAL/TEST never enter."""
+    mag = np.abs(df["pred"].to_numpy(dtype=np.float64)) if not df.empty else np.array([])
+    mag = mag[np.isfinite(mag)]
+    rows: list[dict[str, Any]] = []
+    for q in SHORT_ALIGN_QS:
+        for aq in SHORT_ALIGN_ABS_QS:
+            tau = (
+                0.0
+                if float(aq) <= 0.0
+                else (float(np.quantile(mag, float(aq))) if mag.size else 0.0)
+            )
+            row = score_short_aligned_sleeve(
+                df, q=float(q), abs_tau=tau, min_names=min_names
+            )
+            row["abs_q"] = float(aq)
+            if not np.isfinite(_as_float(row.get("down_pct"))):
+                continue
+            cover = _as_float(row.get("coverage"))
+            if np.isfinite(cover) and cover < BOOK_ALIGN_COVER:
+                continue
+            rows.append(row)
+    chosen: dict[str, Any] = {}
+    best_key = (-1e18, -1e18, -1.0)
+    for row in rows:
+        xs = _as_float(row.get("excess_pp"))
+        down = _as_float(row.get("down_pct"))
+        q = _as_float(row.get("q"))
+        if not np.isfinite(xs):
+            continue
+        key = (xs, down, -q)
+        if key > best_key:
+            best_key = key
+            chosen = dict(row)
+    baseline = score_short_aligned_sleeve(df, q=0.20, abs_tau=0.0, min_names=min_names)
+    baseline["abs_q"] = 0.0
+    if not chosen:
+        chosen = dict(baseline)
+    return {
+        "rows": rows,
+        "chosen": chosen,
+        "baseline": baseline,
+        "fit_split": "train",
+        "qs": list(SHORT_ALIGN_QS),
+        "abs_qs": list(SHORT_ALIGN_ABS_QS),
+        "note": (
+            "Overnight down-rate of within-date bottom-q residual skip names "
+            "(optional TRAIN |pred| floor). q=0.20 is the bottom-20% sleeve. "
+            "Pooled TS direction is report-only. Live q20 unchanged on hit-rate-only."
+        ),
+    }
+
+
+def short_aligned_grid(
+    df: pd.DataFrame,
+    *,
+    train_pred: np.ndarray,
+    min_names: int,
+) -> list[dict[str, Any]]:
+    """Score the bottom-q × |pred| grid with TRAIN-only magnitude thresholds."""
+    mag = np.abs(np.asarray(train_pred, dtype=np.float64))
+    mag = mag[np.isfinite(mag)]
+    rows: list[dict[str, Any]] = []
+    for q in SHORT_ALIGN_QS:
+        for aq in SHORT_ALIGN_ABS_QS:
+            tau = (
+                0.0
+                if float(aq) <= 0.0
+                else (float(np.quantile(mag, float(aq))) if mag.size else 0.0)
+            )
+            row = score_short_aligned_sleeve(
+                df, q=float(q), abs_tau=tau, min_names=min_names
+            )
+            row["abs_q"] = float(aq)
+            rows.append(row)
+    return rows
+
+
+def decide_short_aligned_promote(
+    *,
+    val_chosen: dict[str, Any],
+    val_bot20: dict[str, Any],
+    chosen: dict[str, Any],
+    val_live_ls: dict[str, Any] | None = None,
+    val_live_q20: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """VAL-only short down-rate vs down-floor / bottom-20%, plus optional live IR."""
+    scored = dict(val_chosen or {})
+    base = dict(val_bot20 or {})
+    live = dict(val_live_ls or {})
+    q20 = dict(val_live_q20 or {})
+    down = _as_float(scored.get("down_pct"))
+    floor = _as_float(scored.get("uncond_down_pct"))
+    xs = _as_float(scored.get("excess_pp"))
+    if not np.isfinite(xs) and np.isfinite(down) and np.isfinite(floor):
+        xs = float(down - floor)
+    down20 = _as_float(base.get("down_pct"))
+    cover = _as_float(scored.get("coverage"))
+    q = _as_float((chosen or {}).get("q"), default=0.20)
+    abs_tau = _as_float((chosen or {}).get("abs_tau"), default=0.0)
+    abs_q = _as_float((chosen or {}).get("abs_q"), default=0.0)
+    same = abs(q - 0.20) < 1e-12 and abs(abs_tau) <= 1e-15
+    floor_ok = bool(np.isfinite(xs) and xs >= BOOK_UP_FLOOR_PP)
+    vs_base = bool(
+        np.isfinite(down) and np.isfinite(down20) and down >= down20 + BOOK_UP_BASE_PP
+    )
+    cover_ok = bool(not np.isfinite(cover) or cover >= BOOK_ALIGN_COVER)
+    promote_hit = bool((not same) and floor_ok and vs_base and cover_ok)
+
+    ir = _as_float(live.get("unlevered_net_ir"))
+    ir20 = _as_float(q20.get("unlevered_net_ir"))
+    ir_delta = (
+        float(ir - ir20) if np.isfinite(ir) and np.isfinite(ir20) else float("nan")
+    )
+    live_cover = _as_float(live.get("coverage"))
+    if not np.isfinite(live_cover):
+        live_cover = cover
+    ir_ok = bool(np.isfinite(ir_delta) and ir_delta >= SHORT_IR_LIFT)
+    live_cover_ok = bool(np.isfinite(live_cover) and live_cover >= BOOK_ALIGN_COVER)
+    promote_live = bool(ir_ok and live_cover_ok)
+
+    if same:
+        hit_reason = (
+            "NO PROMOTE short-aligned: TRAIN chose q=0.20 / no |pred| floor "
+            f"(current bottom-20% sleeve). VAL down {down:.2f}% vs floor "
+            f"{floor:.2f}% (xs {xs:+.2f} pp)."
+        )
+    elif not cover_ok:
+        hit_reason = (
+            f"NO PROMOTE short-aligned: TRAIN q={q:.2f} abs_q={abs_q:.2f} but "
+            f"VAL cover {100.0 * cover:.1f}% < {100.0 * BOOK_ALIGN_COVER:.0f}%."
+        )
+    elif not floor_ok:
+        hit_reason = (
+            f"NO PROMOTE short-aligned: TRAIN q={q:.2f} VAL down {down:.2f}% vs "
+            f"floor {floor:.2f}% (xs {xs:+.2f} pp < +{BOOK_UP_FLOOR_PP:.1f} pp)."
+        )
+    elif not vs_base:
+        hit_reason = (
+            f"NO PROMOTE short-aligned: TRAIN q={q:.2f} VAL down {down:.2f}% vs "
+            f"bottom-20% {down20:.2f}% (delta {down - down20:+.2f} pp "
+            f"< +{BOOK_UP_BASE_PP:.1f} pp)."
+        )
+    else:
+        hit_reason = (
+            f"PROMOTE short-aligned q={q:.2f} abs_q={abs_q:.2f}: VAL down "
+            f"{down:.2f}% vs floor {floor:.2f}% (xs {xs:+.2f} pp) and vs "
+            f"bottom-20% {down20:.2f}% (delta {down - down20:+.2f} pp)."
+        )
+
+    if not live_cover_ok:
+        live_reason = (
+            f"NO PROMOTE short live LS: VAL cover {100.0 * live_cover:.1f}% "
+            f"< {100.0 * BOOK_ALIGN_COVER:.0f}%. Keep q20 default."
+        )
+    elif not ir_ok:
+        live_reason = (
+            f"NO PROMOTE short live LS: VAL live_locate IR {ir:+.3f} vs q20 "
+            f"{ir20:+.3f} (delta {ir_delta:+.3f} < +{SHORT_IR_LIFT:.2f}). "
+            "Keep q20 default. Hit-rate-only."
+        )
+    else:
+        live_reason = (
+            f"PROMOTE short live LS q={q:.2f} abs_q={abs_q:.2f}: VAL "
+            f"live_locate IR {ir:+.3f} vs q20 {ir20:+.3f} "
+            f"(delta {ir_delta:+.3f}). Default CLI stays q20 until liquid."
+        )
+    return {
+        "promote_short_aligned": promote_hit,
+        "promote_short_live": promote_live,
+        "gated_on": "val",
+        "reason": hit_reason,
+        "hit_reason": hit_reason,
+        "live_reason": live_reason,
+        "spec": (
+            {"q": float(q), "abs_tau": float(abs_tau), "abs_q": float(abs_q)}
+            if promote_hit
+            else {"q": 0.20, "abs_tau": 0.0, "abs_q": 0.0}
+        ),
+        "chosen": scored,
+        "baseline": base,
+        "train_q": float(q),
+        "train_abs_q": float(abs_q),
+        "train_abs_tau": float(abs_tau),
+        "val_down": down,
+        "val_floor": floor,
+        "val_excess_pp": xs,
+        "val_bot20_down": down20,
+        "val_vs_bot20_pp": (
+            float(down - down20)
+            if np.isfinite(down) and np.isfinite(down20)
+            else float("nan")
+        ),
+        "coverage": cover,
+        "floor_lift_pp": BOOK_UP_FLOOR_PP,
+        "base_lift_pp": BOOK_UP_BASE_PP,
+        "val_ir": ir,
+        "val_ir_q20": ir20,
+        "val_ir_delta": ir_delta,
+        "ir_lift": SHORT_IR_LIFT,
+        "live_book_unchanged": (not promote_live),
+        "default_book_unchanged": True,
+        "mae_usd": _as_float(scored.get("mae_usd")),
+        "mae_pct": _as_float(scored.get("mae_pct")),
         "paper_ir": _as_float(scored.get("paper_ir")),
     }
 
@@ -1858,6 +2203,9 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         stack_txt = format_rel_e_stack_block(payload)
         if stack_txt:
             lines.extend(["", stack_txt])
+        short_txt = format_short_aligned_block(payload)
+        if short_txt:
+            lines.extend(["", short_txt])
     conf = payload.get("confidence")
     if conf:
         lines.extend(["", format_confidence_block(conf)])
@@ -3723,6 +4071,84 @@ def format_book_aligned_block(payload: dict[str, Any]) -> str:
     )
 
 
+def _fmt_short_sleeve(row: Mapping[str, Any] | None) -> str:
+    r = dict(row or {})
+    return (
+        f"down {_as_float(r.get('down_pct')):.2f}%  "
+        f"floor {_as_float(r.get('uncond_down_pct')):.2f}%  "
+        f"xs {_as_float(r.get('excess_pp')):+.2f}pp  "
+        f"cover {100.0 * _as_float(r.get('coverage')):.1f}%  "
+        f"n={int(_as_float(r.get('n'), 0.0))}  "
+        f"dates={int(_as_float(r.get('n_dates'), 0.0))}  "
+        f"MAE ${_as_float(r.get('mae_usd')):.4f} / "
+        f"{100.0 * _as_float(r.get('mae_pct')):.4f}%  "
+        f"paperIR {_as_float(r.get('paper_ir')):+.3f}"
+    )
+
+
+def format_short_aligned_block(payload: dict[str, Any]) -> str:
+    """VAL-gated overnight-down of TRAIN-chosen bottom-q residual names."""
+    promo = payload.get("short_aligned_promotion") or {}
+    fit = payload.get("short_aligned_fit") or {}
+    cmp = payload.get("short_aligned_compare") or {}
+    live = payload.get("short_aligned_live") or {}
+    if not promo and not fit:
+        return ""
+    yes = bool(promo.get("promote_short_aligned"))
+    yes_live = bool(promo.get("promote_short_live"))
+    chosen = fit.get("chosen") or {}
+    tr = (cmp.get("train") or {}).get("chosen") or chosen
+    va = (cmp.get("val") or {}).get("chosen") or {}
+    te = (cmp.get("test") or {}).get("chosen") or {}
+    va20 = (cmp.get("val") or {}).get("bot20") or {}
+    te20 = (cmp.get("test") or {}).get("bot20") or {}
+    q = _as_float(chosen.get("q"), default=0.20)
+    abs_q = _as_float(chosen.get("abs_q"), default=0.0)
+    abs_tau = _as_float(chosen.get("abs_tau"), default=0.0)
+    grid = (cmp.get("val") or {}).get("grid") or []
+    grid_lines = []
+    for row in grid:
+        grid_lines.append(
+            f"    q={_as_float(row.get('q')):.2f} abs_q={_as_float(row.get('abs_q')):.2f}  "
+            f"{_fmt_short_sleeve(row)}"
+        )
+    if not grid_lines:
+        grid_lines = ["    (empty)"]
+    va_live = live.get("val") or {}
+    te_live = live.get("test") or {}
+    return "\n".join(
+        [
+            f"PROMOTE SHORT-ALIGNED? {'YES' if yes else 'NO'}  "
+            f"PROMOTE SHORT LIVE LS? {'YES' if yes_live else 'NO'}",
+            "  Primary object = overnight down-rate of within-date bottom-q "
+            "residual skip names vs unconditional overnight-down. Optional TRAIN "
+            "|pred| floor. TEST report-only. live_locate LS (long q20, short "
+            "TRAIN sleeve) vs long-only q20 is optional. Live q20 unchanged "
+            "on hit-rate-only.",
+            f"  TRAIN pick q={q:.2f} (bottom {100.0 * q:.0f}%)  "
+            f"abs_q={abs_q:.2f}  |pred|>={abs_tau:.5f}  "
+            f"fit_split={fit.get('fit_split')!r}",
+            f"  TRAIN chosen  {_fmt_short_sleeve(tr)}",
+            f"  VAL   chosen  {_fmt_short_sleeve(va)}",
+            f"  VAL   bot-20% {_fmt_short_sleeve(va20)}",
+            f"  VAL   vs floor {_as_float(promo.get('val_excess_pp')):+.2f}pp  "
+            f"(need ≥+{BOOK_UP_FLOOR_PP:.1f}pp)  vs bottom-20% "
+            f"{_as_float(promo.get('val_vs_bot20_pp')):+.2f}pp  "
+            f"(need ≥+{BOOK_UP_BASE_PP:.1f}pp)",
+            f"  TEST  chosen  {_fmt_short_sleeve(te)}  (report-only)",
+            f"  TEST  bot-20% {_fmt_short_sleeve(te20)}  (report-only)",
+            _fmt_stack_live("VAL q20", va_live.get("q20")),
+            _fmt_stack_live("VAL LS", va_live.get("ls")),
+            _fmt_stack_live("TEST q20", te_live.get("q20")),
+            _fmt_stack_live("TEST LS", te_live.get("ls")),
+            f"  {promo.get('hit_reason') or promo.get('reason') or 'no hit decision'}",
+            f"  {promo.get('live_reason') or 'no live decision'}",
+            "  VAL grid (report-only; |pred| τ from TRAIN):",
+            *grid_lines,
+        ]
+    )
+
+
 def format_conviction_live_block(payload: dict[str, Any]) -> str:
     """IDEA F live-cost IR gate; implemented in forecast.shorting."""
     if not payload.get("conviction_live_promotion") and not payload.get("conviction_live"):
@@ -4082,6 +4508,7 @@ def evaluate_overnight_accuracy(
     )
     logit_up = fit_logistic_up(train_pred_r, train_r)
     book_aligned_fit = fit_book_aligned_on_train(tr, min_names=min_names)
+    short_aligned_fit = fit_short_aligned_on_train(tr, min_names=min_names)
     relative_dir_fit = fit_relative_dir_on_train(tr, min_names=min_names)
     rel_e_stack_fit = fit_rel_e_stack_on_train(
         tr, min_names=min_names, e_chosen=book_aligned_fit.get("chosen") or {}
@@ -4676,6 +5103,16 @@ def evaluate_overnight_accuracy(
                 "score_col": "pred",
                 "fit_split": "train",
             },
+            "short_aligned": {
+                "q": float((short_aligned_fit.get("chosen") or {}).get("q") or 0.20),
+                "abs_tau": float(
+                    (short_aligned_fit.get("chosen") or {}).get("abs_tau") or 0.0
+                ),
+                "abs_q": float(
+                    (short_aligned_fit.get("chosen") or {}).get("abs_q") or 0.0
+                ),
+                "fit_split": "train",
+            },
             "rel_e_stack": {
                 "q": float((rel_e_stack_fit.get("chosen") or {}).get("q") or 0.80),
                 "abs_tau": float(
@@ -4908,6 +5345,7 @@ def evaluate_overnight_accuracy(
         compare_conviction_live,
         decide_conviction_live_promote,
         score_conviction_live_book,
+        score_short_aligned_live_book,
     )
 
     conviction_live = compare_conviction_live(
@@ -4992,6 +5430,79 @@ def evaluate_overnight_accuracy(
     }
     payload["rel_e_stack_live"] = rel_e_stack_live
     payload["rel_e_stack_promotion"] = rel_e_stack_promotion
+    chosen_sh = short_aligned_fit.get("chosen") or {}
+    sh_q = float(chosen_sh.get("q") or 0.20)
+    sh_tau = float(chosen_sh.get("abs_tau") or 0.0)
+    val_chosen_sh = score_short_aligned_sleeve(
+        va, q=sh_q, abs_tau=sh_tau, min_names=min_names
+    )
+    test_chosen_sh = score_short_aligned_sleeve(
+        te, q=sh_q, abs_tau=sh_tau, min_names=min_names
+    )
+    val_bot20_sh = score_short_aligned_sleeve(
+        va, q=0.20, abs_tau=0.0, min_names=min_names
+    )
+    test_bot20_sh = score_short_aligned_sleeve(
+        te, q=0.20, abs_tau=0.0, min_names=min_names
+    )
+    short_aligned_live: dict[str, Any] = {}
+    for split_name, split_df in (("train", tr), ("val", va), ("test", te)):
+        q20_row = (conviction_live.get(split_name) or {}).get("q20") or {}
+        if not q20_row:
+            q20_row = score_conviction_live_book(
+                split_df,
+                min_names=min_names,
+                vol_target=0.15,
+                name="q20_equal",
+            )
+        short_aligned_live[split_name] = {
+            "q20": q20_row,
+            "ls": score_short_aligned_live_book(
+                split_df,
+                min_names=min_names,
+                vol_target=0.15,
+                short_q=sh_q,
+                conf_abs=sh_tau,
+                name=f"short_ls_q{sh_q:.2f}_abs{float(chosen_sh.get('abs_q') or 0.0):.2f}",
+            ),
+        }
+    short_aligned_promotion = decide_short_aligned_promote(
+        val_chosen=val_chosen_sh,
+        val_bot20=val_bot20_sh,
+        chosen=chosen_sh,
+        val_live_ls=(short_aligned_live.get("val") or {}).get("ls") or {},
+        val_live_q20=(short_aligned_live.get("val") or {}).get("q20") or {},
+    )
+    payload["short_aligned_fit"] = short_aligned_fit
+    payload["short_aligned_compare"] = {
+        "train": {
+            "chosen": chosen_sh,
+            "bot20": short_aligned_fit.get("baseline"),
+            "grid": short_aligned_fit.get("rows"),
+        },
+        "val": {
+            "chosen": val_chosen_sh,
+            "bot20": val_bot20_sh,
+            "grid": short_aligned_grid(
+                va, train_pred=train_pred_cs, min_names=min_names
+            ),
+        },
+        "test": {
+            "chosen": test_chosen_sh,
+            "bot20": test_bot20_sh,
+            "grid": short_aligned_grid(
+                te, train_pred=train_pred_cs, min_names=min_names
+            ),
+        },
+        "note": (
+            "Primary object = overnight down-rate of within-date bottom-q "
+            "residual skip names vs unconditional overnight-down. "
+            "Pooled TS dir is report-only. TEST is report-only. "
+            "Live q20 unchanged on hit-rate-only."
+        ),
+    }
+    payload["short_aligned_live"] = short_aligned_live
+    payload["short_aligned_promotion"] = short_aligned_promotion
     if log_fn:
         log_fn(
             f"accuracy default={default_name!r}  "
@@ -5012,6 +5523,10 @@ def evaluate_overnight_accuracy(
             f"promote_stack_abs="
             f"{bool(rel_e_stack_promotion.get('promote_stack_abs'))}  "
             f"promote_stack_live="
-            f"{bool(rel_e_stack_promotion.get('promote_stack_live'))}"
+            f"{bool(rel_e_stack_promotion.get('promote_stack_live'))}  "
+            f"promote_short_aligned="
+            f"{bool(short_aligned_promotion.get('promote_short_aligned'))}  "
+            f"promote_short_live="
+            f"{bool(short_aligned_promotion.get('promote_short_live'))}"
         )
     return payload

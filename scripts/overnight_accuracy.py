@@ -25,6 +25,9 @@ the long half (pred > CS median) vs the uncond floor / top-20%. Optional
 TRAIN |pred−median| floor. Live q20 unchanged.
 IDEA I stacks H's long-half with E's TRAIN top-q / |pred| floor (light
 re-grid on TRAIN relative hit). Absolute up vs E; live IR vs q20 (F gate).
+IDEA J mirrors E on the short side: overnight down-rate of TRAIN bottom-q
+/ |pred| names vs the down-floor and vs bottom-20%. Optional live_locate
+LS vs long-only q20. Live q20 unchanged on hit-rate-only.
 """
 
 from __future__ import annotations

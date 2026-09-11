@@ -21,12 +21,15 @@ from forecast.accuracy import (
     cond_abs_mask,
     cs_relative_blocks,
     cs_stack_mask,
+    cs_bottom_abs_mask,
     cs_top_abs_mask,
     decide_book_aligned_promote,
+    decide_short_aligned_promote,
     decide_relative_dir_promote,
     decide_rel_e_stack_promote,
     decide_sector_mae_promote,
     fit_book_aligned_on_train,
+    fit_short_aligned_on_train,
     fit_relative_dir_on_train,
     fit_rel_e_stack_on_train,
     fit_residual_mae_maps,
@@ -48,6 +51,7 @@ from forecast.accuracy import (
     hit_rate_vs_p0,
     long_only_book_block,
     score_book_aligned_sleeve,
+    score_short_aligned_sleeve,
     score_eval_frame,
     score_rel_e_stack,
     score_relative_direction,
@@ -369,6 +373,21 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert "PROMOTE STACK RELATIVE-DIR" in report
     assert "PROMOTE STACK ABSOLUTE-UP" in report
     assert "PROMOTE STACK LIVE IR" in report
+    sh_fit = payload["short_aligned_fit"]
+    assert sh_fit["fit_split"] == "train"
+    assert "chosen" in sh_fit and "baseline" in sh_fit
+    sh_cmp = payload["short_aligned_compare"]
+    assert "chosen" in sh_cmp["val"] and "bot20" in sh_cmp["val"]
+    assert "chosen" in sh_cmp["test"] and "grid" in sh_cmp["val"]
+    sh_promo = payload["short_aligned_promotion"]
+    assert sh_promo["gated_on"] == "val"
+    assert "promote_short_aligned" in sh_promo
+    assert "promote_short_live" in sh_promo
+    assert sh_promo["default_book_unchanged"] is True
+    assert "short_aligned_live" in payload
+    assert "q20" in payload["short_aligned_live"]["val"]
+    assert "PROMOTE SHORT-ALIGNED" in report
+    assert "PROMOTE SHORT LIVE LS" in report
 
 
 def test_zero_move_direction_is_zero_not_nan():
@@ -669,6 +688,25 @@ def test_cs_top_abs_mask_selects_top_and_abs_floor():
     assert mask.tolist() == [False, False, False, True, False, False, False, True]
     mask_floor = cs_top_abs_mask(df, q=0.75, abs_tau=2.5, min_names=3)
     assert mask_floor.tolist() == [False, False, False, False, False, False, False, True]
+
+
+def test_cs_bottom_abs_mask_selects_bottom_and_abs_floor():
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "date": [1, 1, 1, 1, 2, 2, 2, 2],
+            "pred": [0.0, 0.5, 1.0, 2.0, -3.0, 0.1, 0.2, 3.0],
+            "r_on": [-0.02, 0.01, 0.01, 0.01, -0.03, 0.01, 0.01, 0.01],
+        }
+    )
+    mask = cs_bottom_abs_mask(df, q=0.25, abs_tau=0.0, min_names=3)
+    assert mask.tolist() == [True, False, False, False, True, False, False, False]
+    mask_floor = cs_bottom_abs_mask(df, q=0.25, abs_tau=2.5, min_names=3)
+    assert mask_floor.tolist() == [False, False, False, False, True, False, False, False]
+    scored = score_short_aligned_sleeve(df, q=0.25, abs_tau=0.0, min_names=3)
+    assert abs(scored["down_pct"] - 100.0) < 1e-9
+    assert scored["n"] == 2.0
 
 
 def test_fit_book_aligned_on_train_is_train_only():
@@ -976,6 +1014,83 @@ def test_decide_book_aligned_promote_is_val_only():
     )
     assert d3["promote_book_aligned"] is False
     assert d3["gated_on"] == "val"
+
+
+def test_fit_short_aligned_on_train_is_train_only():
+    import pandas as pd
+
+    rng = np.random.default_rng(2)
+    dates = np.repeat(np.arange(20, dtype=np.int64), 10)
+    pred = rng.normal(size=dates.size)
+    r_train = np.where(pred < np.quantile(pred, 0.20), -0.02, 0.01)
+    r_later = np.where(pred < np.quantile(pred, 0.20), 0.02, -0.01)
+    train = pd.DataFrame({"date": dates, "pred": pred, "r_on": r_train})
+    later = pd.DataFrame({"date": dates + 100, "pred": pred, "r_on": r_later})
+    spec = fit_short_aligned_on_train(train, min_names=3)
+    leaked = fit_short_aligned_on_train(later, min_names=3)
+    assert spec["fit_split"] == "train"
+    assert leaked["fit_split"] == "train"
+    assert (
+        spec["chosen"]["q"] != leaked["chosen"]["q"]
+        or spec["chosen"]["abs_tau"] != leaked["chosen"]["abs_tau"]
+        or spec["chosen"]["excess_pp"] != leaked["chosen"]["excess_pp"]
+    )
+    scored = score_short_aligned_sleeve(train, q=0.20, abs_tau=0.0, min_names=3)
+    assert scored["n"] > 0
+    assert np.isfinite(scored["down_pct"])
+    assert np.isfinite(scored["excess_pp"])
+
+
+def test_decide_short_aligned_promote_is_val_only():
+    chosen = {"q": 0.10, "abs_tau": 0.2, "abs_q": 0.50}
+    val_ok = {
+        "down_pct": 56.5,
+        "uncond_down_pct": 46.0,
+        "excess_pp": 10.5,
+        "coverage": 0.10,
+    }
+    d = decide_short_aligned_promote(
+        val_chosen=val_ok,
+        val_bot20={"down_pct": 56.0},
+        chosen=chosen,
+        val_live_ls={"unlevered_net_ir": 1.20, "coverage": 0.10},
+        val_live_q20={"unlevered_net_ir": 1.00, "coverage": 0.25},
+    )
+    assert d["promote_short_aligned"] is True
+    assert d["promote_short_live"] is True
+    assert d["gated_on"] == "val"
+    val_fail = {
+        "down_pct": 56.05,
+        "uncond_down_pct": 46.0,
+        "excess_pp": 10.05,
+        "coverage": 0.10,
+    }
+    d2 = decide_short_aligned_promote(
+        val_chosen=val_fail,
+        val_bot20={"down_pct": 56.0},
+        chosen=chosen,
+        val_live_ls={"unlevered_net_ir": 0.90, "coverage": 0.10},
+        val_live_q20={"unlevered_net_ir": 1.00, "coverage": 0.25},
+    )
+    assert d2["promote_short_aligned"] is False
+    assert d2["promote_short_live"] is False
+    same = {"q": 0.20, "abs_tau": 0.0, "abs_q": 0.0}
+    juicy = {
+        "down_pct": 80.0,
+        "uncond_down_pct": 46.0,
+        "excess_pp": 34.0,
+        "coverage": 0.20,
+    }
+    d3 = decide_short_aligned_promote(
+        val_chosen=juicy,
+        val_bot20={"down_pct": 50.0},
+        chosen=same,
+        val_live_ls={"unlevered_net_ir": 2.00, "coverage": 0.20},
+        val_live_q20={"unlevered_net_ir": 1.00, "coverage": 0.25},
+    )
+    assert d3["promote_short_aligned"] is False
+    assert d3["gated_on"] == "val"
+    assert d3["default_book_unchanged"] is True
 
 
 def test_long_only_book_block_selects_within_date_top_pred():

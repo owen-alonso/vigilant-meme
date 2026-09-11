@@ -9,7 +9,12 @@ import pandas as pd
 import pytest
 
 from forecast.accuracy import sleeve_book_block
-from forecast.backtest import book_pnl, conviction_long_weights, sleeve_direction_from_weights
+from forecast.backtest import (
+    book_pnl,
+    conviction_long_weights,
+    ls_short_aligned_weights,
+    sleeve_direction_from_weights,
+)
 from forecast.shorting import (
     IR_LIFT,
     SHORT_EXCESS_LIFT_PP,
@@ -186,6 +191,16 @@ def test_conviction_long_weights_matches_top_q_and_abs_floor():
     )
     assert w3[["c", "d"]].sum() == pytest.approx(1.0)
     assert w3[["a", "b"]].sum() == pytest.approx(0.0)
+
+
+def test_ls_short_aligned_weights_longs_top_and_shorts_bottom():
+    s = pd.Series([-2.0, -1.0, 1.0, 2.0], index=list("abcd"))
+    w = ls_short_aligned_weights(s, short_q=0.25, abs_tau=0.0, long_q=0.75, min_names=3)
+    assert w["a"] == pytest.approx(-0.5)
+    assert w["d"] == pytest.approx(0.5)
+    assert w[["b", "c"]].sum() == pytest.approx(0.0)
+    w2 = ls_short_aligned_weights(s, short_q=0.25, abs_tau=2.5, long_q=0.75, min_names=3)
+    assert w2.sum() == pytest.approx(0.0)
 
 
 def test_decide_conviction_live_promote_is_val_only():
