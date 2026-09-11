@@ -11,8 +11,9 @@ Then:
 - Build scale-free, strictly causal features. Nothing here uses information
   from bar ``t + 1`` onwards, so the same code runs at inference time.
 - Attach the target: the horizon-bar-ahead log return, divided by a volatility
-  estimate known at ``t``. ``label_return='overnight'`` is
-  ``log(open_{t+h}) - log(close_t)`` — next open is a label, never a feature.
+  estimate known at ``t``.     ``label_return='overnight'`` is
+    ``log(open_{t+h}) - log(close_t)`` — next open is a label, never a feature.
+    ``open_fill`` adds ``(fill_minutes/390)`` of the next session.
 """
 
 from __future__ import annotations
@@ -389,6 +390,7 @@ def _forward_log_return(out: pd.DataFrame, log_close: pd.Series, cfg: DataConfig
         open_px=out["open"],
         kind=str(getattr(cfg, "label_return", "close") or "close"),
         horizon=int(cfg.horizon),
+        fill_minutes=int(getattr(cfg, "fill_minutes", 0) or 0),
     )
 
 
@@ -1293,7 +1295,7 @@ def build_datasets(
             f"{bool(getattr(cfg, 'equities_only', False))} "
             f"sector_residual={bool(getattr(cfg, 'sector_residual', False))} "
             f"train_from={raw_from or 'all'} "
-            f"{formula_log_line(getattr(cfg, 'label_return', 'close'), horizon=int(cfg.horizon))}"
+            f"{formula_log_line(getattr(cfg, 'label_return', 'close'), horizon=int(cfg.horizon), fill_minutes=int(getattr(cfg, 'fill_minutes', 0) or 0))}"
             + (f" (held out of book: {','.join(sorted(dropped))})" if dropped else "")
         )
 

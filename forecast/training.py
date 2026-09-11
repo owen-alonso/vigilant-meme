@@ -46,7 +46,7 @@ from forecast.config import (
 )
 from forecast.data import FEATURE_NAMES, build_datasets, collate_forecast
 from forecast.model import ReturnForecaster
-from forecast.overnight import formula_log_line, normalize_label_return
+from forecast.overnight import formula_log_line, parse_label_spec
 from forecast.ridge import feature_mask, labelled_rows, walk_forward_predict, cs_stats
 from mamba_lm.model import format_dynamic_diagnostics
 from mamba_lm.paths import anchor_to_repo
@@ -828,7 +828,11 @@ def _train(
             f"ridge_objective={getattr(train_cfg, 'ridge_objective', 'ridge')} "
             f"heteroscedastic={model_cfg.heteroscedastic}"
         )
-        log_fn(formula_log_line(getattr(data_cfg, "label_return", "close"), horizon=int(data_cfg.horizon)))
+        log_fn(formula_log_line(
+            getattr(data_cfg, "label_return", "close"),
+            horizon=int(data_cfg.horizon),
+            fill_minutes=int(getattr(data_cfg, "fill_minutes", 0) or 0),
+        ))
         autocast_context(device, train_cfg.precision, log_fn=log_fn)
 
     skip_ic = apply_ridge_skip(model, bundle, train_cfg, device)
@@ -1294,10 +1298,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "--label-return",
         default=d.label_return,
-        choices=("close", "overnight", "session"),
-        help="residual label: close-to-close (default/locked book), overnight gap "
-        "log(open_{t+h})-log(close_t), or next-session open-to-close. "
-        "Next open is never a feature.",
+        help="residual label: close (default/locked book), overnight "
+        "log(open_{t+h})-log(close_t), session open-to-close, or open_fill / open15. "
+        "Next open is never a feature. open_fill is a sensitivity, not the default overnight y.",
+    )
+    g.add_argument(
+        "--fill-minutes",
+        type=int,
+        default=None,
+        help="minutes after next open for open_fill (default 15 when label is open_fill). "
+        "Does not change overnight y unless label-return is open_fill/openN.",
     )
     g.add_argument(
         "--no-equities-only",
@@ -1503,6 +1513,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _cli_label_return(args: argparse.Namespace) -> str:
+    kind, _mins = parse_label_spec(str(getattr(args, "label_return", None) or "close"))
+    return kind
+
+
+def _cli_fill_minutes(args: argparse.Namespace) -> int:
+    from forecast.overnight import fill_minutes_for
+
+    kind, parsed = parse_label_spec(str(getattr(args, "label_return", None) or "close"))
+    explicit = getattr(args, "fill_minutes", None)
+    if kind != "open_fill":
+        return 0
+    return fill_minutes_for(kind, int(explicit) if explicit else parsed)
+
+
 def configs_from_cli(
     args: argparse.Namespace,
 ) -> tuple[DataConfig, ForecastModelConfig, ForecastTrainConfig]:
@@ -1553,7 +1578,8 @@ def configs_from_cli(
         double_residual=args.double_residual,
         residualize_features=args.residualize_features,
         industry_residual=args.industry_residual,
-        label_return=normalize_label_return(str(args.label_return or "close")),
+        label_return=_cli_label_return(args),
+        fill_minutes=_cli_fill_minutes(args),
     )
     model_cfg = ForecastModelConfig(
         n_features=len(FEATURE_NAMES),

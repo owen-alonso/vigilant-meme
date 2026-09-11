@@ -176,8 +176,15 @@ y_t = \frac{r_{t+1} - \beta_t r^{\mathrm{hedge}}_{t+1}}{\sigma_t}
 
 Overnight (`--label-return overnight`) replaces \(r_{t+1}\) with
 \(\log(\mathrm{open}_{t+1})-\log(\mathrm{close}_t)\). Next open is a **label**,
-never a feature. Backtest `--holding overnight` flattens every open (MOC→MOO),
-charges enter+exit each night, and does not headline `vol_target=1`.
+never a feature. Backtest `--holding overnight` flattens every open (MOC→MOO).
+`--live-costs` is the Owen-runnable pack (20 bp RT + name-level MOC/MOO +
+thin/vol impact + 5 bp borrow + 10 bp hedge). `--long-only` drops shorts and
+borrow (no locate). `--locate-adv-pctile 0.3` blocks shorts in the bottom
+turnover tercile. `--adv-floor-pctile 0.67 --min-names 8` is the liquid
+sleeve (same skip, drop thin names before weights). `--compare-long-only`
+prints both books. Do not headline `vol_target=1`. Open+N fill
+(`--label-return open15`) is a **separate** estimand; it does not replace
+overnight `y` unless it wins the locked-val gate.
 
 `best.pt` is selected by mean CS IC when a cross-section exists. `backtest.py`
 builds a dollar-neutral (or `--long-only`) quantile book on the locked

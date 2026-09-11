@@ -60,23 +60,61 @@ The skip defaults to **within-date rank-target ridge** with ``ridge=10``, featur
 
 ``--label-return overnight`` is a **different estimand** (close_t → open_{t+1} residual). Features stay at close t; next open is a label. Yahoo/Stooq adjclose rescales OHLC together. The overnight **trade** is MOC t → MOO t+1 (flat in the next session). Do **not** mix overnight IC into the close-to-close headline. Close-to-close 0.04–0.08 was not reached; that book stays levered net IR ~1.
 
-Overnight protocol (val-gate; do not retarget from test):
+Overnight live book (val-gate; do not retarget from test). Paper 10 bp flatten is **not** live P&L.
 
 ```bash
 # skip-only overnight residual (promoted skip recipe, different y)
 python -m forecast.training --universe liquid --interval daily --skip-only \
   --label-return overnight --checkpoint-dir checkpoints/forecast_ridge_overnight
-# year series + cost/auction/borrow stress (locked test)
-python scripts/cs_overnight.py --data-dir data --universe liquid
-# tiny last-bar MLP residual is on by default (val-gate ≥0.003 vs skip)
-python scripts/cs_overnight.py --data-dir data --universe liquid --encoder
-python scripts/cs_overnight.py --data-dir data --universe liquid --try-dynamic-a
-# holding period matches the label (flatten every open); do not headline vol_target=1
+
+# year series + live auction/locate/long-only stress (locked test)
+python scripts/cs_overnight.py --data-dir data --universe liquid \
+  --out checkpoints/forecast_ridge_overnight/overnight.json
+# optional: val-gate open+15m fill as a separate estimand (does not replace overnight y)
+python scripts/cs_overnight.py --data-dir data --universe liquid --try-fill 15 --no-lastbar-residual
+# optional weekly residual fallback if harsh MOO kills overnight
+python scripts/cs_overnight.py --data-dir data --universe liquid --try-weekly --no-lastbar-residual
+
+# live cost bundle (name-level MOC/MOO + thin/vol impact + borrow + hedge)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
-  --cost-bps 10 --holding overnight --open-auction-bps 10 --borrow-bps 5 --hedge-cost-bps 10
+  --holding overnight --live-costs --compare-long-only
+# locate-gated shorts (bottom 30% CS turnover_z cannot be shorted)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
-  --cost-bps 10 --long-only --holding overnight
+  --holding overnight --live-costs --locate-adv-pctile 0.3
+# long-only, no locate
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --long-only
+# optional liquid sleeve (top CS turnover tercile; same skip w; use a lower min-names)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --adv-floor-pctile 0.67 --min-names 8
+# harsh auction stress
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --cost-bundle harsh
+# old flat overlay (20bp RT + 10bp exit-half auction + 5 borrow + 10 hedge)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --cost-bundle live_flat
+
+# open+15m fill is a different label; only train it after it wins locked val
+python -m forecast.training --universe liquid --interval daily --skip-only \
+  --label-return open15 --checkpoint-dir checkpoints/forecast_ridge_fill15
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_fill15/best.pt \
+  --holding open_fill --cost-bundle fill_live
 ```
+
+Overnight **live vs paper** (same flatten book, 15% causal vol):
+
+| bundle | meaning |
+|---|---|
+| `paper` / `--cost-bps 10` | enter+exit 10 bp. Understates auction/locate. |
+| `live_flat` | 20 bp RT + 10 bp on the *exit half-notional* + 5 borrow + 10 hedge. First live-ish overlay. |
+| `live` (`--live-costs`) | 20 bp RT + **5 bp MOC + 10 bp MOO on full \|w\|**, ×2 on the bottom 30% CS `turnover_z`, + `8 * max(vol_level,0)` bp impact, + 5 borrow + 10 hedge. |
+| `live_locate` | `live` plus no shorts in the bottom 30% turnover (HTB proxy). Report IR with and without this gate. |
+| `live_long_only` | `live` with no shorts, borrow=0. Residual still assumes a liquid ETF hedge overlay. Long sleeve ADV participation is ~2× the 50/50 long sleeve. |
+| `harsh` | ugly MOO (30 bp), HTB, higher impact. If net IR dies, stop; next estimand is open+N fill or weekly residual — not bigger Mamba. |
+| `ex_post_gap` | sensitivity: extra `0.25 * \|overnight move\| * \|w\|`. Uses realized. Not the default. |
+| `fill_live` | MOC + continuous open+N exit (no MOO). Only with `--label-return open15`. |
+
+`--open-auction-bps` is the *legacy* extra on the exit half-notional. Prefer `--moc-bps` / `--moo-bps`. Open+N (`open15`) mixes `15/390` of next-session return into the **label**; do not silently train it as overnight `y`.
 
 ```bash
 # regime heads / surgical vol+CS-product drop / trailing readout window (all lost on val)

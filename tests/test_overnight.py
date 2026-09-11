@@ -15,13 +15,19 @@ from forecast.data import FEATURE_NAMES, compute_features, embargo_calendar_hori
 from forecast.diagnostics import looks_like_unadjusted_open, ohlc_body_diagnostics
 from forecast.overnight import (
     OVERNIGHT_FORMULA,
+    LIVE_BUNDLE,
+    apply_locate_gate,
+    fill_frac_minutes,
+    fill_minutes_for,
     forward_log_return,
     holding_for_label,
     log_positive_price,
     next_open_valid,
     normalize_label_return,
+    overnight_cost_breakdown,
     overnight_one_way_turnover,
     overnight_stress_costs,
+    parse_label_spec,
     uses_next_open,
 )
 from forecast.yahoo import parse_yahoo_chart
@@ -67,10 +73,15 @@ def test_normalize_label_return_aliases():
     assert normalize_label_return("close_open") == "overnight"
     assert normalize_label_return("oc") == "session"
     assert normalize_label_return(None) == "close"
+    assert normalize_label_return("open15") == "open_fill"
+    assert normalize_label_return("fill30") == "open_fill"
     assert uses_next_open("overnight")
+    assert uses_next_open("open_fill")
     assert not uses_next_open("close")
     assert holding_for_label("overnight") == "overnight"
     assert holding_for_label("close") == "close"
+    assert holding_for_label("open15") == "open_fill"
+    assert holding_for_label("open_fill") == "open_fill"
     assert "log(open[t+h])" in OVERNIGHT_FORMULA
 
 
@@ -413,3 +424,349 @@ def test_skip_only_overnight_recovers_planted_gap(tmp_path: Path):
     assert np.isfinite(test["cs_ic"])
     assert test["cs_ic"] > 0.05
     assert summary["best_val_ic"] == pytest.approx(selection_score(summary["skip_only_val"]))
+
+
+def test_open_fill_is_overnight_plus_session_fraction():
+    assert parse_label_spec("open15") == ("open_fill", 15)
+    assert fill_minutes_for("open15") == 15
+    assert fill_minutes_for("open_fill", 30) == 30
+    assert fill_frac_minutes(15) == pytest.approx(15 / 390)
+    grid = _daily_grid()
+    on = forward_log_return(
+        close=grid["close"], open_px=grid["open"], kind="overnight", horizon=1
+    )
+    sess = forward_log_return(
+        close=grid["close"], open_px=grid["open"], kind="session", horizon=1
+    )
+    fill = forward_log_return(
+        close=grid["close"],
+        open_px=grid["open"],
+        kind="open_fill",
+        horizon=1,
+        fill_minutes=15,
+    )
+    t = 19
+    alpha = 15 / 390
+    assert fill.iloc[t] == pytest.approx(float(on.iloc[t] + alpha * sess.iloc[t]))
+
+
+def test_open_fill_label_uses_next_open_and_next_close_not_features():
+    grid = _daily_grid()
+    cfg = _cfg(label_return="open_fill", fill_minutes=15)
+    base = compute_features(grid.copy(), cfg)
+    spiked_open = grid.copy()
+    spiked_open.loc[spiked_open.index[20], "open"] = float(spiked_open["open"].iloc[20]) * 1.2
+    spiked_close = grid.copy()
+    spiked_close.loc[spiked_close.index[20], "close"] = float(spiked_close["close"].iloc[20]) * 1.2
+    on_cfg = _cfg()
+    fill_open = compute_features(spiked_open, cfg)
+    fill_close = compute_features(spiked_close, cfg)
+    on_close = compute_features(spiked_close, on_cfg)
+    t = 19
+    from forecast.data import FEATURE_NAMES
+
+    for name in FEATURE_NAMES:
+        assert base[name].iloc[t] == pytest.approx(float(fill_open[name].iloc[t]), abs=1e-12)
+        assert base[name].iloc[t] == pytest.approx(float(fill_close[name].iloc[t]), abs=1e-12)
+    assert base["target_raw"].iloc[t] != pytest.approx(float(fill_open["target_raw"].iloc[t]))
+    assert base["target_raw"].iloc[t] != pytest.approx(float(fill_close["target_raw"].iloc[t]))
+    # Overnight y ignores next close; fill does not.
+    on_base = compute_features(grid.copy(), on_cfg)
+    assert on_base["target_raw"].iloc[t] == pytest.approx(float(on_close["target_raw"].iloc[t]))
+
+
+def test_fill_minutes_does_not_silently_change_overnight_cli():
+    from forecast.training import build_arg_parser, configs_from_cli
+
+    args = build_arg_parser().parse_args(
+        ["--label-return", "overnight", "--fill-minutes", "15"]
+    )
+    data_cfg, _, _ = configs_from_cli(args)
+    assert data_cfg.label_return == "overnight"
+    assert data_cfg.fill_minutes == 0
+    args_fill = build_arg_parser().parse_args(["--label-return", "open15"])
+    fill_cfg, _, _ = configs_from_cli(args_fill)
+    assert fill_cfg.label_return == "open_fill"
+    assert fill_cfg.fill_minutes == 15
+
+
+def test_auction_costs_charge_thin_names_more():
+    w = np.array([[-0.25, -0.25, 0.25, 0.25]])
+    tz_thin = np.array([[-2.0, -2.0, 1.0, 1.0]])
+    tz_liq = np.array([[1.0, 1.0, 1.0, 1.0]])
+    fat = overnight_stress_costs(
+        round_trip_bps=0.0,
+        moc_bps=10.0,
+        moo_bps=10.0,
+        weights=w,
+        turnover_z=tz_thin,
+        thin_mult=3.0,
+        thin_pctile=0.5,
+    )
+    slim = overnight_stress_costs(
+        round_trip_bps=0.0,
+        moc_bps=10.0,
+        moo_bps=10.0,
+        weights=w,
+        turnover_z=tz_liq,
+        thin_mult=3.0,
+        thin_pctile=0.5,
+    )
+    assert fat[0] > slim[0]
+
+
+def test_live_cost_parts_sum_to_total():
+    w = np.array([[-0.5, 0.0, 0.5]])
+    parts = overnight_cost_breakdown(
+        weights=w,
+        round_trip_bps=float(LIVE_BUNDLE["round_trip_bps"]),
+        open_auction_bps=0.0,
+        moc_bps=float(LIVE_BUNDLE["moc_bps"]),
+        moo_bps=float(LIVE_BUNDLE["moo_bps"]),
+        borrow_bps=float(LIVE_BUNDLE["borrow_bps"]),
+        hedge_cost_bps=float(LIVE_BUNDLE["hedge_cost_bps"]),
+    )
+    accounted = sum(
+        parts[k]
+        for k in (
+            "round_trip",
+            "legacy_open_auction",
+            "moc",
+            "moo",
+            "session_exit",
+            "borrow",
+            "hedge",
+            "impact",
+            "ex_post_gap",
+        )
+    )
+    assert parts["total"][0] == pytest.approx(float(accounted[0]))
+    # Live is strictly more than paper 10bp flatten on a 50/50 book.
+    paper = overnight_stress_costs(round_trip_bps=10.0, weights=w)
+    assert parts["total"][0] > paper[0]
+
+
+def test_locate_gate_zeros_thin_shorts_and_keeps_longs():
+    w = np.array([-0.25, -0.25, 0.25, 0.25])
+    tz = np.array([-2.0, 1.0, -2.0, 1.0])
+    gated, blocked = apply_locate_gate(w, tz, pctile=0.5)
+    assert blocked[0] >= 1
+    assert gated[0] == pytest.approx(0.0)
+    assert gated[2] == pytest.approx(0.25)
+    assert gated[gated < 0].sum() == pytest.approx(-0.5)
+
+
+def test_locate_vs_unconstrained_and_long_only_books():
+    dates = pd.bdate_range("2022-01-03", periods=40)
+    names = [f"S{i}" for i in range(10)]
+    pred = pd.DataFrame(
+        np.tile(np.linspace(-1, 1, 10), (40, 1)), index=dates, columns=names
+    )
+    realized = pred * 0.02
+    tz = pd.DataFrame(
+        np.tile(np.linspace(-2, 2, 10), (40, 1)), index=dates, columns=names
+    )
+    ls = book_pnl(
+        pred,
+        realized,
+        holding="overnight",
+        hold_halflife=0.0,
+        vol_target=0.0,
+        causal_vol=False,
+        round_trip_bps=10.0,
+        borrow_bps=20.0,
+        min_names=8,
+        turnover_z=tz,
+    )
+    loc = book_pnl(
+        pred,
+        realized,
+        holding="overnight",
+        hold_halflife=0.0,
+        vol_target=0.0,
+        causal_vol=False,
+        round_trip_bps=10.0,
+        borrow_bps=20.0,
+        locate_pctile=0.3,
+        min_names=8,
+        turnover_z=tz,
+    )
+    lo = book_pnl(
+        pred,
+        realized,
+        holding="overnight",
+        hold_halflife=0.0,
+        vol_target=0.0,
+        causal_vol=False,
+        round_trip_bps=10.0,
+        borrow_bps=20.0,
+        long_only=True,
+        min_names=8,
+        turnover_z=tz,
+    )
+    assert loc["locate_pctile"] == pytest.approx(0.3)
+    assert loc["mean_shorts_blocked"] > 0
+    assert loc["mean_short_nav"] <= ls["mean_short_nav"] + 1e-9
+    assert lo["long_only"] is True
+    assert lo["mean_short_nav"] == pytest.approx(0.0, abs=1e-12)
+    assert lo["borrow_bps"] == pytest.approx(0.0)
+    assert lo["mean_long_nav"] == pytest.approx(1.0)
+    assert "no locate" in lo["capacity_note"].lower() or "No locate" in lo["capacity_note"]
+
+
+def test_ex_post_gap_is_extra_and_not_in_default_live():
+    w = np.array([[-0.5, 0.5]])
+    gap = np.array([[0.02, 0.02]])
+    base = overnight_stress_costs(round_trip_bps=10.0, weights=w, **{
+        k: LIVE_BUNDLE[k]
+        for k in ("moc_bps", "moo_bps", "borrow_bps", "hedge_cost_bps")
+    })
+    extra = overnight_stress_costs(
+        round_trip_bps=10.0,
+        weights=w,
+        moc_bps=LIVE_BUNDLE["moc_bps"],
+        moo_bps=LIVE_BUNDLE["moo_bps"],
+        borrow_bps=LIVE_BUNDLE["borrow_bps"],
+        hedge_cost_bps=LIVE_BUNDLE["hedge_cost_bps"],
+        realized_abs=gap,
+        ex_post_gap_k=0.25,
+    )
+    assert extra[0] > base[0]
+    assert LIVE_BUNDLE["ex_post_gap_k"] == 0.0
+
+
+def test_open_fill_holding_uses_session_exit_not_moo():
+    dates = pd.bdate_range("2022-01-03", periods=30)
+    names = [f"S{i}" for i in range(10)]
+    pred = pd.DataFrame(
+        np.tile(np.linspace(-1, 1, 10), (30, 1)), index=dates, columns=names
+    )
+    realized = pred * 0.01
+    on = book_pnl(
+        pred,
+        realized,
+        holding="overnight",
+        hold_halflife=1.0,
+        vol_target=0.0,
+        causal_vol=False,
+        round_trip_bps=20.0,
+        moo_bps=30.0,
+        moc_bps=5.0,
+        min_names=8,
+    )
+    fill = book_pnl(
+        pred,
+        realized,
+        holding="open_fill",
+        hold_halflife=1.0,
+        vol_target=0.0,
+        causal_vol=False,
+        round_trip_bps=20.0,
+        moc_bps=5.0,
+        moo_bps=0.0,
+        session_exit_bps=5.0,
+        min_names=8,
+    )
+    assert on["holding"] == "overnight"
+    assert fill["holding"] == "open_fill"
+    assert fill["hold_halflife"] == pytest.approx(0.0)
+    assert fill["mean_cost"] < on["mean_cost"]
+
+
+def test_backtest_live_costs_cli():
+    from forecast.backtest import build_arg_parser, cost_kwargs_from_args
+
+    args = build_arg_parser().parse_args(["--live-costs", "--holding", "overnight"])
+    costs = cost_kwargs_from_args(args)
+    assert costs["moo_bps"] == pytest.approx(10.0)
+    assert costs["moc_bps"] == pytest.approx(5.0)
+    assert costs["round_trip_bps"] == pytest.approx(20.0)
+    lo = build_arg_parser().parse_args(["--live-costs", "--long-only"])
+    locosts = cost_kwargs_from_args(lo)
+    assert locosts["borrow_bps"] == pytest.approx(0.0)
+    assert locosts["name"] == "live_long_only"
+    loc = build_arg_parser().parse_args(
+        ["--live-costs", "--holding", "overnight", "--locate-adv-pctile", "0.3"]
+    )
+    locosts2 = cost_kwargs_from_args(loc)
+    assert locosts2["locate_pctile"] == pytest.approx(0.3)
+    harsh = build_arg_parser().parse_args(["--cost-bundle", "harsh", "--holding", "overnight"])
+    hcosts = cost_kwargs_from_args(harsh)
+    assert hcosts["moo_bps"] == pytest.approx(30.0)
+    assert hcosts["ex_post_gap_k"] == pytest.approx(0.0)
+
+
+def test_adv_floor_drops_thin_names_before_weights():
+    dates = pd.bdate_range("2022-01-03", periods=30)
+    names = [f"S{i}" for i in range(15)]
+    pred = pd.DataFrame(
+        np.tile(np.linspace(-1, 1, 15), (30, 1)), index=dates, columns=names
+    )
+    realized = pred * 0.01
+    tz = pd.DataFrame(
+        np.tile(np.linspace(-3, 3, 15), (30, 1)), index=dates, columns=names
+    )
+    full = book_pnl(
+        pred,
+        realized,
+        holding="overnight",
+        hold_halflife=0.0,
+        vol_target=0.0,
+        causal_vol=False,
+        round_trip_bps=10.0,
+        min_names=5,
+        turnover_z=tz,
+    )
+    sleeve = book_pnl(
+        pred,
+        realized,
+        holding="overnight",
+        hold_halflife=0.0,
+        vol_target=0.0,
+        causal_vol=False,
+        round_trip_bps=10.0,
+        min_names=5,
+        turnover_z=tz,
+        adv_floor_pctile=2.0 / 3.0,
+    )
+    assert sleeve["n_dates"] >= 5
+    assert sleeve["adv_floor_pctile"] == pytest.approx(2.0 / 3.0)
+    traded = sleeve["mean_n_long"] + sleeve["mean_n_short"]
+    full_n = full["mean_n_long"] + full["mean_n_short"]
+    assert traded < full_n
+
+
+def test_sleeve_cs_stays_finite_when_protocol_min_names_exceeds_sleeve():
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "cs_overnight.py"
+    spec = importlib.util.spec_from_file_location("cs_overnight_mod", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+
+    n_dates, n_names = 20, 30
+    rng = np.random.default_rng(4)
+    pred = rng.normal(size=n_dates * n_names)
+    y = pred * 0.4 + rng.normal(scale=0.6, size=pred.shape[0])
+    dates = np.repeat(np.arange(n_dates, dtype=np.int64), n_names)
+    tz = np.tile(np.linspace(-2, 2, n_names), n_dates)
+    stats = mod._sleeve_cs(pred, y, dates, tz, floor=2.0 / 3.0, min_names=30)
+    assert mod._sleeve_min_names(30, 2.0 / 3.0) == 10
+    assert np.isfinite(stats["cs_ic"])
+    assert stats["cs_n_dates"] > 0
+
+
+def test_moc_moo_charge_full_notional_not_exit_half():
+    w = np.array([[-0.5, 0.5]])
+    legacy = overnight_cost_breakdown(
+        weights=w, round_trip_bps=0.0, open_auction_bps=10.0
+    )
+    named = overnight_cost_breakdown(
+        weights=w, round_trip_bps=0.0, moc_bps=5.0, moo_bps=10.0
+    )
+    # Legacy 10bp on exit half-notional (0.5 NAV) vs 5+10bp on full |w| (1.0 NAV).
+    assert legacy["legacy_open_auction"][0] == pytest.approx(10e-4 * 0.5)
+    assert named["moc"][0] == pytest.approx(5e-4)
+    assert named["moo"][0] == pytest.approx(10e-4)
+    assert named["total"][0] > legacy["total"][0]

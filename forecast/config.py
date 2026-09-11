@@ -109,8 +109,12 @@ class DataConfig:
     # Which forward log-return the residual label uses. ``close`` is close_t →
     # close_{t+h} (the locked close-to-close book). ``overnight`` is
     # close_t → open_{t+h} (gap residual; next open is a *label*, never a
-    # feature). ``session`` is open_{t+h} → close_{t+h}. Features stay at close t.
+    # feature). ``session`` is open_{t+h} → close_{t+h}. ``open_fill`` is
+    # overnight plus (fill_minutes/390) of next-session return — a sensitivity,
+    # not the default overnight book. Features stay at close t.
     label_return: str = "close"
+    # Minutes after the next open for ``open_fill``. 0 = unused. 15 ≈ 15/390.
+    fill_minutes: int = 0
 
     def is_daily(self) -> bool:
         return self.interval == "daily"
@@ -146,9 +150,16 @@ class DataConfig:
             payload["industry_residual"] = False
         if "label_return" not in payload:
             payload["label_return"] = "close"
-        from forecast.overnight import normalize_label_return
+        if "fill_minutes" not in payload:
+            payload["fill_minutes"] = 0
+        from forecast.overnight import fill_minutes_for, normalize_label_return
 
         payload["label_return"] = normalize_label_return(payload.get("label_return"))
+        payload["fill_minutes"] = int(
+            fill_minutes_for(payload["label_return"], int(payload.get("fill_minutes") or 0))
+            if payload["label_return"] == "open_fill"
+            else 0
+        )
         return cls(**filter_dataclass_fields(cls, payload))
 
 

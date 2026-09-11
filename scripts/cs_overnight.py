@@ -6,8 +6,8 @@ the two ICs. Promote only if locked-val improves honestly and test stays strong.
 
     python scripts/cs_overnight.py --synthetic
     python scripts/cs_overnight.py --data-dir data --universe liquid
+    python scripts/cs_overnight.py --data-dir data --universe liquid --try-fill 15
     python scripts/cs_overnight.py --data-dir data --universe liquid --encoder
-    python scripts/cs_overnight.py --data-dir data --universe liquid --try-dynamic-a
 """
 
 from __future__ import annotations
@@ -35,7 +35,18 @@ from forecast.config import (
 )
 from forecast.data import FEATURE_NAMES, build_datasets
 from forecast.overnight import (
+    FILL_FORMULA,
+    LIVE_BUNDLE,
+    LIVE_FLAT_BUNDLE,
+    LIVE_LOCATE_BUNDLE,
+    LIVE_LONG_ONLY_BUNDLE,
+    HARSH_BUNDLE,
+    EX_POST_GAP_BUNDLE,
+    FILL_LIVE_BUNDLE,
     OVERNIGHT_FORMULA,
+    PAPER_BUNDLE,
+    VAL_2017_KEEP,
+    VAL_LIFT,
     formula_log_line,
     slim_cs_stats,
 )
@@ -45,6 +56,8 @@ from forecast.ridge import (
     fit_ridge_xy,
     labelled_rows,
     year_cs_ics,
+    year_feature_ics,
+    year_stable_mask,
 )
 from forecast.synthetic import write_cs_overnight_universe
 
@@ -54,8 +67,6 @@ PROMOTED = dict(
     feat_winsor=3.0,
     mask_mode="no_long_ts",
 )
-VAL_LIFT = 0.003
-VAL_2017_FLOOR = 0.015
 VAL_2017_T = 1.5
 TEST_T_FLOOR = 3.0
 # Prior overnight skip print (different book than close-to-close +0.0290).
@@ -69,16 +80,24 @@ def _ymd(year: int, month: int = 1, day: int = 1) -> int:
     )
 
 
-def _cfg(data_dir: str, universe: str) -> DataConfig:
-    preset = interval_data_kwargs("daily")
+def _cfg(
+    data_dir: str,
+    universe: str,
+    *,
+    label_return: str = "overnight",
+    fill_minutes: int = 0,
+    interval: str = "daily",
+) -> DataConfig:
+    preset = interval_data_kwargs(interval)
+    seq_len = 32 if interval == "daily" else int(preset["seq_len"])
     return DataConfig(
         data_dir=data_dir,
-        interval="daily",
+        interval=interval,
         horizon=1,
-        seq_len=32,
+        seq_len=seq_len,
         stride=1,
-        min_context=8,
-        warmup_bars=16,
+        min_context=8 if interval == "daily" else int(preset["min_context"]),
+        warmup_bars=16 if interval == "daily" else int(preset["warmup_bars"]),
         vol_halflife=preset["vol_halflife"],
         z_window=preset["z_window"],
         z_min_periods=preset["z_min_periods"],
@@ -93,7 +112,8 @@ def _cfg(data_dir: str, universe: str) -> DataConfig:
         sector_residual=True,
         equities_only=universe not in ("", "synthetic"),
         train_from="" if universe in ("", "synthetic") else "1999-01-01",
-        label_return="overnight",
+        label_return=label_return,
+        fill_minutes=int(fill_minutes or 0),
     )
 
 
@@ -133,17 +153,27 @@ def _ensure_cache(
     data_dir: str,
     universe: str,
     rebuild: bool,
+    label_return: str = "overnight",
+    fill_minutes: int = 0,
+    interval: str = "daily",
 ) -> dict[str, Any]:
     if path.exists() and not rebuild:
         print(f"cache {path}", flush=True)
         return _load(path)
     if not data_dir:
         raise SystemExit("need --data-dir or --synthetic to build overnight last bars")
+    cfg = _cfg(
+        data_dir,
+        universe,
+        label_return=label_return,
+        fill_minutes=fill_minutes,
+        interval=interval,
+    )
     print(
-        f"building overnight last bars from {data_dir}  {formula_log_line('overnight')}",
+        f"building last bars from {data_dir}  {formula_log_line(label_return, fill_minutes=fill_minutes)}",
         flush=True,
     )
-    bundle = build_datasets(_cfg(data_dir, universe), log_fn=print)
+    bundle = build_datasets(cfg, log_fn=print)
     _dump(bundle, path)
     print(f"wrote {path}  n_trade={bundle.get('n_trading_names')}", flush=True)
     return _load(path)
@@ -290,9 +320,27 @@ def _fit_lastbar_residual(
     }
 
 
-def _fit_promoted(cache: dict[str, Any]) -> tuple[np.ndarray, float, float]:
+def _fit_skip(
+    cache: dict[str, Any],
+    *,
+    ridge: float | None = None,
+    rank_target: bool | None = None,
+    feat_winsor: float | None = None,
+    mask_mode: str | None = None,
+    date_halflife: float = 0.0,
+    drop_disp_q: float = 0.0,
+    train_from_year: int | None = None,
+    year_stable: bool = False,
+) -> tuple[np.ndarray, float, float]:
     x, y, d = _train_xy(cache)
-    mask = feature_mask(PROMOTED["mask_mode"])
+    if train_from_year is not None:
+        keep = d >= _ymd(int(train_from_year))
+        if bool(keep.any()):
+            x, y, d = x[keep], y[keep], d[keep]
+    mask = feature_mask(mask_mode or PROMOTED["mask_mode"])
+    if year_stable:
+        extra = year_stable_mask(x, y, d, min_names=int(cache["cs_min_names"]))
+        mask = mask & extra
     if x.shape[1] != mask.size:
         raise ValueError(
             f"cache has {x.shape[1]} features, expected {mask.size}. Rebuild the cache."
@@ -301,14 +349,20 @@ def _fit_promoted(cache: dict[str, Any]) -> tuple[np.ndarray, float, float]:
         x,
         y,
         d,
-        ridge=PROMOTED["ridge"],
+        ridge=float(PROMOTED["ridge"] if ridge is None else ridge),
         min_names=int(cache["cs_min_names"]),
         cs_demean=True,
-        rank_target=PROMOTED["rank_target"],
-        feat_winsor=PROMOTED["feat_winsor"],
+        rank_target=PROMOTED["rank_target"] if rank_target is None else bool(rank_target),
+        feat_winsor=float(PROMOTED["feat_winsor"] if feat_winsor is None else feat_winsor),
         feature_mask_bool=mask,
+        date_halflife=float(date_halflife),
+        drop_disp_q=float(drop_disp_q),
     )
     return w, b, ic
+
+
+def _fit_promoted(cache: dict[str, Any]) -> tuple[np.ndarray, float, float]:
+    return _fit_skip(cache)
 
 
 def _print_split(name: str, split: dict[str, Any]) -> None:
@@ -336,92 +390,449 @@ def _print_split(name: str, split: dict[str, Any]) -> None:
         )
 
 
-def _wide(pred: np.ndarray, y: np.ndarray, dates: np.ndarray) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Last-bar vectors -> wide date x dummy-name frames for book_pnl."""
+def _wide_vec(values: np.ndarray, dates: np.ndarray) -> pd.DataFrame:
     keys = np.unique(dates)
-    # Variable breadth: pad with NaN. Names are anonymous slots per date.
     max_n = max(int((dates == k).sum()) for k in keys)
     p = np.full((len(keys), max_n), np.nan)
-    r = np.full((len(keys), max_n), np.nan)
     index = pd.to_datetime(keys.astype("datetime64[D]"))
     for i, key in enumerate(keys):
         sel = dates == key
         n = int(sel.sum())
-        p[i, :n] = pred[sel]
-        r[i, :n] = y[sel]
+        p[i, :n] = values[sel]
     cols = [f"N{j}" for j in range(max_n)]
-    return pd.DataFrame(p, index=index, columns=cols), pd.DataFrame(r, index=index, columns=cols)
+    return pd.DataFrame(p, index=index, columns=cols)
 
 
-def _stress_grid(pred: np.ndarray, y: np.ndarray, dates: np.ndarray) -> list[dict[str, Any]]:
+def _wide(pred: np.ndarray, y: np.ndarray, dates: np.ndarray) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Last-bar vectors -> wide date x dummy-name frames for book_pnl."""
+    return _wide_vec(pred, dates), _wide_vec(y, dates)
+
+
+def _feat_wide(cache: dict[str, Any], split: str, name: str) -> pd.DataFrame:
+    names = list(FEATURE_NAMES)
+    if name not in names:
+        raise KeyError(name)
+    x = cache[f"{split}_x"].astype(np.float64)
+    d = cache[f"{split}_d"].astype(np.int64)
+    return _wide_vec(x[:, names.index(name)], d)
+
+
+def _book_row(stats: dict[str, Any], name: str, note: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "unlevered_net_ir": stats.get("unlevered_net_ir"),
+        "levered_net_ir": stats.get("net_ir"),
+        "unlevered_max_dd": stats.get("unlevered_max_dd"),
+        "levered_max_dd": stats.get("max_dd"),
+        "mean_turnover": stats.get("mean_turnover"),
+        "mean_cs_ic": stats.get("mean_cs_ic"),
+        "vol_target": stats.get("vol_target"),
+        "long_only": stats.get("long_only"),
+        "round_trip_bps": stats.get("round_trip_bps"),
+        "open_auction_bps": stats.get("open_auction_bps"),
+        "moc_bps": stats.get("moc_bps"),
+        "moo_bps": stats.get("moo_bps"),
+        "borrow_bps": stats.get("borrow_bps"),
+        "hedge_cost_bps": stats.get("hedge_cost_bps"),
+        "impact_vol_k": stats.get("impact_vol_k"),
+        "thin_mult": stats.get("thin_mult"),
+        "thin_pctile": stats.get("thin_pctile"),
+        "locate_pctile": stats.get("locate_pctile"),
+        "ex_post_gap_k": stats.get("ex_post_gap_k"),
+        "mean_long_nav": stats.get("mean_long_nav"),
+        "mean_short_nav": stats.get("mean_short_nav"),
+        "mean_shorts_blocked": stats.get("mean_shorts_blocked"),
+        "mean_cost_unlev": stats.get("mean_cost_unlev"),
+        "cost_parts": stats.get("cost_parts"),
+        "capacity_note": stats.get("capacity_note"),
+        "note": note,
+    }
+
+
+def _run_book(
+    pred: pd.DataFrame,
+    realized: pd.DataFrame,
+    *,
+    bundle: dict[str, Any],
+    long_only: bool = False,
+    holding: str = "overnight",
+    turnover_z: pd.DataFrame | None = None,
+    vol_level: pd.DataFrame | None = None,
+    vol_target: float = 0.15,
+    adv_floor_pctile: float = 0.0,
+) -> dict[str, Any]:
+    return book_pnl(
+        pred,
+        realized,
+        quantile=0.2,
+        weighting="quantile",
+        hold_halflife=0.0,
+        causal_vol=True,
+        vol_target=float(vol_target),
+        lever_cap=3.0,
+        min_names=8,
+        holding=holding,
+        long_only=long_only,
+        round_trip_bps=float(bundle.get("round_trip_bps", 10.0)),
+        open_auction_bps=float(bundle.get("open_auction_bps", 0.0)),
+        borrow_bps=float(bundle.get("borrow_bps", 0.0)),
+        hedge_cost_bps=float(bundle.get("hedge_cost_bps", 0.0)),
+        moc_bps=float(bundle.get("moc_bps", 0.0)),
+        moo_bps=float(bundle.get("moo_bps", 0.0)),
+        session_exit_bps=float(bundle.get("session_exit_bps", 0.0)),
+        impact_vol_k=float(bundle.get("impact_vol_k", 0.0)),
+        thin_mult=float(bundle.get("thin_mult", 1.0)),
+        thin_pctile=float(bundle.get("thin_pctile", 0.0)),
+        locate_pctile=float(bundle.get("locate_pctile", 0.0)),
+        ex_post_gap_k=float(bundle.get("ex_post_gap_k", 0.0)),
+        turnover_z=turnover_z,
+        vol_level=vol_level,
+        adv_floor_pctile=float(adv_floor_pctile),
+    )
+
+
+def _stress_grid(
+    pred: np.ndarray,
+    y: np.ndarray,
+    dates: np.ndarray,
+    *,
+    turnover_z: pd.DataFrame | None = None,
+    vol_level: pd.DataFrame | None = None,
+    holding: str = "overnight",
+) -> list[dict[str, Any]]:
     p, r = _wide(pred, y, dates)
-    min_names = 8
-    cases = [
-        dict(name="overnight_10bp", round_trip_bps=10.0),
-        dict(name="overnight_20bp", round_trip_bps=20.0),
-        dict(name="overnight_40bp", round_trip_bps=40.0),
-        dict(name="auction_10_plus_rt10", round_trip_bps=10.0, open_auction_bps=10.0),
-        dict(name="borrow_5_plus_rt10", round_trip_bps=10.0, borrow_bps=5.0),
-        dict(
-            name="live_friction_bundle",
-            round_trip_bps=20.0,
-            open_auction_bps=10.0,
-            borrow_bps=5.0,
-            hedge_cost_bps=10.0,
+    cases: list[tuple[str, dict[str, Any], bool, str]] = [
+        ("overnight_10bp", PAPER_BUNDLE, False, "paper flatten; understates auction/locate"),
+        ("overnight_20bp", {**PAPER_BUNDLE, "round_trip_bps": 20.0}, False, "flat 20bp RT"),
+        ("overnight_40bp", {**PAPER_BUNDLE, "round_trip_bps": 40.0}, False, "flat 40bp RT"),
+        (
+            "live_flat",
+            LIVE_FLAT_BUNDLE,
+            False,
+            "old overlay: 20bp RT + 10bp exit-half auction + 5 borrow + 10 hedge",
         ),
-        dict(name="long_only_10bp", round_trip_bps=10.0, long_only=True),
-        dict(name="vol_target_1_toy", round_trip_bps=10.0, vol_target=1.0),
+        (
+            "live",
+            LIVE_BUNDLE,
+            False,
+            "name-level MOC/MOO + thin/vol impact; shorts unconstrained",
+        ),
+        (
+            "live_locate",
+            LIVE_LOCATE_BUNDLE,
+            False,
+            "live + cannot short bottom 30% CS turnover_z",
+        ),
+        (
+            "live_long_only",
+            LIVE_LONG_ONLY_BUNDLE,
+            True,
+            "live costs, no shorts, no locate, borrow=0; ETF hedge overlay remains",
+        ),
+        (
+            "harsh_auction",
+            HARSH_BUNDLE,
+            False,
+            "ugly MOO / HTB / impact stress. If this dies, say so.",
+        ),
+        (
+            "live_ex_post_gap",
+            EX_POST_GAP_BUNDLE,
+            False,
+            "SENSITIVITY: extra k*|realized gap|*|w| (not the default live book)",
+        ),
+        (
+            "long_only_10bp",
+            PAPER_BUNDLE,
+            True,
+            "paper long-only; no locate",
+        ),
+        (
+            "vol_target_1_toy",
+            PAPER_BUNDLE,
+            False,
+            "vol_target=1 is a toy; do not headline",
+        ),
+        (
+            "live_liquid_sleeve",
+            LIVE_BUNDLE,
+            False,
+            "live costs, top CS turnover_z tercile only (val-gated sleeve, same skip w)",
+            2.0 / 3.0,
+        ),
+        (
+            "live_liquid_sleeve_long_only",
+            LIVE_LONG_ONLY_BUNDLE,
+            True,
+            "liquid sleeve + long-only (no locate)",
+            2.0 / 3.0,
+        ),
     ]
     rows: list[dict[str, Any]] = []
     for case in cases:
-        name = case.pop("name")
-        stats = book_pnl(
+        name, bundle, long_only, note = case[0], case[1], case[2], case[3]
+        floor = float(case[4]) if len(case) > 4 else 0.0
+        stats = _run_book(
             p,
             r,
-            quantile=0.2,
-            weighting="quantile",
-            hold_halflife=0.0,
-            causal_vol=True,
-            vol_target=float(case.get("vol_target", 0.15)),
-            lever_cap=3.0,
-            min_names=min_names,
-            holding="overnight",
-            round_trip_bps=float(case.get("round_trip_bps", 10.0)),
-            open_auction_bps=float(case.get("open_auction_bps", 0.0)),
-            borrow_bps=float(case.get("borrow_bps", 0.0)),
-            hedge_cost_bps=float(case.get("hedge_cost_bps", 0.0)),
-            long_only=bool(case.get("long_only", False)),
+            bundle=bundle,
+            long_only=long_only,
+            holding=holding,
+            turnover_z=turnover_z,
+            vol_level=vol_level,
+            vol_target=1.0 if name == "vol_target_1_toy" else 0.15,
+            adv_floor_pctile=floor,
         )
-        row = {
-            "name": name,
-            "unlevered_net_ir": stats.get("unlevered_net_ir"),
-            "levered_net_ir": stats.get("net_ir"),
-            "unlevered_max_dd": stats.get("unlevered_max_dd"),
-            "levered_max_dd": stats.get("max_dd"),
-            "mean_turnover": stats.get("mean_turnover"),
-            "mean_cs_ic": stats.get("mean_cs_ic"),
-            "vol_target": stats.get("vol_target"),
-            "long_only": stats.get("long_only"),
-            "round_trip_bps": stats.get("round_trip_bps"),
-            "open_auction_bps": stats.get("open_auction_bps"),
-            "borrow_bps": stats.get("borrow_bps"),
-            "hedge_cost_bps": stats.get("hedge_cost_bps"),
-            "note": (
-                "vol_target=1 is a toy; do not headline"
-                if name == "vol_target_1_toy"
-                else "overnight flatten (MOC->MOO); paper IR omits locate/auction"
-            ),
-        }
+        row = _book_row(stats, name, note)
+        row["adv_floor_pctile"] = floor
         rows.append(row)
         print(
             f"  stress {name}: unlev net IR={row['unlevered_net_ir']:+.3f} "
             f"lev net IR={row['levered_net_ir']:+.3f} "
             f"lev maxDD={row['levered_max_dd']:+.3f} "
-            f"turn={row['mean_turnover']:.3f}",
+            f"turn={row['mean_turnover']:.3f} "
+            f"long={row['mean_long_nav']:.2f} short={row['mean_short_nav']:.2f}",
             flush=True,
         )
-        case["name"] = name  # restore if reused
     return rows
+
+
+def _ic_by_tercile(
+    pred: np.ndarray,
+    y: np.ndarray,
+    dates: np.ndarray,
+    z: np.ndarray,
+    *,
+    min_names: int,
+) -> list[dict[str, float]]:
+    """CS IC inside low/mid/high terciles of a known-at-t feature (e.g. turnover_z)."""
+    rows: list[dict[str, float]] = []
+    ics = [[], [], []]
+    for key in np.unique(dates):
+        sel = dates == key
+        if int(sel.sum()) < int(min_names):
+            continue
+        zz = z[sel]
+        pp = pred[sel]
+        yy = y[sel]
+        finite = np.isfinite(zz)
+        if int(finite.sum()) < int(min_names):
+            continue
+        cuts = np.nanpercentile(zz[finite], [100.0 / 3.0, 200.0 / 3.0])
+        buckets = [
+            finite & (zz <= cuts[0]),
+            finite & (zz > cuts[0]) & (zz <= cuts[1]),
+            finite & (zz > cuts[1]),
+        ]
+        from forecast.training import _pearson
+
+        for i, mask in enumerate(buckets):
+            if int(mask.sum()) < 3:
+                continue
+            val = _pearson(pp[mask], yy[mask])
+            if np.isfinite(val):
+                ics[i].append(float(val))
+    labels = ("low", "mid", "high")
+    for i, lab in enumerate(labels):
+        arr = np.asarray(ics[i], dtype=np.float64)
+        rows.append(
+            {
+                "tercile": lab,
+                "cs_ic": float(arr.mean()) if arr.size else float("nan"),
+                "n_dates": float(arr.size),
+            }
+        )
+    return rows
+
+
+def _sleeve_min_names(min_names: int, floor: float) -> int:
+    """Protocol min_names scaled to the remaining CS after the turnover floor.
+
+    A 30-name liquid tape with floor=2/3 keeps ~1/3 of names. Evaluating that
+    sleeve at min_names=30 drops every date and prints a fake NaN IC.
+    """
+    remain = max(0.05, 1.0 - float(floor))
+    return max(8, int(round(float(min_names) * remain)))
+
+
+def _sleeve_cs(
+    pred: np.ndarray,
+    y: np.ndarray,
+    dates: np.ndarray,
+    turnover_z: np.ndarray,
+    *,
+    floor: float,
+    min_names: int,
+) -> dict[str, float]:
+    """CS IC on names at/above the within-date turnover_z percentile (known at t)."""
+    keep = np.zeros(pred.shape[0], dtype=bool)
+    p = float(floor)
+    for key in np.unique(dates):
+        sel = dates == key
+        row = turnover_z[sel]
+        finite = np.isfinite(row)
+        if int(finite.sum()) < 5:
+            continue
+        cut = float(np.nanpercentile(row[finite], 100.0 * p))
+        local = np.zeros(int(sel.sum()), dtype=bool)
+        local[finite] = row[finite] >= cut
+        keep[sel] = local
+    if not bool(keep.any()):
+        return {"cs_ic": float("nan"), "cs_ic_tstat": float("nan"), "cs_n_dates": 0.0}
+    eval_min = _sleeve_min_names(int(min_names), p)
+    return slim_cs_stats(cs_stats(pred[keep], y[keep], dates[keep], min_names=eval_min))
+
+
+def _diagnose_years(
+    cache: dict[str, Any],
+    w: np.ndarray,
+    b: float,
+    split: dict[str, Any],
+) -> dict[str, Any]:
+    """2023 / year-stability diagnostics. Reported after the fact; not a promote knob."""
+    min_names = int(cache["cs_min_names"])
+    names = list(FEATURE_NAMES)
+    out: dict[str, Any] = {"val_years": split["val"].get("years"), "test_years": split["test"].get("years")}
+    test_years = {int(r["year"]): r for r in (split["test"].get("years") or [])}
+    y2023 = test_years.get(2023, {})
+    out["test_2023"] = {
+        "cs_ic": float(y2023.get("cs_ic", float("nan"))),
+        "cs_ic_tstat": float(y2023.get("cs_ic_tstat", float("nan"))),
+        "cs_n_dates": float(y2023.get("cs_n_dates", float("nan"))),
+        "dead": bool(
+            np.isfinite(y2023.get("cs_ic", float("nan")))
+            and abs(float(y2023.get("cs_ic_tstat", 0) or 0)) < 1.5
+        ),
+    }
+    x_va = cache["val_x"].astype(np.float64)
+    y_va = cache["val_y"].astype(np.float64)
+    d_va = cache["val_d"].astype(np.int64)
+    x_te = cache["test_x"].astype(np.float64)
+    y_te = cache["test_y"].astype(np.float64)
+    d_te = cache["test_d"].astype(np.int64)
+    pred_te = split["test_pred"]
+    val_uni = year_feature_ics(x_va, y_va, d_va, min_names=min_names)
+    te_yr = year_feature_ics(x_te, y_te, d_te, min_names=min_names)
+    if 2023 in te_yr:
+        u23 = te_yr[2023]
+        # mean val uni IC across val years
+        if val_uni:
+            stacked = np.stack(list(val_uni.values()), axis=0)
+            finite = np.isfinite(stacked)
+            counts = finite.sum(axis=0)
+            sums = np.where(finite, stacked, 0.0).sum(axis=0)
+            val_mean = np.full(stacked.shape[1], np.nan, dtype=np.float64)
+            ok = counts > 0
+            val_mean[ok] = sums[ok] / counts[ok]
+        else:
+            val_mean = np.full(u23.shape, np.nan)
+        flips = []
+        for j, name in enumerate(names):
+            a = float(val_mean[j]) if j < val_mean.size else float("nan")
+            b_ic = float(u23[j]) if j < u23.size else float("nan")
+            if np.isfinite(a) and np.isfinite(b_ic) and a * b_ic < 0 and abs(a) >= 0.01:
+                flips.append({"feature": name, "val_cs_ic": a, "y2023_cs_ic": b_ic})
+        flips.sort(key=lambda r: abs(r["val_cs_ic"]), reverse=True)
+        out["feature_sign_flips_2023_vs_val"] = flips[:12]
+        print("  2023 feature sign flips vs val (known-at-t columns):", flush=True)
+        if not flips:
+            print("    none with |val CS IC|>=0.01", flush=True)
+        for row in flips[:8]:
+            print(
+                f"    {row['feature']}: val={row['val_cs_ic']:+.4f}  2023={row['y2023_cs_ic']:+.4f}",
+                flush=True,
+            )
+    if "turnover_z" in names:
+        tz = x_te[:, names.index("turnover_z")]
+        yr = (np.datetime64("1970-01-01") + d_te.astype("timedelta64[D]")).astype("datetime64[Y]").astype(int) + 1970
+        mask_23 = yr == 2023
+        if bool(mask_23.any()):
+            terc = _ic_by_tercile(
+                pred_te[mask_23], y_te[mask_23], d_te[mask_23], tz[mask_23], min_names=max(5, min_names // 4)
+            )
+            out["test_2023_ic_by_turnover_tercile"] = terc
+            print("  2023 CS IC by turnover_z tercile (low=thin):", flush=True)
+            for row in terc:
+                print(
+                    f"    {row['tercile']}: cs_ic={row['cs_ic']:+.4f} n={int(row['n_dates'])}",
+                    flush=True,
+                )
+        terc_val = _ic_by_tercile(
+            split["val_pred"], y_va, d_va, x_va[:, names.index("turnover_z")], min_names=max(5, min_names // 4)
+        )
+        out["val_ic_by_turnover_tercile"] = terc_val
+    print(
+        f"  test 2023 CS IC={out['test_2023']['cs_ic']:+.4f} "
+        f"t={out['test_2023']['cs_ic_tstat']:.2f} "
+        f"dead={out['test_2023']['dead']}",
+        flush=True,
+    )
+    return out
+
+
+def _stability_ablate(
+    cache: dict[str, Any],
+    skip_val: float,
+    skip_val_2017: float,
+) -> dict[str, Any]:
+    """Causal skip variants. Promote only on locked val; do not retarget 2023/test."""
+    candidates = [
+        ("recency_2y", dict(date_halflife=504.0)),
+        ("recency_5y", dict(date_halflife=1260.0)),
+        ("train_from_2009", dict(train_from_year=2009)),
+        ("train_from_2012", dict(train_from_year=2012)),
+        ("no_ohlc", dict(mask_mode="no_ohlc")),
+        ("core_cs", dict(mask_mode="core")),
+        ("drop_disp_5", dict(drop_disp_q=0.05)),
+        ("feat_winsor_5", dict(feat_winsor=5.0)),
+        ("year_stable_train", dict(year_stable=True)),
+    ]
+    rows: list[dict[str, Any]] = []
+    promoted: str | None = None
+    best_val = float(skip_val)
+    print("overnight year-stability ablations (val-gate; not test/2023):", flush=True)
+    for name, kwargs in candidates:
+        w, b, train_ic = _fit_skip(cache, **kwargs)
+        split = _split_stats(cache, w, b)
+        val = split["val"]
+        test = split["test"]
+        val_ic = float(val["cs_ic"])
+        val_2017 = float(val["cs_ic_2017"])
+        test_years = {int(r["year"]): r for r in (test.get("years") or [])}
+        y2023 = test_years.get(2023, {})
+        lift = val_ic - float(skip_val)
+        keep_2017 = (not np.isfinite(val_2017)) or val_2017 >= float(VAL_2017_KEEP)
+        ok = (
+            np.isfinite(val_ic)
+            and lift >= float(VAL_LIFT)
+            and keep_2017
+            and not (np.isfinite(skip_val_2017) and np.isfinite(val_2017) and val_2017 < float(skip_val_2017) - 0.01)
+        )
+        row = {
+            "name": name,
+            "train_cs_ic": float(train_ic),
+            "val_cs_ic": val_ic,
+            "val_t": float(val["cs_ic_tstat"]),
+            "val_2017": val_2017,
+            "test_cs_ic": float(test["cs_ic"]),
+            "test_t": float(test["cs_ic_tstat"]),
+            "test_2023": float(y2023.get("cs_ic", float("nan"))),
+            "test_2023_t": float(y2023.get("cs_ic_tstat", float("nan"))),
+            "val_lift": float(lift),
+            "promote": bool(ok),
+            "kwargs": {k: (v if not isinstance(v, (np.generic,)) else float(v)) for k, v in kwargs.items()},
+        }
+        rows.append(row)
+        print(
+            f"  {name}: val={val_ic:+.4f} lift={lift:+.4f} val2017={val_2017:+.4f} "
+            f"test={float(test['cs_ic']):+.4f} 2023={row['test_2023']:+.4f} "
+            f"{'PROMOTE' if ok else 'no'}",
+            flush=True,
+        )
+        if ok and val_ic > best_val:
+            best_val = val_ic
+            promoted = name
+    return {"candidates": rows, "promoted": promoted}
 
 
 def _train_encoder(
@@ -510,6 +921,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="skip the cheap last-bar MLP residual (default: run it from the cache)",
     )
+    p.add_argument(
+        "--no-stability",
+        action="store_true",
+        help="skip causal year-stability skip variants (val-gated; default: run)",
+    )
+    p.add_argument(
+        "--try-fill",
+        type=int,
+        default=0,
+        metavar="N",
+        help="val-gate open+N minute fill as a *separate* estimand (does not replace overnight y)",
+    )
+    p.add_argument(
+        "--try-weekly",
+        action="store_true",
+        help="val-gate weekly close-to-close residual as a fallback estimand (needs --data-dir)",
+    )
     args = p.parse_args(argv)
 
     if args.synthetic:
@@ -561,8 +989,14 @@ def main(argv: list[str] | None = None) -> int:
         "lastbar_residual": None,
         "encoder": None,
         "dynamic_a": None,
+        "year_diagnosis": None,
+        "stability": None,
+        "liquid_sleeve": None,
+        "fill": None,
+        "weekly": None,
         "promoted": None,
         "verdict": "",
+        "next_estimand": None,
     }
     if not args.no_lastbar_residual:
         print("tiny last-bar MLP residual (frozen skip, same overnight y) ...", flush=True)
@@ -584,7 +1018,83 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
     print("overnight holding-period stress (locked test last bars):", flush=True)
-    payload["stress"] = _stress_grid(split["test_pred"], split["test_y"], split["test_d"])
+    try:
+        tz = _feat_wide(cache, "test", "turnover_z")
+        vol = _feat_wide(cache, "test", "vol_level")
+    except Exception:
+        tz, vol = None, None
+    payload["stress"] = _stress_grid(
+        split["test_pred"],
+        split["test_y"],
+        split["test_d"],
+        turnover_z=tz,
+        vol_level=vol,
+        holding="overnight",
+    )
+    print("overnight year diagnosis (report only; do not retarget from 2023):", flush=True)
+    payload["year_diagnosis"] = _diagnose_years(cache, w, b, split)
+    names = list(FEATURE_NAMES)
+    tz_i = names.index("turnover_z") if "turnover_z" in names else None
+    if tz_i is not None:
+        floor = 2.0 / 3.0
+        min_names = int(cache["cs_min_names"])
+        sleeve_val = _sleeve_cs(
+            split["val_pred"], split["val_y"], split["val_d"],
+            cache["val_x"].astype(np.float64)[:, tz_i],
+            floor=floor, min_names=min_names,
+        )
+        yr = (np.datetime64("1970-01-01") + split["val_d"].astype("timedelta64[D]")).astype("datetime64[Y]").astype(int) + 1970
+        m2017 = yr == 2017
+        sleeve_2017 = _sleeve_cs(
+            split["val_pred"][m2017], split["val_y"][m2017], split["val_d"][m2017],
+            cache["val_x"].astype(np.float64)[m2017, tz_i],
+            floor=floor, min_names=min_names,
+        ) if bool(m2017.any()) else {"cs_ic": float("nan")}
+        sleeve_test = _sleeve_cs(
+            split["test_pred"], split["test_y"], split["test_d"],
+            cache["test_x"].astype(np.float64)[:, tz_i],
+            floor=floor, min_names=min_names,
+        )
+        yr_te = (np.datetime64("1970-01-01") + split["test_d"].astype("timedelta64[D]")).astype("datetime64[Y]").astype(int) + 1970
+        m23 = yr_te == 2023
+        sleeve_2023 = _sleeve_cs(
+            split["test_pred"][m23], split["test_y"][m23], split["test_d"][m23],
+            cache["test_x"].astype(np.float64)[m23, tz_i],
+            floor=floor, min_names=min_names,
+        ) if bool(m23.any()) else {"cs_ic": float("nan")}
+        lift = float(sleeve_val.get("cs_ic", float("nan"))) - float(val["cs_ic"])
+        keep_2017 = (
+            not np.isfinite(sleeve_2017.get("cs_ic", float("nan")))
+            or float(sleeve_2017["cs_ic"]) >= float(VAL_2017_KEEP)
+        )
+        promote_sleeve = np.isfinite(lift) and lift >= float(VAL_LIFT) and keep_2017
+        payload["liquid_sleeve"] = {
+            "adv_floor_pctile": floor,
+            "cs_min_names": _sleeve_min_names(min_names, floor),
+            "val": sleeve_val,
+            "val_2017": sleeve_2017,
+            "test": sleeve_test,
+            "test_2023": sleeve_2023,
+            "val_lift": float(lift),
+            "promote": bool(promote_sleeve),
+            "note": (
+                "same overnight skip w; trade only top CS turnover_z tercile. "
+                "Known at t. Not a new model. Live long-only sleeve can have "
+                "worse causal-vol DD than the full long-only book (lumpier)."
+            ),
+        }
+        print(
+            f"liquid sleeve (top turnover tercile): val={float(sleeve_val.get('cs_ic', float('nan'))):+.4f} "
+            f"lift={lift:+.4f} val2017={float(sleeve_2017.get('cs_ic', float('nan'))):+.4f} "
+            f"test={float(sleeve_test.get('cs_ic', float('nan'))):+.4f} "
+            f"2023={float(sleeve_2023.get('cs_ic', float('nan'))):+.4f} "
+            f"{'PROMOTE live sleeve' if promote_sleeve else 'no'}",
+            flush=True,
+        )
+    if not args.no_stability:
+        payload["stability"] = _stability_ablate(
+            cache, float(val["cs_ic"]), float(val["cs_ic_2017"])
+        )
 
     if args.encoder or args.try_dynamic_a:
         if not args.data_dir:
@@ -652,29 +1162,176 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
 
-    live = next((r for r in payload["stress"] if r["name"] == "live_friction_bundle"), None)
+    live = next((r for r in payload["stress"] if r["name"] == "live"), None)
+    live_flat = next((r for r in payload["stress"] if r["name"] == "live_flat"), None)
+    live_lo = next((r for r in payload["stress"] if r["name"] == "live_long_only"), None)
+    live_loc = next((r for r in payload["stress"] if r["name"] == "live_locate"), None)
+    harsh = next((r for r in payload["stress"] if r["name"] == "harsh_auction"), None)
     paper = next((r for r in payload["stress"] if r["name"] == "overnight_10bp"), None)
+    sleeve_ls = next((r for r in payload["stress"] if r["name"] == "live_liquid_sleeve"), None)
+    sleeve_lo = next(
+        (r for r in payload["stress"] if r["name"] == "live_liquid_sleeve_long_only"), None
+    )
+
+    if args.try_fill and args.data_dir:
+        n_fill = int(args.try_fill)
+        fill_cache_path = Path(str(args.cache) + f".fill{n_fill}.npz")
+        print(FILL_FORMULA, flush=True)
+        fill_cache = _ensure_cache(
+            fill_cache_path,
+            data_dir=args.data_dir,
+            universe=args.universe,
+            rebuild=True,
+            label_return="open_fill",
+            fill_minutes=n_fill,
+        )
+        fw, fb, ftrain = _fit_promoted(fill_cache)
+        fsplit = _split_stats(fill_cache, fw, fb)
+        fval = float(fsplit["val"]["cs_ic"])
+        f2017 = float(fsplit["val"]["cs_ic_2017"])
+        ftest = float(fsplit["test"]["cs_ic"])
+        promote_fill = (
+            np.isfinite(fval)
+            and fval >= float(val["cs_ic"]) + VAL_LIFT
+            and (not np.isfinite(f2017) or f2017 >= float(VAL_2017_KEEP) or args.synthetic)
+        )
+        payload["fill"] = {
+            "minutes": n_fill,
+            "alpha": n_fill / 390.0,
+            "train_cs_ic": float(ftrain),
+            "val": slim_cs_stats(fsplit["val"]) | {"cs_ic_2017": f2017},
+            "test": slim_cs_stats(fsplit["test"]),
+            "promote": bool(promote_fill),
+            "note": (
+                "separate estimand; default overnight y unchanged"
+                if not promote_fill
+                else "val-gate passed; still report separately from MOC→MOO overnight"
+            ),
+        }
+        print(
+            f"open+{n_fill}m fill: val={fval:+.4f} val2017={f2017:+.4f} "
+            f"test={ftest:+.4f} vs overnight val={float(val['cs_ic']):+.4f} "
+            f"{'PROMOTE-as-separate' if promote_fill else 'no promote'}",
+            flush=True,
+        )
+        try:
+            ftz = _feat_wide(fill_cache, "test", "turnover_z")
+            fvol = _feat_wide(fill_cache, "test", "vol_level")
+        except Exception:
+            ftz, fvol = None, None
+        fp, fr = _wide(fsplit["test_pred"], fsplit["test_y"], fsplit["test_d"])
+        fill_book = _run_book(
+            fp, fr, bundle=FILL_LIVE_BUNDLE, holding="open_fill", turnover_z=ftz, vol_level=fvol
+        )
+        payload["fill"]["live_book"] = _book_row(
+            fill_book, f"fill{n_fill}_live", "MOC + continuous open+N exit; not MOO"
+        )
+        print(
+            f"  fill live unlev net IR={payload['fill']['live_book']['unlevered_net_ir']:+.3f}",
+            flush=True,
+        )
+
+    if args.try_weekly and args.data_dir:
+        wk_cache = Path(str(args.cache) + ".weekly.npz")
+        print("weekly close-to-close residual fallback (val-gate; not bigger Mamba)", flush=True)
+        weekly_cache = _ensure_cache(
+            wk_cache,
+            data_dir=args.data_dir,
+            universe=args.universe,
+            rebuild=True,
+            label_return="close",
+            interval="weekly",
+        )
+        ww, wb, wtrain = _fit_promoted(weekly_cache)
+        wsplit = _split_stats(weekly_cache, ww, wb)
+        wval = float(wsplit["val"]["cs_ic"])
+        payload["weekly"] = {
+            "train_cs_ic": float(wtrain),
+            "val": slim_cs_stats(wsplit["val"]) | {"cs_ic_2017": float(wsplit["val"]["cs_ic_2017"])},
+            "test": slim_cs_stats(wsplit["test"]),
+            "note": "weekly residual is a different estimand; not mixed into overnight y",
+        }
+        print(
+            f"weekly residual: val={wval:+.4f} test={float(wsplit['test']['cs_ic']):+.4f}",
+            flush=True,
+        )
+
+    harsh_ir = float((harsh or {}).get("unlevered_net_ir") or float("nan"))
+    live_ir = float((live or {}).get("unlevered_net_ir") or float("nan"))
+    overnight_dies = np.isfinite(harsh_ir) and harsh_ir < 0.3
+    fill_ok = bool((payload.get("fill") or {}).get("promote"))
+    if overnight_dies and fill_ok:
+        payload["next_estimand"] = "open_fill"
+    elif overnight_dies:
+        payload["next_estimand"] = "weekly_residual"
+    else:
+        payload["next_estimand"] = "overnight_live"
+
+    stab_name = (payload.get("stability") or {}).get("promoted")
     if skip_ok:
-        payload["promoted"] = "overnight_skip"
+        payload["promoted"] = f"overnight_skip+{stab_name}" if stab_name else "overnight_skip"
         payload["verdict"] = (
-            "Overnight skip is the overnight book (not the close-to-close headline). "
-            "Paper 10bp flatten IR is not live P&L; auction/borrow/hedge overlay cut it."
+            "Overnight skip remains the overnight book (not the close-to-close headline). "
+            "Paper 10bp flatten IR is not live P&L. Headline live (name-level auction) "
+            "and live_long_only / live_locate; do not mix ICs. "
+            + (
+                f"Val-gated skip variant {stab_name} lifted locked val without killing val-2017."
+                if stab_name
+                else "No year-stability skip variant cleared the locked-val gate."
+            )
         )
     else:
         payload["verdict"] = (
             "Overnight skip did not stay strong under the locked protocol. "
-            "Do not promote. Next highest-EV estimand is not bigger Mamba: "
-            "try a tradeable next-open *limit* fill (open+N minutes) or a weekly residual "
-            "if overnight collapses under auction/borrow; keep close-to-close IR~1 as the "
-            "honest close-to-close book."
+            "Do not promote. Next highest-EV estimand is not bigger Mamba."
         )
-    if live and paper:
-        payload["friction_note"] = (
+    if overnight_dies:
+        payload["verdict"] += (
+            " Harsh auction realism killed overnight net IR; "
+            f"next estimand={payload['next_estimand']} "
+            "(open+N fill if it won val, else weekly residual). Close-to-close IR~1 stays "
+            "the honest close-to-close book."
+        )
+    notes = []
+    if paper and live_flat:
+        notes.append(
             f"paper 10bp unlev net IR={paper['unlevered_net_ir']:+.3f}; "
-            f"live-friction bundle unlev net IR={live['unlevered_net_ir']:+.3f} "
-            f"(20bp RT + 10bp auction + 5bp borrow + 10bp hedge). "
-            "Shorting overnight needs a locate; long-only is the no-borrow path."
+            f"live_flat overlay={live_flat['unlevered_net_ir']:+.3f}"
         )
+    if live:
+        notes.append(f"live auction unlev net IR={live['unlevered_net_ir']:+.3f}")
+    if live_loc:
+        notes.append(
+            f"live+locate unlev net IR={live_loc['unlevered_net_ir']:+.3f} "
+            f"(mean shorts blocked/date={live_loc.get('mean_shorts_blocked')})"
+        )
+    if live_lo:
+        notes.append(
+            f"live long-only unlev net IR={live_lo['unlevered_net_ir']:+.3f} "
+            f"maxDD={live_lo['levered_max_dd']:+.3f} (no locate)"
+        )
+    if harsh:
+        notes.append(f"harsh auction unlev net IR={harsh['unlevered_net_ir']:+.3f}")
+    if sleeve_ls:
+        notes.append(
+            f"live liquid sleeve unlev net IR={sleeve_ls['unlevered_net_ir']:+.3f} "
+            f"lev maxDD={sleeve_ls['levered_max_dd']:+.3f}"
+        )
+    if sleeve_lo:
+        notes.append(
+            f"live liquid sleeve long-only unlev net IR={sleeve_lo['unlevered_net_ir']:+.3f} "
+            f"lev maxDD={sleeve_lo['levered_max_dd']:+.3f}"
+        )
+    sleeve_meta = payload.get("liquid_sleeve") or {}
+    if sleeve_meta:
+        notes.append(
+            "liquid sleeve CS "
+            f"val={float(sleeve_meta.get('val', {}).get('cs_ic', float('nan'))):+.4f} "
+            f"lift={float(sleeve_meta.get('val_lift', float('nan'))):+.4f} "
+            f"{'PROMOTE sleeve filter' if sleeve_meta.get('promote') else 'no sleeve promote'}"
+        )
+    payload["friction_note"] = "; ".join(notes)
+    if payload["friction_note"]:
         print(payload["friction_note"], flush=True)
 
     out_path = Path(args.out)
