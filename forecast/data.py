@@ -11,7 +11,8 @@ Then:
 - Build scale-free, strictly causal features. Nothing here uses information
   from bar ``t + 1`` onwards, so the same code runs at inference time.
 - Attach the target: the horizon-bar-ahead log return, divided by a volatility
-  estimate known at ``t``.
+  estimate known at ``t``. ``label_return='overnight'`` is
+  ``log(open_{t+h}) - log(close_t)`` — next open is a label, never a feature.
 """
 
 from __future__ import annotations
@@ -27,6 +28,14 @@ import torch
 from torch.utils.data import Dataset
 
 from forecast.config import BARS_PER_SESSION, SESSION_START_MINUTE, DataConfig
+from forecast.overnight import (
+    forward_log_return,
+    formula_log_line,
+    next_open_valid,
+    normalize_label_return,
+    same_bar_open_for_features,
+    uses_next_open,
+)
 from forecast.universe import (
     allowed_symbols,
     hedge_symbol_for,
@@ -221,6 +230,9 @@ def normalize_bars(df: pd.DataFrame, *, origin: str = "bars") -> pd.DataFrame:
         raise ValueError(
             f"{origin}: {int(nonpos.sum())} rows with close <= 0 (log-price is undefined)"
         )
+    for col in ("open", "high", "low"):
+        px = pd.to_numeric(out[col], errors="coerce")
+        out[col] = px.where(px > 0)
     out = out.sort_values("datetime").drop_duplicates("datetime", keep="last")
     return out.reset_index(drop=True)
 
@@ -365,19 +377,18 @@ def _gap_limit_days(cfg: DataConfig) -> int:
 
 
 def _forward_log_return(out: pd.DataFrame, log_close: pd.Series, cfg: DataConfig) -> pd.Series:
-    """Causal label return. Features never see these future prices."""
-    kind = str(getattr(cfg, "label_return", "close") or "close").strip().lower()
-    h = int(cfg.horizon)
-    if kind in ("", "close", "close_close", "cc"):
-        return log_close.shift(-h) - log_close
-    open_px = out["open"].astype(np.float64).clip(lower=1e-12)
-    log_open = np.log(open_px)
-    if kind in ("overnight", "on", "gap", "close_open"):
-        return log_open.shift(-h) - log_close
-    if kind in ("session", "oc", "open_close", "intraday"):
-        return log_close.shift(-h) - log_open.shift(-h)
-    raise ValueError(
-        f"unknown label_return {kind!r}; expected close, overnight, or session"
+    """Causal label return. Features never see these future prices.
+
+    Overnight is ``log(open_{t+h}) - log(close_t)``. Invalid / non-positive
+    next opens are NaN (not clipped to 1e-12). Same-bar ``open_t`` is unused
+    here; it only appears in candle features via ``same_bar_open_for_features``.
+    """
+    del log_close  # recomputed inside forward_log_return from raw close
+    return forward_log_return(
+        close=out["close"],
+        open_px=out["open"],
+        kind=str(getattr(cfg, "label_return", "close") or "close"),
+        horizon=int(cfg.horizon),
     )
 
 
@@ -408,11 +419,12 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
         out[name] = raw / (sigma * math.sqrt(k))
 
     out["range_hl"] = ((out["high"] - out["low"]) / close) / sigma
-    out["body_co"] = ((close - out["open"]) / close) / sigma
+    open_feat = same_bar_open_for_features(out["open"], close)
+    out["body_co"] = ((close - open_feat) / close) / sigma
     hl = (out["high"] - out["low"]).clip(lower=1e-12)
     out["close_loc"] = (2.0 * (close - out["low"]) / hl) - 1.0
-    upper = np.maximum(close, out["open"])
-    lower = np.minimum(close, out["open"])
+    upper = np.maximum(close, open_feat)
+    lower = np.minimum(close, open_feat)
     out["wick_up"] = ((out["high"] - upper) / close) / sigma
     out["wick_dn"] = ((lower - out["low"]) / close) / sigma
 
@@ -483,6 +495,8 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     )
     if cfg.require_horizon_traded:
         valid = valid & (horizon_traded > 0)
+    if uses_next_open(getattr(cfg, "label_return", "close")):
+        valid = valid & next_open_valid(out["open"], int(cfg.horizon)).to_numpy()
     if cfg.max_abs_log_return > 0:
         valid = valid & (out["target_raw"].abs() <= cfg.max_abs_log_return)
     if cfg.max_abs_target > 0:
@@ -736,8 +750,9 @@ def attach_residual_target(
     ``industry_residual`` adds a mapped industry ETF when present.
     ``residualize_features`` subtracts the same causal betas times same-bar
     hedge ``ret_*`` from the name's own ``ret_*`` (not a label leak).
-    ``label_return`` selects which forward log-return is residualized:
-    close-to-close (default), overnight gap, or next-session open-to-close.
+    ``label_return`` selects which forward log-return is residualized.
+    Overnight is ``log(open_{t+h})-log(close_t)``; the hedge's *forward*
+    overnight return is a label term. Features stay at close ``t``.
     """
     bench = str(cfg.benchmark_symbol or "").upper()
     if not cfg.residual_target:
@@ -1146,11 +1161,10 @@ def split_session_bounds(n_sessions: int, cfg: DataConfig) -> tuple[int, int]:
 
 
 def embargo_calendar_horizon(panel: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
-    """Drop labels whose horizon close sits outside this split.
+    """Drop labels whose horizon bar sits outside this split.
 
-    Intraday targets cannot leave their session, so a session-boundary cut is
-    already an embargo. Daily/weekly/monthly bars *are* sessions, so the last
-    ``horizon`` train labels would otherwise be the first val/test returns.
+    Overnight uses ``open_{t+h}`` on that same next bar, so the last
+    ``horizon`` train dates would otherwise label the first val open.
     """
     if panel.empty or not cfg.is_calendar() or int(cfg.horizon) < 1:
         return panel
@@ -1278,7 +1292,8 @@ def build_datasets(
             f"trading names={len(trade_panels)} equities_only="
             f"{bool(getattr(cfg, 'equities_only', False))} "
             f"sector_residual={bool(getattr(cfg, 'sector_residual', False))} "
-            f"train_from={raw_from or 'all'}"
+            f"train_from={raw_from or 'all'} "
+            f"{formula_log_line(getattr(cfg, 'label_return', 'close'), horizon=int(cfg.horizon))}"
             + (f" (held out of book: {','.join(sorted(dropped))})" if dropped else "")
         )
 
@@ -1452,6 +1467,7 @@ def build_datasets(
         "equities_only": bool(getattr(cfg, "equities_only", False)),
         "train_from": raw_from,
         "n_trading_names": int(len(trade_panels)),
+        "label_return": normalize_label_return(getattr(cfg, "label_return", "close")),
     }
 
 

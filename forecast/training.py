@@ -46,6 +46,7 @@ from forecast.config import (
 )
 from forecast.data import FEATURE_NAMES, build_datasets, collate_forecast
 from forecast.model import ReturnForecaster
+from forecast.overnight import formula_log_line, normalize_label_return
 from forecast.ridge import feature_mask, labelled_rows, walk_forward_predict, cs_stats
 from mamba_lm.model import format_dynamic_diagnostics
 from mamba_lm.paths import anchor_to_repo
@@ -818,6 +819,7 @@ def _train(
         log_fn(
             f"device={device} params={n_params:,} features={model_cfg.n_features} "
             f"seq_len={data_cfg.seq_len} horizon={data_cfg.horizon} "
+            f"label_return={getattr(data_cfg, 'label_return', 'close')} "
             f"linear_skip={model_cfg.linear_skip} "
             f"dynamic_weights={model_cfg.dynamic_weights} "
             f"loss={train_cfg.loss} ic_loss_weight={train_cfg.ic_loss_weight} "
@@ -826,6 +828,7 @@ def _train(
             f"ridge_objective={getattr(train_cfg, 'ridge_objective', 'ridge')} "
             f"heteroscedastic={model_cfg.heteroscedastic}"
         )
+        log_fn(formula_log_line(getattr(data_cfg, "label_return", "close"), horizon=int(data_cfg.horizon)))
         autocast_context(device, train_cfg.precision, log_fn=log_fn)
 
     skip_ic = apply_ridge_skip(model, bundle, train_cfg, device)
@@ -1289,7 +1292,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--label-return",
         default=d.label_return,
         choices=("close", "overnight", "session"),
-        help="residual label: close-to-close (default), overnight gap, or next-session open-to-close",
+        help="residual label: close-to-close (default/locked book), overnight gap "
+        "log(open_{t+h})-log(close_t), or next-session open-to-close. "
+        "Next open is never a feature.",
     )
     g.add_argument(
         "--no-equities-only",
@@ -1545,7 +1550,7 @@ def configs_from_cli(
         double_residual=args.double_residual,
         residualize_features=args.residualize_features,
         industry_residual=args.industry_residual,
-        label_return=str(args.label_return or "close"),
+        label_return=normalize_label_return(str(args.label_return or "close")),
     )
     model_cfg = ForecastModelConfig(
         n_features=len(FEATURE_NAMES),

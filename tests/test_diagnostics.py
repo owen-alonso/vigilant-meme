@@ -79,3 +79,26 @@ def test_delete_mixed_weekly_removes_file(tmp_path: Path):
     rc = diag_main(["--data-dir", str(tmp_path), "--interval", "weekly", "--delete-mixed"])
     assert rc == 0
     assert not path.exists()
+
+
+def test_overnight_rejects_unadjusted_open_vs_adj_close(tmp_path: Path):
+    n = 80
+    close = np.full(n, 50.0)
+    open_px = np.full(n, 100.0)
+    dates = pd.bdate_range("2018-01-02", periods=n)
+    path = tmp_path / "AAPL_daily.parquet"
+    pd.DataFrame(
+        {
+            "datetime": dates,
+            "open": open_px,
+            "high": open_px,
+            "low": close,
+            "close": close,
+            "volume": np.full(n, 1.0),
+        }
+    ).to_parquet(path)
+    cfg = DataConfig(interval="daily", label_return="overnight", allow_mixed_prices=False)
+    with pytest.raises(ValueError, match="unadjusted opens"):
+        assert_calendar_price_quality(path, cfg)
+    ok = DataConfig(interval="daily", label_return="close", allow_mixed_prices=False)
+    assert_calendar_price_quality(path, ok)

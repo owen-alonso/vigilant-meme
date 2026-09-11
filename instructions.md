@@ -23,10 +23,10 @@ Given **daily** OHLCV for a liquid universe (Yahoo/Stooq split-adjusted, plus SP
 It does **not**:
 
 - Pull the live tape unless you ran `forecast.download` first. `generate.py` reads a **local parquet**. `LATEST as of …` is the last timestamp **in that file**, not wall-clock now.
-- Forecast overnight gaps as a special case: the target is the next **session close**.
+- Mix overnight gap IC into the close-to-close headline. Default `--label-return close` predicts the next **session close**. `--label-return overnight` is a **different** book: `log(open_{t+1}) - log(close_t)` residual (next open is a label, never a feature).
 - Output a trade, size, or “buy/sell”. It outputs a number in **basis points** (and a residual score used by the backtest).
 - See the future day it is predicting. Features are causal (bars `<= t` only). **Realized** is scored afterwards when that future already exists in the file.
-- Use next-bar **open** as a feature. Do not disable the calendar embargo.
+- Use next-bar **open** as a feature. Do not disable the calendar embargo. Same-bar `open_t` is a candle feature known at the close.
 
 The network predicts a **volatility-normalized residual**. `generate.py` multiplies by the vol known at bar `t` and reports basis points.
 
@@ -34,7 +34,7 @@ The network predicts a **volatility-normalized residual**. `generate.py` multipl
 y_t = \frac{r_{t+1} - \beta_t r^{\mathrm{hedge}}_{t+1}}{\sigma_t}
 \]
 
-\(\beta_t\) uses same-bar returns **through \(t\) only**. The hedge is the mapped sector ETF when `--sector-residual` (default) and that parquet exists, otherwise SPY. `--double-residual` fits causal betas vs SPY **and** sector; `--industry-residual` adds a mapped industry ETF when that parquet exists. `--residualize-features` subtracts the same betas times same-bar hedge `ret_*` (not a label leak). \(\sigma_t\) is EWM realized vol using only bars **up to \(t-1\)**. **1 bp = 0.01%**. Hedge *forward* return is a **label** term, never a feature.
+Default \(r_{t+1}\) is close-to-close. Overnight is \(r^{on}_t = \log(\mathrm{open}_{t+1}) - \log(\mathrm{close}_t)\). \(\beta_t\) uses same-bar returns **through \(t\) only**. The hedge is the mapped sector ETF when `--sector-residual` (default) and that parquet exists, otherwise SPY. `--double-residual` fits causal betas vs SPY **and** sector; `--industry-residual` adds a mapped industry ETF when that parquet exists. `--residualize-features` subtracts the same betas times same-bar hedge `ret_*` (not a label leak). \(\sigma_t\) is EWM realized vol using only bars **up to \(t-1\)**. **1 bp = 0.01%**. Hedge *forward* return is a **label** term, never a feature.
 
 The same weights apply to any ticker: features are scale-free (no per-symbol embedding). Trading names are equities on the train-era-locked list in `forecast/universe.py`; SPY and sector/macro ETFs are **hedges**, not book names.
 
@@ -58,17 +58,33 @@ python -m forecast.training --universe liquid --interval daily --skip-only --che
 
 The skip defaults to **within-date rank-target ridge** with ``ridge=10``, feature winsor 3, and ``--ridge-features no_long_ts``, plus same-bar CS product features (val-selected). Do **not** enable walk-forward / later ``train_from`` / ListNet-skip / crash-date drop / year-balance / year-stable mask / double residual / feature residualization / industry residual / ``liquid_wide`` / regime heads / ``no_vol_products`` / trailing readout windows / trailing skip-IC shrink as the default from test: those lost or were a dead heat on locked **close-to-close** val.
 
-``--label-return overnight`` is a **different estimand** (close_t → open_{t+1} residual). On locked val it is in the 0.04–0.08 band and 2017 is alive; locked test is **+0.031**, not 0.04. Do **not** mix that number into the close-to-close headline. Close-to-close 0.04–0.08 was not reached; the honest close-to-close book stays levered net IR ~1.
+``--label-return overnight`` is a **different estimand** (close_t → open_{t+1} residual). Features stay at close t; next open is a label. Yahoo/Stooq adjclose rescales OHLC together. The overnight **trade** is MOC t → MOO t+1 (flat in the next session). Do **not** mix overnight IC into the close-to-close headline. Close-to-close 0.04–0.08 was not reached; that book stays levered net IR ~1.
 
-Optional next levers (val-gate; do not promote from test):
+Overnight protocol (val-gate; do not retarget from test):
+
+```bash
+# skip-only overnight residual (promoted skip recipe, different y)
+python -m forecast.training --universe liquid --interval daily --skip-only \
+  --label-return overnight --checkpoint-dir checkpoints/forecast_ridge_overnight
+# year series + cost/auction/borrow stress (locked test)
+python scripts/cs_overnight.py --data-dir data --universe liquid
+# tiny frozen-skip encoder; Dynamic A only if you want a val-gated extra
+python -m forecast.training --universe liquid --interval daily --label-return overnight \
+  --d-model 32 --n-layer 1 --checkpoint-dir checkpoints/forecast_overnight_enc
+python scripts/cs_overnight.py --data-dir data --universe liquid --encoder
+python scripts/cs_overnight.py --data-dir data --universe liquid --try-dynamic-a
+# holding period matches the label (flatten every open); do not headline vol_target=1
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --cost-bps 10 --holding overnight --open-auction-bps 10 --borrow-bps 5 --hedge-cost-bps 10
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --cost-bps 10 --long-only --holding overnight
+```
 
 ```bash
 # regime heads / surgical vol+CS-product drop / trailing readout window (all lost on val)
 python scripts/cs_regime_ablate.py --data-dir data --universe liquid
-# causal trailing skip-IC shrink (lost on close-to-close val); overnight/session are different estimands
+# causal trailing skip-IC shrink (lost on close-to-close val)
 python scripts/cs_shrink_ablate.py --data-dir data --universe liquid --also-labels
-# optional overnight-gap residual book (not the close-to-close headline)
-python -m forecast.training --universe liquid --interval daily --skip-only --label-return overnight
 # ~170-equity 2018-era book (Yahoo extras; --skip-existing reuses the 85-name cache)
 python -m forecast.download --universe liquid_wide --source yahoo --interval daily --skip-existing
 python -m forecast.training --universe liquid_wide --interval daily --skip-only

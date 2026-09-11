@@ -24,6 +24,11 @@ import torch
 
 from forecast.checkpoint import load_forecaster
 from forecast.config import DataConfig
+from forecast.overnight import (
+    holding_for_label,
+    overnight_one_way_turnover,
+    overnight_stress_costs,
+)
 from forecast.generate import (
     forecast_panel,
     load_forecast_panels,
@@ -276,6 +281,10 @@ def book_pnl(
     causal_vol: bool = True,
     lever_cap: float = 3.0,
     min_vol_days: int = 21,
+    holding: str = "close",
+    open_auction_bps: float = 0.0,
+    borrow_bps: float = 0.0,
+    hedge_cost_bps: float = 0.0,
 ) -> dict[str, Any]:
     """Cost-aware long-short with optional rank weights, hold smoothing, causal vol.
 
@@ -283,7 +292,17 @@ def book_pnl(
     scale is invariant). Default ``causal_vol`` uses expanding std of prior
     unlevered gross only. ``vol_target`` is annualized; 1.0 is a 100% vol book
     and will print catastrophic max DD even when IR is ~1.
+
+    ``holding='overnight'`` matches the overnight gap label: flatten every
+    open (no session EWMA). Costs charge a full enter+exit each night, plus
+    optional open-auction, borrow, and residual-hedge overlay bps.
     """
+    hold_mode = str(holding or "close").strip().lower()
+    if hold_mode in ("on", "gap", "close_open"):
+        hold_mode = "overnight"
+    if hold_mode == "overnight" and float(hold_halflife) > 0:
+        # Session carry would mix open→close into an overnight book.
+        hold_halflife = 0.0
     dates = pred.index.intersection(realized.index)
     raw_w: list[pd.Series] = []
     gross: list[float] = []
@@ -330,9 +349,32 @@ def book_pnl(
     )
     realized_kept = realized.reindex(index=w_panel.index, columns=w_panel.columns)
     gross_s = (w_panel * realized_kept).sum(axis=1, skipna=True).astype(np.float64)
-    prev = w_panel.shift(1).fillna(0.0)
-    turnover = 0.5 * (w_panel - prev).abs().sum(axis=1)
-    cost_unlev = (float(round_trip_bps) * 1e-4) * turnover
+    w_arr = w_panel.to_numpy(dtype=np.float64)
+    if hold_mode == "overnight":
+        turnover = pd.Series(overnight_one_way_turnover(w_arr), index=w_panel.index)
+        cost_unlev = pd.Series(
+            overnight_stress_costs(
+                round_trip_bps=round_trip_bps,
+                open_auction_bps=open_auction_bps,
+                borrow_bps=borrow_bps,
+                hedge_cost_bps=hedge_cost_bps,
+                weights=w_arr,
+            ),
+            index=w_panel.index,
+        )
+    else:
+        prev = w_panel.shift(1).fillna(0.0)
+        turnover = 0.5 * (w_panel - prev).abs().sum(axis=1)
+        cost_unlev = (float(round_trip_bps) * 1e-4) * turnover
+        if float(open_auction_bps) or float(borrow_bps) or float(hedge_cost_bps):
+            extra = overnight_stress_costs(
+                round_trip_bps=0.0,
+                open_auction_bps=open_auction_bps,
+                borrow_bps=borrow_bps,
+                hedge_cost_bps=hedge_cost_bps,
+                weights=w_arr,
+            )
+            cost_unlev = cost_unlev + extra
     net_unlev = gross_s - cost_unlev
 
     ppy = float(periods_per_year)
@@ -386,6 +428,10 @@ def book_pnl(
         "lever_cap": float(lever_cap),
         "long_only": bool(long_only),
         "min_names": float(min_names),
+        "holding": hold_mode,
+        "open_auction_bps": float(open_auction_bps),
+        "borrow_bps": float(borrow_bps),
+        "hedge_cost_bps": float(hedge_cost_bps),
         "mean_cs_ic": float(ics["ic"].mean()) if len(ics) else float("nan"),
         "mean_cs_ic_spearman": (
             float(ics["ic_spearman"].mean()) if len(ics) else float("nan")
@@ -414,9 +460,13 @@ def format_report(stats: dict[str, Any], *, checkpoint: Path, test_start: Any) -
         f"  Names       {int(stats.get('n_names', 0))}   dates {int(stats.get('n_dates', 0))}",
         f"  Weighting   {stats.get('weighting', 'quantile')}  "
         f"quantile {stats.get('quantile', float('nan')):.2f}  "
-        f"hold_hl {stats.get('hold_halflife', 0):.1f}"
+        f"hold_hl {stats.get('hold_halflife', 0):.1f}  "
+        f"holding {stats.get('holding', 'close')}"
         f"{'  LONG-ONLY' if stats.get('long_only') else ''}",
-        f"  round-trip  {stats.get('round_trip_bps', float('nan')):.1f} bp",
+        f"  round-trip  {stats.get('round_trip_bps', float('nan')):.1f} bp"
+        f"  auction {stats.get('open_auction_bps', 0):.1f} bp"
+        f"  borrow {stats.get('borrow_bps', 0):.1f} bp"
+        f"  hedge {stats.get('hedge_cost_bps', 0):.1f} bp",
         f"  Lever       mean {stats.get('mean_lever', stats.get('lever', float('nan'))):.3f}  "
         f"max {stats.get('max_lever', float('nan')):.3f}  "
         f"(vol target {stats.get('vol_target', float('nan')):.2f} annual"
@@ -453,8 +503,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--hold-halflife",
         type=float,
-        default=1.0,
-        help="EWMA half-life in days for target weights (0 = no smoothing; 5 is too slow for 1-day CS)",
+        default=None,
+        help="EWMA half-life in days for target weights "
+        "(default: 0 overnight / 1 close-to-close; 5 is too slow for 1-day CS)",
+    )
+    p.add_argument(
+        "--holding",
+        choices=("auto", "close", "overnight"),
+        default="auto",
+        help="close-to-close roll vs overnight flatten (auto: checkpoint label_return)",
+    )
+    p.add_argument(
+        "--open-auction-bps",
+        type=float,
+        default=0.0,
+        help="extra one-way cost on the open exit (overnight auction vs official print)",
+    )
+    p.add_argument(
+        "--borrow-bps",
+        type=float,
+        default=0.0,
+        help="overnight borrow fee on short notional (long-short overnight only)",
+    )
+    p.add_argument(
+        "--hedge-cost-bps",
+        type=float,
+        default=0.0,
+        help="extra daily cost for auctioning the residual sector/SPY hedge (~1 NAV)",
     )
     p.add_argument("--cost-bps", type=float, default=10.0, help="round-trip cost in basis points")
     p.add_argument(
@@ -504,6 +579,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     model, state = load_forecaster(ckpt_path, device)
     data_cfg = DataConfig.from_dict(state["data_config"])
+    hold_mode = str(args.holding or "auto").lower()
+    if hold_mode == "auto":
+        hold_mode = holding_for_label(getattr(data_cfg, "label_return", "close"))
+    hold_hl = args.hold_halflife
+    if hold_hl is None:
+        hold_hl = 0.0 if hold_mode == "overnight" else 1.0
+    if float(args.vol_target) >= 0.999:
+        print(
+            "NOTE: vol_target=1 is a 100% vol toy. Report unlevered IR + 15% causal-vol "
+            "max DD; do not headline this levered path.",
+            file=sys.stderr,
+        )
     try:
         files = resolve_data_files(
             args.data, data_cfg.data_dir, parse_symbols(args.symbols), interval=data_cfg.interval
@@ -558,9 +645,13 @@ def main(argv: list[str] | None = None) -> int:
         long_only=args.long_only,
         min_names=min_names,
         weighting=args.weighting,
-        hold_halflife=args.hold_halflife,
+        hold_halflife=hold_hl,
         causal_vol=not args.full_sample_vol,
         lever_cap=args.lever_cap,
+        holding=hold_mode,
+        open_auction_bps=args.open_auction_bps,
+        borrow_bps=args.borrow_bps,
+        hedge_cost_bps=args.hedge_cost_bps,
     )
     print(format_report(stats, checkpoint=ckpt_path, test_start=start))
     if args.json:
