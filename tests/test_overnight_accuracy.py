@@ -13,11 +13,13 @@ from forecast.accuracy import (
     apply_bin_constants,
     apply_calibrate_spec,
     apply_cond_dir_blend,
+    apply_decile_reliability,
     apply_drift_veto,
     apply_readout,
     cond_abs_mask,
     fit_cond_dir_blend,
     fit_confidence_blend,
+    fit_decile_reliability,
     fit_left_tail_l1,
     direction_hits,
     evaluate_overnight_accuracy,
@@ -242,6 +244,7 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert "confidence_blend" in names
     assert "left_tail_l1" in names
     assert "cond_dir_blend" in names
+    assert "decile_reliability" in names
     promo = payload["promotion"]
     assert promo["cs_skip_unchanged"] is True
     # Promotion is VAL-only; test keys exist for the report but are not the gate.
@@ -291,6 +294,10 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     gate_dir = float((cond_row["cond_gate"] or {}).get("val_cond_dir_pct") or float("nan"))
     assert np.isfinite(gate_dir)
     del juicy
+    dec_row = by_name["decile_reliability"]
+    assert dec_row["fit"] == "train"
+    assert int((dec_row["params"] or {}).get("n_bins") or 0) >= 3
+    assert "keep" in (dec_row["params"] or {})
 
 
 def test_zero_move_direction_is_zero_not_nan():
@@ -423,6 +430,37 @@ def test_cond_dir_blend_is_train_only_and_masks_low_abs():
         assert np.allclose(hat[low], spec["b_up"])
     cal = apply_calibrate_spec(train_p, {"kind": "cond_dir_blend", **spec})
     assert np.allclose(cal, hat)
+
+
+def test_decile_reliability_is_train_only():
+    rng = np.random.default_rng(6)
+    train_p = rng.normal(scale=0.01, size=600)
+    # Left third of pred is anti-skill; right two-thirds match the sign.
+    q33 = float(np.quantile(train_p, 0.33))
+    train_y = np.where(train_p < q33, np.abs(train_p), train_p)
+    train_y = train_y + rng.normal(scale=0.0003, size=600)
+    spec = fit_decile_reliability(train_p, train_y)
+    later_p = rng.normal(loc=0.04, scale=0.02, size=300)
+    later_y = -later_p
+    leaked = fit_decile_reliability(
+        np.concatenate([train_p, later_p]),
+        np.concatenate([train_y, later_y]),
+    )
+    assert int(spec["n_bins"]) >= 3
+    assert spec["n_keep"] < spec["n_bins"] or spec["n_keep"] >= 1
+    assert (
+        spec["edges"] != leaked["edges"]
+        or spec["keep"] != leaked["keep"]
+        or abs(float(spec["b_up"]) - float(leaked["b_up"])) > 1e-12
+    )
+    hat = apply_decile_reliability(
+        train_p,
+        np.asarray(spec["edges"], dtype=np.float64),
+        np.asarray(spec["keep"], dtype=np.bool_),
+        float(spec["b_up"]),
+    )
+    cal = apply_calibrate_spec(train_p, {"kind": "decile_reliability", **spec})
+    assert np.allclose(hat, cal, equal_nan=True)
 
 
 def test_apply_calibrate_spec_affine_and_veto():

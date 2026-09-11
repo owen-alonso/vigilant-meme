@@ -863,6 +863,9 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         cond_txt = format_cond_dir_block(ablate, payload.get("promotion") or {})
         if cond_txt:
             lines.extend(["", cond_txt])
+        dec_txt = format_decile_reliability_block(ablate, payload.get("promotion") or {})
+        if dec_txt:
+            lines.extend(["", dec_txt])
     conf = payload.get("confidence")
     if conf:
         lines.extend(["", format_confidence_block(conf)])
@@ -1104,6 +1107,111 @@ def apply_bin_constants(
     out = out.astype(np.float64, copy=True)
     out[~np.isfinite(xv)] = np.nan
     return out
+
+
+def _bin_index(x: np.ndarray, edges: np.ndarray, n_bins: int) -> np.ndarray:
+    xv = np.asarray(x, dtype=np.float64)
+    e = np.asarray(edges, dtype=np.float64)
+    inner = e[1:-1] if e.size >= 2 else np.zeros(0)
+    if inner.size == 0:
+        return np.zeros(xv.shape[0], dtype=np.int64)
+    idx = np.digitize(xv, inner, right=False)
+    return np.clip(idx, 0, int(n_bins) - 1).astype(np.int64)
+
+
+def apply_decile_reliability(
+    pred_r: np.ndarray,
+    edges: np.ndarray,
+    keep: np.ndarray,
+    b_up: float,
+) -> np.ndarray:
+    """Residual*sigma in TRAIN-reliable bins; train-median always-up otherwise."""
+    p = np.asarray(pred_r, dtype=np.float64)
+    k = np.asarray(keep, dtype=np.bool_)
+    idx = _bin_index(p, edges, k.size)
+    reliable = k[idx]
+    out = np.full(p.shape, float(b_up), dtype=np.float64)
+    out[reliable] = p[reliable]
+    out[~np.isfinite(p)] = np.nan
+    return out
+
+
+def fit_decile_reliability(
+    pred_r: np.ndarray,
+    r_on: np.ndarray,
+    *,
+    n_bins_grid: Sequence[int] = (5, 8, 10),
+    min_n: int = 24,
+) -> dict[str, Any]:
+    """TRAIN-only: keep residual sign only in pred_r bins that beat always-up.
+
+    A bin is reliable if residual-sign hit rate ≥ TRAIN overnight-up + DIR_LIFT
+    and it has at least ``min_n`` rows. Unreliable bins become the train-median
+    gap (always-up). ``n_bins`` is chosen on TRAIN direction excess, then MAE.
+    """
+    p = np.asarray(pred_r, dtype=np.float64)
+    y = np.asarray(r_on, dtype=np.float64)
+    ok = np.isfinite(p) & np.isfinite(y)
+    p, y = p[ok], y[ok]
+    b_up = float(np.median(y) if y.size else 0.0)
+    moved = y != 0.0
+    up = float((y[moved] > 0).mean()) if int(moved.sum()) else 0.5
+    floor = up + float(DIR_LIFT)
+    fallback = {
+        "n_bins": 10,
+        "edges": [-1e18, 1e18],
+        "keep": [True],
+        "hit": [float("nan")],
+        "b_up": b_up,
+        "train_up": up,
+        "floor": floor,
+        "n_keep": 1,
+    }
+    if p.size < 80:
+        return fallback
+    best = dict(fallback)
+    best_key = (-1e9, 1e9)
+    for n_bins in n_bins_grid:
+        n_bins = max(3, int(n_bins))
+        if p.size < n_bins * min_n:
+            continue
+        qs = np.linspace(0.0, 1.0, n_bins + 1)
+        cuts = np.unique(np.quantile(p, qs[1:-1]))
+        edges = np.concatenate([[-1e18], cuts, [1e18]]).astype(np.float64)
+        n_eff = int(edges.size - 1)
+        keep = np.zeros(n_eff, dtype=np.bool_)
+        hit = np.full(n_eff, np.nan, dtype=np.float64)
+        idx = _bin_index(p, edges, n_eff)
+        for i in range(n_eff):
+            sel = idx == i
+            n_i = int(sel.sum())
+            if n_i < int(min_n):
+                continue
+            hits = direction_hits(p[sel], y[sel])
+            if hits.size == 0:
+                continue
+            hr = float(hits.mean())
+            hit[i] = hr
+            keep[i] = hr >= floor
+        hat = apply_decile_reliability(p, edges, keep, b_up)
+        excess = _direction_excess(hat, y)
+        mae = float(np.mean(np.abs(hat - y)))
+        if not np.isfinite(excess):
+            continue
+        key = (excess, -mae)
+        if key > best_key:
+            best_key = key
+            best = {
+                "n_bins": n_eff,
+                "edges": edges.tolist(),
+                "keep": [bool(v) for v in keep],
+                "hit": [float(v) if np.isfinite(v) else float("nan") for v in hit],
+                "b_up": b_up,
+                "train_up": up,
+                "floor": floor,
+                "n_keep": int(keep.sum()),
+            }
+    return best
 
 
 def fit_group_median(
@@ -1530,6 +1638,13 @@ def apply_calibrate_spec(
             conf_b=float(params.get("conf_b") or 0.0),
             conf_b_up=float(params.get("conf_b_up") or 0.0),
             b_up=float(params.get("b_up") or 0.0),
+        )
+    if kind in ("decile_reliability",):
+        edges = np.asarray(params.get("edges") or [-np.inf, np.inf], dtype=np.float64)
+        keep_raw = params.get("keep") or [True]
+        keep = np.asarray([bool(v) for v in keep_raw], dtype=np.bool_)
+        return apply_decile_reliability(
+            p, edges, keep, float(params.get("b_up") or 0.0)
         )
     if kind in ("dow_gap", "dow_plus_residual"):
         if dates is None:
@@ -2069,6 +2184,45 @@ def format_cond_dir_block(ablate: dict[str, Any], promotion: dict[str, Any]) -> 
     return "\n".join(lines)
 
 
+def format_decile_reliability_block(
+    ablate: dict[str, Any], promotion: dict[str, Any]
+) -> str:
+    row = next(
+        (r for r in (ablate.get("rows") or []) if r.get("name") == "decile_reliability"),
+        None,
+    )
+    if not row:
+        return ""
+    params = row.get("params") or {}
+    v = row.get("val") or {}
+    t = row.get("test") or {}
+    yes = bool(row.get("promote_dir"))
+    default = str(promotion.get("direction") or "") == "decile_reliability"
+    n_keep = int(params.get("n_keep") or 0)
+    n_bins = int(params.get("n_bins") or 0)
+    lines = [
+        f"PROMOTE DECILE RELIABILITY? {'YES' if yes else 'NO'}"
+        + ("  (accuracy default)" if default else ""),
+        "  Keep residual*sigma only in TRAIN pred_r bins whose sign-hit "
+        "≥ TRAIN always-up + 0.2pp; else train-median. n_bins TRAIN-chosen. "
+        "VAL gate: full-frame dir ≥ train-median +0.2pp AND ≥ residual*σ +0.2pp. "
+        "CS skip / live book unchanged.",
+        f"  TRAIN n_bins={n_bins}  keep {n_keep}/{n_bins}  "
+        f"floor={100.0 * _as_float(params.get('floor')):.2f}%  "
+        f"(fit_split=train)",
+        f"  VAL dir {_as_float(v.get('dir_pct')):.2f}%  "
+        f"xs {_as_float(v.get('excess_pp')):+.2f}pp  "
+        f"MAE {_as_float(v.get('mae_usd')):.4f}$ / "
+        f"{100.0 * _as_float(v.get('mae_pct')):.4f}%  "
+        f"promote_dir={yes}",
+        f"  TEST dir {_as_float(t.get('dir_pct')):.2f}%  "
+        f"xs {_as_float(t.get('excess_pp')):+.2f}pp  "
+        f"MAE {_as_float(t.get('mae_usd')):.4f}$ / "
+        f"{100.0 * _as_float(t.get('mae_pct')):.4f}%  (report-only)",
+    ]
+    return "\n".join(lines)
+
+
 def format_confidence_block(conf: dict[str, Any]) -> str:
     lines = [
         "CONFIDENCE ( |pred_r| vs TRAIN quantiles; scored on locked TEST )",
@@ -2210,6 +2364,7 @@ def evaluate_overnight_accuracy(
     left_tail = fit_left_tail_l1(train_pred_r, train_r)
     blend = fit_confidence_blend(train_pred_r, train_r, a_l1, b_l1, mu_med)
     cond_blend = fit_cond_dir_blend(train_pred_r, train_r, left_tail, blend, mu_med)
+    decile_rel = fit_decile_reliability(train_pred_r, train_r)
     dow_table, dow_default = fit_group_median(
         train_r, weekday_of_dates(tr["date"].to_numpy(dtype=np.int64))
     )
@@ -2253,6 +2408,7 @@ def evaluate_overnight_accuracy(
     left_spec = {"kind": "left_tail_l1", **left_tail}
     blend_spec = {"kind": "confidence_blend", **blend}
     cond_spec = {"kind": "cond_dir_blend", **cond_blend}
+    decile_spec = {"kind": "decile_reliability", **decile_rel}
     dow_spec = {
         "kind": "dow_gap",
         "by_dow": _table_to_jsonable(dow_table),
@@ -2495,6 +2651,23 @@ def evaluate_overnight_accuracy(
             ),
         ),
         (
+            "decile_reliability",
+            "direction",
+            decile_spec,
+            lambda d, x, spec=decile_rel: apply_decile_reliability(
+                d["pred_r"].to_numpy(dtype=np.float64),
+                np.asarray(spec["edges"], dtype=np.float64),
+                np.asarray(spec["keep"], dtype=np.bool_),
+                float(spec["b_up"]),
+            ),
+            lambda d, x, spec=decile_rel: apply_decile_reliability(
+                d["pred_r"].to_numpy(dtype=np.float64),
+                np.asarray(spec["edges"], dtype=np.float64),
+                np.asarray(spec["keep"], dtype=np.bool_),
+                float(spec["b_up"]),
+            ),
+        ),
+        (
             "dow_gap",
             "calendar",
             dow_spec,
@@ -2683,6 +2856,7 @@ def evaluate_overnight_accuracy(
             "left_tail_l1": left_tail,
             "confidence_blend": blend,
             "cond_dir_blend": cond_blend,
+            "decile_reliability": decile_rel,
             "piecewise_l1": piecewise_spec,
             "bin_calibrate": bin_spec,
             "dow_gap": dow_spec,
@@ -2749,6 +2923,12 @@ def evaluate_overnight_accuracy(
             conf_b=cond_blend["conf_b"],
             conf_b_up=cond_blend["conf_b_up"],
             b_up=cond_blend["b_up"],
+        ),
+        "decile_reliability": apply_decile_reliability(
+            train_pred_r,
+            np.asarray(decile_rel["edges"], dtype=np.float64),
+            np.asarray(decile_rel["keep"], dtype=np.bool_),
+            float(decile_rel["b_up"]),
         ),
         "dow_gap": train_dow,
         "dow_plus_residual": train_dow + apply_affine(train_pred_r, a_dow, b_dow),
