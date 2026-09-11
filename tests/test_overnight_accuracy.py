@@ -10,16 +10,24 @@ from forecast.accuracy import (
     abs_error_block,
     adv_sleeve_mask,
     apply_affine,
+    apply_bin_constants,
+    apply_calibrate_spec,
+    apply_drift_veto,
     apply_readout,
     direction_hits,
     evaluate_overnight_accuracy,
     evaluate_overnight_skip,
     fit_affine_l1,
     fit_affine_ols,
+    fit_bin_constants,
+    fit_drift_veto,
     hit_rate_inference,
+    hit_rate_vs_p0,
+    long_only_book_block,
     score_eval_frame,
     slim_accuracy,
     two_sided_normal_p,
+    weekday_of_dates,
 )
 from forecast.data import FEATURE_NAMES
 from forecast.synthetic import write_cs_overnight_universe
@@ -222,6 +230,12 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert "train_median_gap" in names
     assert "ts_ridge_all" in names
     assert "sign_ridge_calibrated" in names
+    assert "drift_veto" in names
+    assert "bin_calibrate" in names
+    assert "piecewise_l1" in names
+    assert "dow_gap" in names
+    assert "confidence_blend" in names
+    assert "left_tail_l1" in names
     promo = payload["promotion"]
     assert promo["cs_skip_unchanged"] is True
     # Promotion is VAL-only; test keys exist for the report but are not the gate.
@@ -249,6 +263,17 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     # Honest price object: L1 affine should not be worse than residual*sigma on
     # the planted tape by a large margin (it can match the median gap).
     assert l1_test <= base_test * 1.05 or l1_test <= med_test * 1.05
+    # Excess vs overnight-up is reported on every readout.
+    med_xs = by_name["train_median_gap"]["test"]["excess_pp"]
+    assert np.isfinite(med_xs)
+    assert "excess_pp" in by_name["drift_veto"]["val"]
+    assert "book" in payload
+    assert "long_only_top20" in payload["book"]
+    year0 = payload["year_slices"][0]
+    assert "excess_pp" in year0
+    assert "up_pct" in year0
+    assert payload["calibrate"]["name"] == promo["accuracy_default"]
+    assert "kind" in payload["calibrate"]
 
 
 def test_zero_move_direction_is_zero_not_nan():
@@ -276,4 +301,126 @@ def test_zero_move_direction_is_zero_not_nan():
     assert out["dir_pct"] == 0.0
     expect = float(np.mean(np.abs(nxt - close) / close))
     assert abs(out["mae_pct"] - expect) < 1e-12
+    assert out["excess_pp"] == out["dir_pct"] - out["up_pct"]
+
+
+def test_weekday_of_dates_monday_is_zero():
+    # 1970-01-05 is a Monday.
+    monday = int((np.datetime64("1970-01-05") - np.datetime64("1970-01-01")) / np.timedelta64(1, "D"))
+    friday = monday + 4
+    wd = weekday_of_dates(np.array([monday, friday]))
+    assert wd.tolist() == [0, 4]
+
+
+def test_hit_rate_vs_p0_always_up_has_zero_excess():
+    r = np.array([0.01, -0.02, 0.03, 0.04, -0.01, 0.02])
+    pred = np.ones_like(r)
+    hits = direction_hits(pred, r)
+    up = float((r > 0).mean())
+    stats = hit_rate_vs_p0(hits, up)
+    assert abs(stats["excess_pp"]) < 1e-9
+    assert abs(stats["hit_rate"] - up) < 1e-12
+
+
+def test_drift_veto_threshold_is_train_only():
+    rng = np.random.default_rng(3)
+    train_p = rng.normal(scale=0.01, size=400)
+    # Left tail of pred is actually down; bulk is the overnight-up drift.
+    train_y = np.where(train_p < np.quantile(train_p, 0.15), -0.004, 0.003)
+    train_y = train_y + rng.normal(scale=0.0005, size=400)
+    spec = fit_drift_veto(train_p, train_y)
+    later_p = rng.normal(scale=0.01, size=200)
+    later_y = -np.sign(later_p) * 0.01
+    spec_later = fit_drift_veto(later_p, later_y)
+    assert spec["tau"] != spec_later["tau"] or spec["b_dn"] != spec_later["b_dn"]
+    leaked = fit_drift_veto(
+        np.concatenate([train_p, later_p]), np.concatenate([train_y, later_y])
+    )
+    assert abs(float(leaked["tau"]) - float(spec["tau"])) > 1e-12 or abs(
+        float(leaked["b_dn"]) - float(spec["b_dn"])
+    ) > 1e-12
+    hat = apply_drift_veto(train_p, spec["tau"], spec["a_dn"], spec["b_dn"], spec["b_up"])
+    # Veto may predict down only on the left tail.
+    down = hat < 0
+    if int(down.sum()) >= 8:
+        assert float(np.median(train_p[down])) <= float(np.median(train_p[~down]))
+
+
+def test_bin_edges_come_from_train_only():
+    rng = np.random.default_rng(4)
+    train_p = rng.normal(size=200)
+    train_y = 0.2 * train_p + 0.001
+    later_p = rng.normal(loc=3.0, size=80)
+    later_y = -0.5 * later_p
+    e0, v0 = fit_bin_constants(train_p, train_y, n_bins=5)
+    e1, _v1 = fit_bin_constants(later_p, later_y, n_bins=5)
+    assert abs(float(e0[1]) - float(e1[1])) > 0.2
+    leaked_e, _ = fit_bin_constants(
+        np.concatenate([train_p, later_p]),
+        np.concatenate([train_y, later_y]),
+        n_bins=5,
+    )
+    assert abs(float(leaked_e[1]) - float(e0[1])) > 1e-6
+    hat = apply_bin_constants(later_p, e0, v0)
+    assert hat.shape == later_p.shape
+    assert np.isfinite(hat).all()
+
+
+def test_apply_calibrate_spec_affine_and_veto():
+    p = np.array([-0.02, -0.001, 0.01])
+    aff = apply_calibrate_spec(p, {"kind": "affine_l1", "a": 0.5, "b": 0.001})
+    assert np.allclose(aff, 0.5 * p + 0.001)
+    veto = apply_calibrate_spec(
+        p, {"kind": "drift_veto", "tau": -0.01, "a_dn": 1.0, "b_dn": 0.0, "b_up": 0.002}
+    )
+    assert veto[0] == p[0]
+    assert veto[1] == 0.002
+    assert veto[2] == 0.002
+    # Empty spec is residual*sigma passthrough (generate.py with no overlay).
+    raw = apply_calibrate_spec(p, {})
+    assert np.allclose(raw, p)
+
+
+def test_long_only_book_block_selects_within_date_top_pred():
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "date": [1, 1, 1, 1, 2, 2, 2, 2],
+            "pred": [0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0],
+            "r_on": [0.01, 0.01, 0.01, -0.02, -0.01, 0.01, 0.01, 0.01],
+        }
+    )
+    block = long_only_book_block(df, score_col="pred", q=0.75, min_names=3)
+    # Top 25% of 4 names is the max on each date (pred=3).
+    assert block["n"] == 2.0
+    # Date1 top is down, date2 top is up -> 50% up vs 75% uncond (6/8 up).
+    assert abs(block["up_pct"] - 50.0) < 1e-9
+    assert block["excess_pp"] < 0
+
+
+def test_always_up_excess_is_zero_on_scored_frame():
+    import pandas as pd
+
+    close = np.array([100.0, 50.0, 25.0, 10.0])
+    r_on = np.array([0.01, -0.02, 0.03, -0.01])
+    nxt = close * np.exp(r_on)
+    df = pd.DataFrame(
+        {
+            "symbol": ["A", "B", "A", "B"],
+            "date": [1, 1, 2, 2],
+            "pred": np.ones(4),
+            "y": r_on / 0.01,
+            "scale": np.full(4, 0.01),
+            "close": close,
+            "next_open": nxt,
+            "r_on": r_on,
+            "pred_r": np.full(4, 0.002),
+            "implied_open": close * np.exp(0.002),
+            "implied_open_given_hedge": nxt,
+        }
+    )
+    out = slim_accuracy(score_eval_frame(df, min_names=2))
+    assert abs(out["excess_pp"]) < 1e-9
+    assert abs(out["dir_pct"] - out["up_pct"]) < 1e-9
 
