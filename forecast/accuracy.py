@@ -1168,6 +1168,9 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         book_txt = format_book_aligned_block(payload)
         if book_txt:
             lines.extend(["", book_txt])
+        live_txt = format_conviction_live_block(payload)
+        if live_txt:
+            lines.extend(["", live_txt])
     conf = payload.get("confidence")
     if conf:
         lines.extend(["", format_confidence_block(conf)])
@@ -2865,6 +2868,15 @@ def format_book_aligned_block(payload: dict[str, Any]) -> str:
     )
 
 
+def format_conviction_live_block(payload: dict[str, Any]) -> str:
+    """IDEA F live-cost IR gate; implemented in forecast.shorting."""
+    if not payload.get("conviction_live_promotion") and not payload.get("conviction_live"):
+        return ""
+    from forecast.shorting import _conviction_live_block
+
+    return _conviction_live_block(payload)
+
+
 def format_confidence_block(conf: dict[str, Any]) -> str:
     lines = [
         "CONFIDENCE ( |pred_r| vs TRAIN quantiles; scored on locked TEST )",
@@ -3715,12 +3727,32 @@ def evaluate_overnight_accuracy(
         ),
     }
     payload["book_aligned_promotion"] = book_aligned_promotion
+    from forecast.shorting import (
+        compare_conviction_live,
+        decide_conviction_live_promote,
+    )
+
+    conviction_live = compare_conviction_live(
+        {"train": tr, "val": va, "test": te},
+        chosen=chosen_ba,
+        min_names=min_names,
+        vol_target=0.15,
+    )
+    conviction_live_promotion = decide_conviction_live_promote(
+        val_q20=(conviction_live.get("val") or {}).get("q20") or {},
+        val_chosen=(conviction_live.get("val") or {}).get("chosen") or {},
+        chosen=chosen_ba,
+    )
+    payload["conviction_live"] = conviction_live
+    payload["conviction_live_promotion"] = conviction_live_promotion
     if log_fn:
         log_fn(
             f"accuracy default={default_name!r}  "
             f"promote_dir={promotion.get('direction')!r}  "
             f"promote_mae={promotion.get('price')!r}  "
             f"promote_book_aligned="
-            f"{bool(book_aligned_promotion.get('promote_book_aligned'))}"
+            f"{bool(book_aligned_promotion.get('promote_book_aligned'))}  "
+            f"promote_conviction_live="
+            f"{bool(conviction_live_promotion.get('promote_conviction_live'))}"
         )
     return payload

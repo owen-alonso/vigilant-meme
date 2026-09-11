@@ -6,9 +6,11 @@
         --json checkpoints/forecast_ridge_overnight/shorting.json
 
 Fits the PR #5 overnight skip on TRAIN. Locked VAL decides whether honest
-``live_locate`` LS beats ``live_long_only``. Locked TEST is printed and
-never used as a gate. Cloud VM has no Yahoo liquid tape — use --synthetic
-here; run the liquid command on desktop.
+``live_locate`` LS beats ``live_long_only``. IDEA F also scores E's thin
+high-conviction sleeve as an optional live_long_only path (VAL IR / DD /
+coverage); default stays q20 unless that gate clears. Locked TEST is
+printed and never used as a gate. Cloud VM has no Yahoo liquid tape —
+use --synthetic here; run the liquid command on desktop.
 """
 
 from __future__ import annotations

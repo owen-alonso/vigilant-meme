@@ -9,10 +9,11 @@ import pandas as pd
 import pytest
 
 from forecast.accuracy import sleeve_book_block
-from forecast.backtest import book_pnl, sleeve_direction_from_weights
+from forecast.backtest import book_pnl, conviction_long_weights, sleeve_direction_from_weights
 from forecast.shorting import (
     IR_LIFT,
     SHORT_EXCESS_LIFT_PP,
+    decide_conviction_live_promote,
     decide_ic_gate_promote,
     decide_ic_scale_promote,
     decide_lo_promote,
@@ -170,6 +171,60 @@ def test_decide_ls_promote_ignores_test_and_requires_short_skill():
     )
     assert yes["promote_ls"] is True
     assert yes["default_book"] == "live_locate"
+
+
+def test_conviction_long_weights_matches_top_q_and_abs_floor():
+    s = pd.Series([0.0, 0.5, 1.0, 2.0], index=list("abcd"))
+    w = conviction_long_weights(s, q=0.75, abs_tau=0.0, min_names=3)
+    assert w["d"] == pytest.approx(1.0)
+    assert w[["a", "b", "c"]].sum() == pytest.approx(0.0)
+    w2 = conviction_long_weights(s, q=0.75, abs_tau=2.5, min_names=3)
+    assert w2.sum() == pytest.approx(0.0)
+
+
+def test_decide_conviction_live_promote_is_val_only():
+    chosen = {"q": 0.90, "abs_tau": 0.3, "abs_q": 0.70}
+    q20 = {
+        "unlevered_net_ir": 1.00,
+        "unlevered_max_dd": -0.20,
+        "mean_turnover": 1.6,
+        "coverage": 0.25,
+    }
+    ok = {
+        "unlevered_net_ir": 1.10,
+        "unlevered_max_dd": -0.22,
+        "mean_turnover": 1.8,
+        "coverage": 0.08,
+    }
+    yes = decide_conviction_live_promote(
+        val_q20=q20, val_chosen=ok, chosen=chosen
+    )
+    assert yes["promote_conviction_live"] is True
+    assert yes["gated_on"] == "val"
+    assert yes["default_book_unchanged"] is True
+    weak_ir = dict(ok, unlevered_net_ir=1.02)
+    no_ir = decide_conviction_live_promote(
+        val_q20=q20, val_chosen=weak_ir, chosen=chosen
+    )
+    assert no_ir["promote_conviction_live"] is False
+    bad_dd = dict(ok, unlevered_max_dd=-0.30)
+    no_dd = decide_conviction_live_promote(
+        val_q20=q20, val_chosen=bad_dd, chosen=chosen
+    )
+    assert no_dd["promote_conviction_live"] is False
+    thin = dict(ok, coverage=0.03)
+    no_cover = decide_conviction_live_promote(
+        val_q20=q20, val_chosen=thin, chosen=chosen
+    )
+    assert no_cover["promote_conviction_live"] is False
+    same = decide_conviction_live_promote(
+        val_q20=q20,
+        val_chosen=dict(ok, unlevered_net_ir=9.9, coverage=0.25),
+        chosen={"q": 0.80, "abs_tau": 0.0, "abs_q": 0.0},
+    )
+    assert same["promote_conviction_live"] is False
+    juicy_test = {"unlevered_net_ir": 99.0, "unlevered_max_dd": 0.0, "coverage": 0.99}
+    assert juicy_test["unlevered_net_ir"] > yes["val_ir"]
 
 
 def test_decide_lo_promote_requires_ir_lift_not_worse_dd():
@@ -883,3 +938,9 @@ def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
     assert "VAL LONG-ONLY GRID" in text
     assert "VAL LONG-ONLY REFINE" in text
     assert "LS HAIRCUT EXPERIMENT" in text
+    assert payload["conviction_live"]["fit_split"] == "train"
+    assert payload["conviction_live_promotion"]["gated_on"] == "val"
+    assert payload["conviction_live_promotion"]["default_book_unchanged"] is True
+    assert "PROMOTE CONVICTION LIVE" in text
+    assert "chosen" in (payload["conviction_live"].get("val") or {})
+    assert "q20" in (payload["conviction_live"].get("test") or {})

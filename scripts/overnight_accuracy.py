@@ -14,7 +14,8 @@ blend, book-aligned top-q residual overnight-up, long-only book up-rate) are
 fit on TRAIN and gated on locked VAL — never on TEST. Direction skill is
 excess vs the unconditional overnight-up rate (~54.3% on liquid TEST), not
 vs a coin flip. Book-aligned sleeve up-rate is the primary accuracy object
-vs that floor; pooled TS direction stays report-only.
+vs that floor; pooled TS direction stays report-only. IDEA F gates that
+sleeve as an optional live_long_only path on VAL unlev net IR / max DD.
 """
 
 from __future__ import annotations

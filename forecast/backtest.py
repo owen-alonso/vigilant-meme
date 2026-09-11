@@ -331,6 +331,35 @@ def soft_ic_gross_scale(
     return float(np.clip(x / t, 0.0, hi))
 
 
+def conviction_long_weights(
+    scores: pd.Series,
+    *,
+    q: float,
+    abs_tau: float = 0.0,
+    min_names: int = 3,
+) -> pd.Series:
+    """Equal-weight names with ``pred >= nanquantile(q)`` and optional ``|pred|`` floor.
+
+    ``q=0.90`` is the top 10% (accuracy IDEA E). Matches ``cs_top_abs_mask``.
+    Next open is never used.
+    """
+    s = pd.to_numeric(scores, errors="coerce")
+    w = pd.Series(0.0, index=s.index, dtype=np.float64)
+    finite = s.notna() & np.isfinite(s)
+    if int(finite.sum()) < int(min_names):
+        return w
+    cut = float(np.nanquantile(s.to_numpy(dtype=np.float64), float(q)))
+    keep = finite & (s >= cut)
+    tau = float(abs_tau)
+    if tau > 0.0:
+        keep = keep & (s.abs() >= tau)
+    n = int(keep.sum())
+    if n <= 0:
+        return w
+    w.loc[keep] = 1.0 / float(n)
+    return w
+
+
 def quantile_weights(
     scores: pd.Series,
     *,
@@ -602,20 +631,29 @@ def resize_long_only(
     vol: pd.Series | None = None,
     long_size: str = "equal",
     conf_pctile: float = 0.0,
+    conf_abs: float = 0.0,
 ) -> pd.Series:
     """Causal long-only resize known at close t. Does not use labels.
 
     ``conf_pctile`` drops longs whose ``|pred|`` is below that CS percentile
-    of ``|pred|`` on the same date. ``long_size`` reweights remaining longs:
+    of ``|pred|`` on the same date. ``conf_abs`` drops longs below a TRAIN
+    ``|pred|`` floor (0=off). ``long_size`` reweights remaining longs:
     equal, ``abs_pred``, or ``inv_vol`` (missing vol → date median).
     """
     out = weights.astype(np.float64).copy()
     long = out > 1e-12
     if not bool(long.any()):
         return out
+    mag = scores.reindex(out.index).abs()
+    tau = float(conf_abs)
+    if tau > 0.0:
+        keep_abs = long & mag.notna() & np.isfinite(mag) & (mag >= tau)
+        out.loc[long & ~keep_abs] = 0.0
+        long = out > 1e-12
+        if not bool(long.any()):
+            return out * 0.0
     p = float(np.clip(conf_pctile, 0.0, 0.95))
     if p > 0:
-        mag = scores.reindex(out.index).abs()
         finite = mag.notna() & np.isfinite(mag)
         if int(finite.sum()) >= 3:
             cut = float(np.nanpercentile(mag[finite], 100.0 * p))
@@ -742,6 +780,8 @@ def book_pnl(
     adv_floor_pctile: float = 0.0,
     long_size: str = "equal",
     conf_pctile: float = 0.0,
+    conf_abs: float = 0.0,
+    conviction_q: float = 0.0,
     ic_gate_window: int = 0,
     ic_gate_tau: float = 0.0,
     ic_gate_kind: str = "pearson",
@@ -871,6 +911,13 @@ def book_pnl(
                 q_exit=sticky_qx,
                 min_names=int(min_names),
             )
+        elif long_only and float(conviction_q or 0.0) > 0.0:
+            w = conviction_long_weights(
+                pair_all["p"],
+                q=float(conviction_q),
+                abs_tau=float(conf_abs or 0.0),
+                min_names=int(min_names),
+            )
         else:
             w = date_weights(
                 pair_all["p"],
@@ -878,8 +925,10 @@ def book_pnl(
                 quantile=quantile,
                 long_only=long_only,
             )
-        if long_only and (
-            str(long_size or "equal").lower() != "equal" or float(conf_pctile) > 0
+        if long_only and float(conviction_q or 0.0) <= 0.0 and (
+            str(long_size or "equal").lower() != "equal"
+            or float(conf_pctile) > 0
+            or float(conf_abs or 0.0) > 0
         ):
             vol_row = None
             if vol_level is not None and ts in vol_level.index:
@@ -890,6 +939,7 @@ def book_pnl(
                 vol=vol_row,
                 long_size=str(long_size or "equal"),
                 conf_pctile=float(conf_pctile),
+                conf_abs=float(conf_abs or 0.0),
             )
         if trail_ic is not None:
             n_gate_dates += 1
@@ -1125,6 +1175,8 @@ def book_pnl(
         "adv_floor_pctile": float(adv_floor_pctile),
         "long_size": str(long_size or "equal"),
         "conf_pctile": float(conf_pctile),
+        "conf_abs": float(conf_abs or 0.0),
+        "conviction_q": float(conviction_q or 0.0),
         "ic_gate_window": float(gate_w),
         "ic_gate_tau": float(ic_gate_tau) if gate_w > 0 else 0.0,
         "ic_gate_kind": str(ic_gate_kind or "pearson") if gate_w > 0 else "",
@@ -1423,6 +1475,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="long-only: drop sleeve names with |pred| below this CS percentile "
         "(0=off, 0.5=date-median conviction). Causal; ignored unless --long-only.",
+    )
+    p.add_argument(
+        "--conviction-q",
+        type=float,
+        default=0.0,
+        help="long-only accuracy-style sleeve: keep pred >= nanquantile(q) "
+        "(0=off; 0.90 = top 10%%). Optional live path; default stays q20. "
+        "Ignored unless --long-only.",
+    )
+    p.add_argument(
+        "--conf-abs",
+        type=float,
+        default=0.0,
+        help="long-only: drop names with |pred| below this TRAIN floor (0=off). "
+        "Use with --conviction-q for IDEA E's sleeve. Default off.",
     )
     p.add_argument(
         "--ic-gate-window",
@@ -1735,6 +1802,8 @@ def main(argv: list[str] | None = None) -> int:
         adv_floor_pctile=float(args.adv_floor_pctile or 0.0),
         long_size=str(getattr(args, "long_size", "equal") or "equal"),
         conf_pctile=float(getattr(args, "conf_pctile", 0.0) or 0.0),
+        conf_abs=float(getattr(args, "conf_abs", 0.0) or 0.0),
+        conviction_q=float(getattr(args, "conviction_q", 0.0) or 0.0),
         ic_gate_window=int(getattr(args, "ic_gate_window", 0) or 0),
         ic_gate_tau=float(getattr(args, "ic_gate_tau", 0.0) or 0.0),
         ic_scale_window=int(getattr(args, "ic_scale_window", 0) or 0),

@@ -18,9 +18,12 @@ import numpy as np
 import pandas as pd
 
 from forecast.accuracy import (
+    BOOK_ALIGN_COVER,
     DIR_LIFT,
     PROMOTED_SKIP,
     _frame_for_split,
+    cs_top_abs_mask,
+    fit_book_aligned_on_train,
     fit_promoted_overnight_skip,
     load_split_px,
     overnight_skip_data_config,
@@ -152,6 +155,9 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/be
 # IDEA 7: soft trailing CS-IC gross scale (TRAIN-chosen; default off)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only --ic-scale-window 20 --ic-scale-tau 0.04 --ic-scale-smax 1.25
+# IDEA F: optional thin high-conviction sleeve (off unless VAL IR gate; default stays q20)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
+  --holding overnight --live-costs --long-only --conviction-q 0.90 --conf-abs 0.335
 """
 
 
@@ -222,6 +228,8 @@ def _run_overnight_book(
     adv_floor_pctile: float = 0.0,
     long_size: str = "equal",
     conf_pctile: float = 0.0,
+    conf_abs: float = 0.0,
+    conviction_q: float = 0.0,
     ic_gate_window: int = 0,
     ic_gate_tau: float = 0.0,
     ic_gate_trail: pd.Series | None = None,
@@ -257,6 +265,8 @@ def _run_overnight_book(
         adv_floor_pctile=float(adv_floor_pctile),
         long_size=str(long_size or "equal"),
         conf_pctile=float(conf_pctile),
+        conf_abs=float(conf_abs or 0.0),
+        conviction_q=float(conviction_q or 0.0),
         ic_gate_window=int(ic_gate_window or 0),
         ic_gate_tau=float(ic_gate_tau or 0.0),
         ic_gate_trail=ic_gate_trail,
@@ -515,6 +525,231 @@ def decide_lo_promote(grid: dict[str, Any]) -> dict[str, Any]:
         "dd_delta": dd_delta,
         "ir_lift": LO_IR_LIFT,
         "dd_tol": LO_DD_TOL,
+    }
+
+
+def _sleeve_coverage(df: pd.DataFrame, *, q: float, abs_tau: float, min_names: int) -> dict[str, float]:
+    mask = cs_top_abs_mask(
+        df, q=float(q), abs_tau=float(abs_tau), score_col="pred", min_names=min_names
+    )
+    cover = float(mask.mean()) if mask.size else float("nan")
+    n = float(int(mask.sum()))
+    n_dates = 0.0
+    if int(mask.sum()) and "date" in df.columns:
+        n_dates = float(pd.Series(df["date"].to_numpy()[mask]).nunique())
+    n_all = float(df["date"].nunique()) if not df.empty and "date" in df.columns else 0.0
+    return {
+        "coverage": cover,
+        "n": n,
+        "n_dates": n_dates,
+        "date_coverage": (float(n_dates / n_all) if n_all else float("nan")),
+    }
+
+
+def score_conviction_live_book(
+    df: pd.DataFrame,
+    *,
+    min_names: int,
+    vol_target: float,
+    conviction_q: float = 0.0,
+    conf_abs: float = 0.0,
+    quantile: float = 0.2,
+    name: str = "",
+) -> dict[str, Any]:
+    """``--live-costs --long-only`` unlev net IR / DD / turnover on one split."""
+    empty = {
+        "name": name or "empty",
+        "unlevered_net_ir": float("nan"),
+        "unlevered_max_dd": float("nan"),
+        "mean_turnover": float("nan"),
+        "mean_cost_unlev_bp": float("nan"),
+        "n_book_dates": float("nan"),
+        "coverage": float("nan"),
+        "date_coverage": float("nan"),
+        "n": 0.0,
+        "n_dates": 0.0,
+        "conviction_q": float(conviction_q),
+        "conf_abs": float(conf_abs),
+        "quantile": float(quantile),
+    }
+    if df.empty:
+        return empty
+    pred, y, r_on, tz, vol = _wide_from_frame(df)
+    if pred.empty or pred.shape[1] < 2:
+        return empty
+    stats = _run_overnight_book(
+        pred,
+        y,
+        bundle=LIVE_LONG_ONLY_BUNDLE,
+        long_only=True,
+        min_names=min_names,
+        vol_target=vol_target,
+        overnight_r=r_on,
+        turnover_z=tz,
+        vol_level=vol,
+        quantile=float(quantile),
+        weighting="quantile",
+        long_size="equal",
+        conviction_q=float(conviction_q or 0.0),
+        conf_abs=float(conf_abs or 0.0),
+    )
+    acc_q = float(conviction_q) if float(conviction_q or 0.0) > 0 else 0.80
+    cov = _sleeve_coverage(
+        df, q=acc_q, abs_tau=float(conf_abs or 0.0), min_names=min_names
+    )
+    return {
+        "name": name or ("conviction" if conviction_q else "live_long_only_q20"),
+        "unlevered_net_ir": stats.get("unlevered_net_ir"),
+        "unlevered_max_dd": stats.get("unlevered_max_dd"),
+        "mean_turnover": stats.get("mean_turnover"),
+        "mean_cost_unlev_bp": stats.get("mean_cost_unlev_bp"),
+        "n_book_dates": stats.get("n_dates"),
+        "coverage": cov["coverage"],
+        "date_coverage": cov["date_coverage"],
+        "n": cov["n"],
+        "n_dates": cov["n_dates"],
+        "conviction_q": float(conviction_q or 0.0),
+        "conf_abs": float(conf_abs or 0.0),
+        "quantile": float(quantile),
+        "long_only": True,
+        "cost_bundle": "live_long_only",
+    }
+
+
+def compare_conviction_live(
+    frames: dict[str, pd.DataFrame],
+    *,
+    chosen: dict[str, Any],
+    min_names: int,
+    vol_target: float,
+) -> dict[str, Any]:
+    """Score q20 vs E's TRAIN sleeve vs optional q=0.90 (no |pred| floor)."""
+    q = float((chosen or {}).get("q") or 0.80)
+    abs_tau = float((chosen or {}).get("abs_tau") or 0.0)
+    abs_q = float((chosen or {}).get("abs_q") or 0.0)
+    out: dict[str, Any] = {
+        "train_q": q,
+        "train_abs_tau": abs_tau,
+        "train_abs_q": abs_q,
+        "fit_split": "train",
+        "note": (
+            "live_long_only unlev net IR / max DD / turnover. "
+            "q20 equal is the default book. Chosen sleeve uses IDEA E's "
+            "TRAIN (q, |pred| floor). TEST is report-only."
+        ),
+    }
+    for split, df in frames.items():
+        q20 = score_conviction_live_book(
+            df,
+            min_names=min_names,
+            vol_target=vol_target,
+            quantile=0.2,
+            name="q20_equal",
+        )
+        chosen_row = score_conviction_live_book(
+            df,
+            min_names=min_names,
+            vol_target=vol_target,
+            conviction_q=q,
+            conf_abs=abs_tau,
+            name=f"e_q{q:.2f}_abs{abs_q:.2f}",
+        )
+        q90 = score_conviction_live_book(
+            df,
+            min_names=min_names,
+            vol_target=vol_target,
+            conviction_q=0.90,
+            conf_abs=0.0,
+            name="q90_no_abs",
+        )
+        out[split] = {"q20": q20, "chosen": chosen_row, "q90": q90}
+    return out
+
+
+def decide_conviction_live_promote(
+    *,
+    val_q20: dict[str, Any],
+    val_chosen: dict[str, Any],
+    chosen: dict[str, Any],
+) -> dict[str, Any]:
+    """VAL-only optional live path vs q20. TEST never enters."""
+    ir20 = _as_float((val_q20 or {}).get("unlevered_net_ir"))
+    ir = _as_float((val_chosen or {}).get("unlevered_net_ir"))
+    dd20 = _as_float((val_q20 or {}).get("unlevered_max_dd"))
+    dd = _as_float((val_chosen or {}).get("unlevered_max_dd"))
+    cover = _as_float((val_chosen or {}).get("coverage"))
+    to20 = _as_float((val_q20 or {}).get("mean_turnover"))
+    to = _as_float((val_chosen or {}).get("mean_turnover"))
+    q = _as_float((chosen or {}).get("q"), default=0.80)
+    abs_tau = _as_float((chosen or {}).get("abs_tau"), default=0.0)
+    abs_q = _as_float((chosen or {}).get("abs_q"), default=0.0)
+    same = abs(q - 0.80) < 1e-12 and abs(abs_tau) <= 1e-15
+    ir_delta = (
+        float(ir - ir20) if np.isfinite(ir) and np.isfinite(ir20) else float("nan")
+    )
+    dd_delta = (
+        float(dd - dd20) if np.isfinite(dd) and np.isfinite(dd20) else float("nan")
+    )
+    ir_ok = bool(np.isfinite(ir_delta) and ir_delta >= LO_IR_LIFT)
+    dd_ok = bool(not np.isfinite(dd_delta) or dd_delta >= -LO_DD_TOL)
+    cover_ok = bool(np.isfinite(cover) and cover >= BOOK_ALIGN_COVER)
+    promote = bool((not same) and ir_ok and dd_ok and cover_ok)
+    spec = {"quantile": 0.2, "conviction_q": 0.0, "conf_abs": 0.0}
+    if same:
+        reason = (
+            "NO PROMOTE optional live path: TRAIN sleeve is q20 / no |pred| floor. "
+            f"Keep q20 default. IDEA E remains hit-rate-only. VAL IR {ir:+.3f} vs "
+            f"q20 {ir20:+.3f}."
+        )
+    elif not cover_ok:
+        reason = (
+            f"NO PROMOTE optional live path: VAL cover {100.0 * cover:.1f}% "
+            f"< {100.0 * BOOK_ALIGN_COVER:.0f}%. Keep q20 default. "
+            "IDEA E remains hit-rate-only."
+        )
+    elif not ir_ok:
+        reason = (
+            f"NO PROMOTE optional live path: VAL unlev net IR {ir:+.3f} vs q20 "
+            f"{ir20:+.3f} (delta {ir_delta:+.3f} < +{LO_IR_LIFT:.2f}). "
+            "Keep q20 default. IDEA E remains hit-rate-only."
+        )
+    elif not dd_ok:
+        reason = (
+            f"NO PROMOTE optional live path: VAL max DD {dd:+.3f} vs q20 "
+            f"{dd20:+.3f} (delta {dd_delta:+.3f} < -{LO_DD_TOL:.2f}). "
+            "Keep q20 default. IDEA E remains hit-rate-only."
+        )
+    else:
+        spec = {"quantile": 0.2, "conviction_q": float(q), "conf_abs": float(abs_tau)}
+        reason = (
+            f"PROMOTE optional live path q={q:.2f} abs_q={abs_q:.2f}: VAL unlev "
+            f"net IR {ir:+.3f} vs q20 {ir20:+.3f} (delta {ir_delta:+.3f}) and "
+            f"max DD {dd:+.3f} vs {dd20:+.3f} (delta {dd_delta:+.3f}), "
+            f"cover {100.0 * cover:.1f}%. Default CLI stays q20 until liquid."
+        )
+    return {
+        "promote_conviction_live": promote,
+        "gated_on": "val",
+        "reason": reason,
+        "spec": spec,
+        "q20": dict(val_q20 or {}),
+        "chosen": dict(val_chosen or {}),
+        "train_q": float(q),
+        "train_abs_q": float(abs_q),
+        "train_abs_tau": float(abs_tau),
+        "val_ir": ir,
+        "val_ir_q20": ir20,
+        "val_ir_delta": ir_delta,
+        "val_dd": dd,
+        "val_dd_q20": dd20,
+        "val_dd_delta": dd_delta,
+        "val_turnover": to,
+        "val_turnover_q20": to20,
+        "coverage": cover,
+        "ir_lift": LO_IR_LIFT,
+        "dd_tol": LO_DD_TOL,
+        "cover_floor": BOOK_ALIGN_COVER,
+        "default_book_unchanged": True,
     }
 
 
@@ -2740,6 +2975,18 @@ def evaluate_overnight_shorting(
     grid = val_knob_grid(frames["val"], min_names=min_names, vol_target=vol_target)
     lo_grid = val_long_only_grid(frames["val"], min_names=min_names, vol_target=vol_target)
     lo_promo = decide_lo_promote(lo_grid)
+    book_aligned_fit = fit_book_aligned_on_train(frames["train"], min_names=min_names)
+    conviction_live = compare_conviction_live(
+        {k: frames[k] for k in ("train", "val", "test") if k in frames},
+        chosen=book_aligned_fit.get("chosen") or {},
+        min_names=min_names,
+        vol_target=vol_target,
+    )
+    conviction_live_promotion = decide_conviction_live_promote(
+        val_q20=(conviction_live.get("val") or {}).get("q20") or {},
+        val_chosen=(conviction_live.get("val") or {}).get("chosen") or {},
+        chosen=book_aligned_fit.get("chosen") or {},
+    )
     lo_refine = val_long_only_refine(frames["val"], min_names=min_names, vol_target=vol_target)
     ic_fit = fit_ic_gate_on_train(
         frames["train"], min_names=min_names, vol_target=vol_target
@@ -3344,6 +3591,9 @@ def evaluate_overnight_shorting(
         "promotion": promo,
         "lo_promotion": lo_promo,
         "lo_refine_promotion": lo_refine_promo,
+        "book_aligned_fit": book_aligned_fit,
+        "conviction_live": conviction_live,
+        "conviction_live_promotion": conviction_live_promotion,
         "ic_gate_fit": ic_fit,
         "ic_gate_promotion": ic_promo,
         "ic_gate_val_always": ic_val_always,
@@ -3402,6 +3652,8 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
         f"PROMOTE LONG-ONLY KNOBS? {'YES' if lo_promo.get('promote_lo') else 'NO'}",
         f"  spec = {lo_promo.get('spec')}",
         f"  {lo_promo.get('reason')}",
+        "",
+        _conviction_live_block(payload),
         "",
         f"PROMOTE LONG-ONLY REFINE (q/size/conf, TEST veto)? "
         f"{'YES' if (payload.get('lo_refine_promotion') or {}).get('promote_lo') else 'NO'}",
@@ -3886,6 +4138,56 @@ def _lo_refine_block(grid: dict[str, Any], promo: dict[str, Any]) -> str:
     if len(rows) > 8:
         lines.append(f"  ... {len(rows) - 8} more rows in JSON")
     return "\n".join(lines)
+
+
+def _fmt_conv_row(label: str, row: dict[str, Any]) -> str:
+    cover = _as_float(row.get("coverage"))
+    cover_s = f"{100.0 * cover:.1f}%" if np.isfinite(cover) else "nan%"
+    return (
+        f"  {label:<16}  "
+        f"IR {_fmt(row.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(row.get('unlevered_max_dd'), '+.3f')}  "
+        f"to {_fmt(row.get('mean_turnover'), '.3f')}  "
+        f"cost {_fmt(row.get('mean_cost_unlev_bp'), '.1f')}bp  "
+        f"cover {cover_s}  "
+        f"n={_n(row.get('n'))}"
+    )
+
+
+def _conviction_live_block(payload: dict[str, Any]) -> str:
+    promo = payload.get("conviction_live_promotion") or {}
+    cmp = payload.get("conviction_live") or {}
+    if not promo and not cmp:
+        return ""
+    yes = bool(promo.get("promote_conviction_live"))
+    va = cmp.get("val") or {}
+    te = cmp.get("test") or {}
+    q = _as_float(cmp.get("train_q"), default=0.80)
+    abs_q = _as_float(cmp.get("train_abs_q"), default=0.0)
+    abs_tau = _as_float(cmp.get("train_abs_tau"), default=0.0)
+    return "\n".join(
+        [
+            f"PROMOTE CONVICTION LIVE? {'YES' if yes else 'NO'}",
+            "  IDEA F: --live-costs --long-only unlev net IR / max DD / turnover "
+            "for E's TRAIN sleeve vs q20 equal. Optional live path only. "
+            "Default CLI stays q20. TEST report-only.",
+            f"  TRAIN sleeve q={q:.2f} abs_q={abs_q:.2f} |pred|>={abs_tau:.5f}  "
+            f"(fit_split=train)",
+            "  VAL (gate):",
+            _fmt_conv_row("q20 equal", va.get("q20") or {}),
+            _fmt_conv_row("E chosen", va.get("chosen") or {}),
+            _fmt_conv_row("q90 no |pred|", va.get("q90") or {}),
+            f"  VAL IR delta {_fmt(promo.get('val_ir_delta'), '+.3f')} "
+            f"(need ≥+{LO_IR_LIFT:.2f})  DD delta {_fmt(promo.get('val_dd_delta'), '+.3f')} "
+            f"(need ≥-{LO_DD_TOL:.2f})  cover {_fmt(100.0 * _as_float(promo.get('coverage')), '.1f')}% "
+            f"(need ≥{100.0 * BOOK_ALIGN_COVER:.0f}%)",
+            "  TEST (report-only):",
+            _fmt_conv_row("q20 equal", te.get("q20") or {}),
+            _fmt_conv_row("E chosen", te.get("chosen") or {}),
+            _fmt_conv_row("q90 no |pred|", te.get("q90") or {}),
+            f"  {promo.get('reason') or 'no decision'}",
+        ]
+    )
 
 
 def _lo_grid_block(grid: dict[str, Any]) -> str:

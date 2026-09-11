@@ -320,6 +320,10 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert "promote_book_aligned" in ba_promo
     report = format_accuracy_report(payload)
     assert "PROMOTE BOOK-ALIGNED" in report
+    assert "conviction_live" in payload
+    assert payload["conviction_live_promotion"]["gated_on"] == "val"
+    assert payload["conviction_live_promotion"]["default_book_unchanged"] is True
+    assert "PROMOTE CONVICTION LIVE" in report
 
 
 def test_zero_move_direction_is_zero_not_nan():
