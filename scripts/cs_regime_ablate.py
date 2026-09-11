@@ -274,9 +274,14 @@ def main(argv: list[str] | None = None) -> int:
     x_va = cache["val_x"].astype(np.float64)
     y_va = cache["val_y"].astype(np.float64)
     d_va = cache["val_d"].astype(np.int64)
+    def _as_day(days: int) -> str:
+        return str(np.datetime64("1970-01-01") + np.timedelta64(int(days), "D"))
+
     print(
         f"cache {cache_path} features={n_feat} min_names={min_names} "
-        f"n_trade={cache.get('n_trade', '?')} universe={args.universe}",
+        f"n_trade={cache.get('n_trade', '?')} universe={args.universe} "
+        f"train={_as_day(int(d_tr.min()))}->{_as_day(int(d_tr.max()))} "
+        f"val={_as_day(int(d_va.min()))}->{_as_day(int(d_va.max()))}",
         flush=True,
     )
 
@@ -300,6 +305,11 @@ def main(argv: list[str] | None = None) -> int:
     fit_mask, sel_mask = late_train_holdout_mask(d_tr)
     x_fit, y_fit, d_fit = x_tr[fit_mask], y_tr[fit_mask], d_tr[fit_mask]
     x_sel, y_sel, d_sel = x_tr[sel_mask], y_tr[sel_mask], d_tr[sel_mask]
+    print(
+        f"late-train holdout { _as_day(int(d_sel.min())) }->{_as_day(int(d_sel.max()))} "
+        f"(fit ends {_as_day(int(d_fit.max()))})",
+        flush=True,
+    )
     mask = feature_mask(PROMOTED["mask_mode"])
     regime_grid = [
         ("spy_vol", 2),
