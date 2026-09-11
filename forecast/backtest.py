@@ -1217,6 +1217,7 @@ def format_report(stats: dict[str, Any], *, checkpoint: Path, test_start: Any) -
         + (
             f"  ic_scale W={int(stats.get('ic_scale_window') or 0)} "
             f"τ={float(stats.get('ic_scale_tau') or 0):+.3f} "
+            f"s_max={float(stats.get('ic_scale_smax') or 1):.2f} "
             f"mean_s {float(stats.get('mean_ic_scale') or float('nan')):.2f}"
             if float(stats.get("ic_scale_window") or 0) > 0
             else ""
