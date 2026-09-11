@@ -20,6 +20,8 @@ from forecast.shorting import (
     decide_disp_gate_promote,
     decide_ensemble_promote,
     blend_cs_scores,
+    ENSEMBLE_ALPHAS,
+    fit_ensemble_on_train,
     decide_lo_refine,
     decide_ls_promote,
     evaluate_overnight_shorting,
@@ -405,35 +407,78 @@ def test_blend_cs_scores_w1_is_z_a_and_w0_is_z_b():
 
 
 def test_decide_ensemble_promote_is_val_only():
-    grid = {
-        "baseline": {
-            "name": "ens_w1.00",
-            "weight": 1.0,
-            "unlevered_net_ir": 1.0,
-            "unlevered_max_dd": -0.20,
-        },
-        "best": {
-            "name": "ens_w0.50",
-            "weight": 0.5,
-            "unlevered_net_ir": 1.20,
-            "unlevered_max_dd": -0.18,
-        },
+    val_a = {
+        "name": "ens_a1.00",
+        "alpha": 1.0,
+        "weight": 1.0,
+        "unlevered_net_ir": 1.0,
+        "unlevered_max_dd": -0.20,
+        "coverage": 1.0,
+        "net_ir": 0.8,
+    }
+    val_b = {
+        "name": "ens_a0.50",
+        "alpha": 0.5,
+        "weight": 0.5,
+        "unlevered_net_ir": 1.20,
+        "unlevered_max_dd": -0.18,
+        "coverage": 1.0,
+        "net_ir": 0.95,
     }
     juicy_test = {"unlevered_net_ir": 9.9}
-    yes = decide_ensemble_promote(grid)
+    yes = decide_ensemble_promote(
+        val_overnight=val_a,
+        val_chosen=val_b,
+        chosen={"alpha": 0.5, "weight": 0.5},
+    )
     assert yes["promote_ensemble"] is True
     assert yes["gated_on"] == "val"
-    assert yes["spec"]["weight"] == 0.5
+    assert yes["spec"]["alpha"] == 0.5
     assert juicy_test["unlevered_net_ir"] > yes["ir_ensemble"]
 
     no = decide_ensemble_promote(
-        {
-            "baseline": grid["baseline"],
-            "best": {**grid["baseline"]},
-        }
+        val_overnight=val_a,
+        val_chosen=val_a,
+        chosen={"alpha": 1.0, "weight": 1.0},
     )
     assert no["promote_ensemble"] is False
-    assert no["spec"]["weight"] == 1.0
+    assert no["spec"]["alpha"] == 1.0
+
+    thin = decide_ensemble_promote(
+        val_overnight=val_a,
+        val_chosen={**val_b, "coverage": 0.10},
+        chosen={"alpha": 0.5, "weight": 0.5},
+    )
+    assert thin["promote_ensemble"] is False
+
+
+def test_ensemble_alphas_are_train_grid_without_pure_c2c():
+    assert ENSEMBLE_ALPHAS == (0.5, 0.6, 0.7, 0.8, 1.0)
+
+
+def test_fit_ensemble_on_train_picks_overnight_when_c2c_is_anti():
+    rng = np.random.default_rng(0)
+    dates = np.repeat(np.arange(40, dtype=np.int64) + 18000, 8)
+    names = np.tile([f"S{i}" for i in range(8)], 40)
+    true = np.tile(np.linspace(-1.0, 1.0, 8), 40)
+    r_on = true * 0.01
+    frame_on = pd.DataFrame(
+        {
+            "symbol": names,
+            "date": dates,
+            "pred": true,
+            "y": true,
+            "r_on": r_on,
+            "turnover_z": -true,
+            "vol_level": np.full(len(dates), 0.2),
+        }
+    )
+    frame_cc = frame_on.copy()
+    frame_cc["pred"] = -true + rng.normal(0.0, 0.05, size=len(true))
+    fit = fit_ensemble_on_train(frame_on, frame_cc, min_names=6, vol_target=0.0)
+    assert fit["fit_split"] == "train"
+    assert float(fit["chosen"]["alpha"]) == 1.0
+    assert {round(float(r["alpha"]), 2) for r in fit["rows"]} <= set(ENSEMBLE_ALPHAS)
 
 
 def test_synthetic_names_map_to_sector_etfs_and_etfs_are_not_book_names():
@@ -546,6 +591,10 @@ def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
     assert "PROMOTE SECTOR-OVERNIGHT" in text
     assert "PROMOTE DISP-GATE" in text
     assert payload["ensemble_promotion"]["gated_on"] == "val"
+    assert payload["ensemble_fit"]["fit_split"] == "train"
+    train_a = float((payload["ensemble_fit"].get("chosen") or {}).get("alpha") or 1.0)
+    assert train_a in set(ENSEMBLE_ALPHAS)
+    assert payload["ensemble_compare"]["train_alpha"] == pytest.approx(train_a)
     assert "PROMOTE OVERNIGHT" in text and "ENSEMBLE" in text
     assert "VAL LONG-ONLY GRID" in text
     assert "VAL LONG-ONLY REFINE" in text

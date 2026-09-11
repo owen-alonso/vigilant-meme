@@ -130,8 +130,9 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/be
   --holding overnight --live-costs --long-only --disp-gate-kind cc --disp-gate-window 1 --disp-gate-tau 0.02
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only --disp-gate-kind on_trail --disp-gate-window 20 --disp-gate-tau 1.0
-# IDEA 5: overnight ⊕ close-to-close rank ensemble (VAL-chosen w; default w=1)
+# IDEA 5: overnight ⊕ close-to-close rank ensemble (TRAIN-chosen α; default α=1)
 # A = overnight sector residual (current). B = close-to-close residual skip.
+# α grid {0.5, 0.6, 0.7, 0.8, 1.0}; α=1 is overnight-only. VAL gate, TEST report-only.
 python -m forecast.training --universe liquid --interval daily --skip-only \\
   --label-return close --checkpoint-dir checkpoints/forecast_ridge
 python scripts/overnight_shorting.py --data-dir data --universe liquid \\
@@ -1303,7 +1304,9 @@ def _overnight_skip_frames(
     return frames, min_names, float(train_ic), hedges
 
 
-ENSEMBLE_WS = (0.0, 0.25, 0.5, 0.75, 1.0)
+# Overnight weight α. α=1 is pure overnight (A). TRAIN-only pick; no α<0.5.
+ENSEMBLE_ALPHAS = (0.5, 0.6, 0.7, 0.8, 1.0)
+ENSEMBLE_COVER_VAL = 0.30
 
 
 def within_date_z(pred: pd.DataFrame) -> pd.DataFrame:
@@ -1334,15 +1337,26 @@ def blend_cs_scores(
     return w * za + (1.0 - w) * zb
 
 
-def ensemble_on_cc_grid(
+def score_ensemble_alpha(
     frame_on: pd.DataFrame,
     frame_cc: pd.DataFrame,
+    alpha: float,
     *,
     min_names: int,
     vol_target: float = 0.15,
 ) -> dict[str, Any]:
-    """Overnight live long-only q20 on blended overnight ⊕ c2c ranks."""
-    empty = {"rows": [], "best": {}, "baseline": {}, "gated_on": "val"}
+    """Overnight live long-only q20 on ``α z(A) + (1-α) z(B)``. A = overnight."""
+    empty = {
+        "name": f"ens_a{float(alpha):.2f}",
+        "weight": float(alpha),
+        "alpha": float(alpha),
+        "unlevered_net_ir": float("nan"),
+        "net_ir": float("nan"),
+        "unlevered_max_dd": float("nan"),
+        "mean_cost_unlev_bp": float("nan"),
+        "n_dates": 0.0,
+        "coverage": float("nan"),
+    }
     if frame_on.empty or frame_cc.empty:
         return empty
     pred_a = frame_to_wide(frame_on, "pred")
@@ -1350,38 +1364,82 @@ def ensemble_on_cc_grid(
     _p, y, r_on, tz, vol = _wide_from_frame(frame_on)
     if pred_a.empty or pred_b.empty or y.empty or pred_a.shape[1] < 2:
         return empty
+    pred = blend_cs_scores(pred_a, pred_b, float(alpha))
+    if pred.empty or pred.shape[1] < 2:
+        return empty
+    idx = pred.index.intersection(y.index)
+    if idx.empty:
+        return empty
+    stats = _lo_q20_book(
+        pred.loc[idx],
+        y.loc[idx],
+        min_names=min_names,
+        vol_target=vol_target,
+        overnight_r=r_on.reindex(idx) if r_on is not None else None,
+        turnover_z=tz.reindex(idx) if tz is not None else None,
+        vol_level=vol.reindex(idx) if vol is not None else None,
+    )
+    n_cal = float(len(idx))
+    n_book = _as_float(stats.get("n_dates"))
+    cover = (
+        float(n_book / n_cal)
+        if n_cal > 0 and np.isfinite(n_book)
+        else float("nan")
+    )
+    return {
+        "name": f"ens_a{float(alpha):.2f}",
+        "weight": float(alpha),
+        "alpha": float(alpha),
+        "unlevered_net_ir": stats.get("unlevered_net_ir"),
+        "net_ir": stats.get("net_ir"),
+        "unlevered_max_dd": stats.get("unlevered_max_dd"),
+        "mean_cost_unlev_bp": stats.get("mean_cost_unlev_bp"),
+        "n_dates": n_book,
+        "coverage": cover,
+    }
+
+
+def ensemble_on_cc_grid(
+    frame_on: pd.DataFrame,
+    frame_cc: pd.DataFrame,
+    *,
+    min_names: int,
+    vol_target: float = 0.15,
+) -> dict[str, Any]:
+    """Score the TRAIN α grid on one split. Does not pick α."""
+    empty = {
+        "rows": [],
+        "best": {},
+        "baseline": {},
+        "note": (
+            "s = α z(overnight sector residual) + (1-α) z(close-to-close residual); "
+            "book is --live-costs --long-only q20 overnight. α=1 is pure A. "
+            "α is fit on TRAIN only."
+        ),
+    }
+    if frame_on.empty or frame_cc.empty:
+        return empty
     rows: list[dict[str, Any]] = []
     baseline: dict[str, Any] = {}
-    for w in ENSEMBLE_WS:
-        pred = blend_cs_scores(pred_a, pred_b, w)
-        if pred.empty or pred.shape[1] < 2:
-            continue
-        idx = pred.index.intersection(y.index)
-        stats = _lo_q20_book(
-            pred.loc[idx],
-            y.loc[idx],
+    for alpha in ENSEMBLE_ALPHAS:
+        row = score_ensemble_alpha(
+            frame_on,
+            frame_cc,
+            alpha,
             min_names=min_names,
             vol_target=vol_target,
-            overnight_r=r_on.reindex(idx) if r_on is not None else None,
-            turnover_z=tz.reindex(idx) if tz is not None else None,
-            vol_level=vol.reindex(idx) if vol is not None else None,
         )
-        row = {
-            "name": f"ens_w{w:.2f}",
-            "weight": w,
-            "unlevered_net_ir": stats.get("unlevered_net_ir"),
-            "unlevered_max_dd": stats.get("unlevered_max_dd"),
-            "mean_cost_unlev_bp": stats.get("mean_cost_unlev_bp"),
-            "n_dates": stats.get("n_dates"),
-        }
+        if not np.isfinite(_as_float(row.get("unlevered_net_ir"))):
+            continue
         rows.append(row)
-        if abs(w - 1.0) < 1e-12:
+        if abs(float(alpha) - 1.0) < 1e-12:
             baseline = dict(row)
     if not rows:
         return empty
     rows.sort(
         key=lambda r: (
             -_as_float(r.get("unlevered_net_ir"), default=-1e9),
+            -_as_float(r.get("alpha"), default=0.0),
             str(r.get("name")),
         )
     )
@@ -1389,65 +1447,126 @@ def ensemble_on_cc_grid(
         "rows": rows,
         "best": dict(rows[0]),
         "baseline": baseline,
-        "gated_on": "val",
-        "note": (
-            "score = w*z(overnight sector residual) + (1-w)*z(close-to-close residual); "
-            "book is --live-costs --long-only q20 overnight. w=1 is pure A."
-        ),
+        "note": empty["note"],
     }
 
 
-def decide_ensemble_promote(grid: dict[str, Any]) -> dict[str, Any]:
-    """VAL-only vs pure overnight (w=1). TEST never enters."""
+def fit_ensemble_on_train(
+    frame_on: pd.DataFrame,
+    frame_cc: pd.DataFrame,
+    *,
+    min_names: int,
+    vol_target: float = 0.15,
+) -> dict[str, Any]:
+    """Select α on TRAIN only. VAL/TEST must never enter."""
+    grid = ensemble_on_cc_grid(
+        frame_on, frame_cc, min_names=min_names, vol_target=vol_target
+    )
+    rows = list(grid.get("rows") or [])
     baseline = dict(grid.get("baseline") or {})
-    best = dict(grid.get("best") or {})
+    chosen: dict[str, Any] = {}
+    best_ir = -1e18
+    for row in rows:
+        ir = _as_float(row.get("unlevered_net_ir"))
+        cover = _as_float(row.get("coverage"))
+        if not np.isfinite(ir):
+            continue
+        if np.isfinite(cover) and cover < ENSEMBLE_COVER_VAL:
+            continue
+        # Prefer higher IR; ties go to larger α (closer to overnight-only).
+        alpha = _as_float(row.get("alpha"), default=0.0)
+        better = ir > best_ir + 1e-12
+        tie = abs(ir - best_ir) <= 1e-12 and alpha > _as_float(
+            chosen.get("alpha"), default=-1.0
+        )
+        if better or tie:
+            best_ir = ir
+            chosen = dict(row)
+    if not chosen:
+        chosen = dict(baseline)
+    return {
+        "rows": rows,
+        "chosen": chosen,
+        "baseline": baseline,
+        "fit_split": "train",
+        "alphas": list(ENSEMBLE_ALPHAS),
+        "note": grid.get("note"),
+    }
+
+
+def decide_ensemble_promote(
+    *,
+    val_overnight: dict[str, Any],
+    val_chosen: dict[str, Any],
+    chosen: dict[str, Any],
+) -> dict[str, Any]:
+    """VAL-only vs pure overnight (α=1). TEST never enters. α is TRAIN-chosen."""
+    baseline = dict(val_overnight or {})
+    scored = dict(val_chosen or {})
     ir_a = _as_float(baseline.get("unlevered_net_ir"))
-    ir_b = _as_float(best.get("unlevered_net_ir"))
+    ir_b = _as_float(scored.get("unlevered_net_ir"))
     dd_a = _as_float(baseline.get("unlevered_max_dd"))
-    dd_b = _as_float(best.get("unlevered_max_dd"))
+    dd_b = _as_float(scored.get("unlevered_max_dd"))
+    cover = _as_float(scored.get("coverage"))
     ir_delta = (
         float(ir_b - ir_a) if np.isfinite(ir_b) and np.isfinite(ir_a) else float("nan")
     )
     dd_delta = (
         float(dd_b - dd_a) if np.isfinite(dd_b) and np.isfinite(dd_a) else float("nan")
     )
-    w_best = _as_float(best.get("weight"), default=1.0)
-    same = (not best) or abs(w_best - 1.0) < 1e-12 or str(best.get("name")) == str(
-        baseline.get("name")
-    )
+    alpha = _as_float(chosen.get("alpha", chosen.get("weight")), default=1.0)
+    same = (not chosen) or abs(alpha - 1.0) < 1e-12
     ir_ok = bool(np.isfinite(ir_delta) and ir_delta >= LO_IR_LIFT)
     dd_ok = bool(not np.isfinite(dd_delta) or dd_delta >= -LO_DD_TOL)
-    promote = bool((not same) and ir_ok and dd_ok)
-    if same or not ir_ok:
+    cover_ok = bool(not np.isfinite(cover) or cover >= ENSEMBLE_COVER_VAL)
+    promote = bool((not same) and ir_ok and dd_ok and cover_ok)
+    if same:
         reason = (
-            "NO PROMOTE: no overnight⊕c2c blend beats pure overnight (w=1) by "
-            f"{LO_IR_LIFT:.2f} unlev net IR (best {best.get('name')} {ir_b:+.3f} "
-            f"vs A {ir_a:+.3f}, delta {ir_delta:+.3f}). Keep overnight sector ranks."
+            "NO PROMOTE: TRAIN chose α=1.0 (overnight-only). "
+            f"VAL A IR {ir_a:+.3f}. Keep overnight sector ranks."
+        )
+    elif not cover_ok:
+        reason = (
+            f"NO PROMOTE: TRAIN α={alpha:.2f} but VAL coverage "
+            f"{100 * cover:.0f}% < {100 * ENSEMBLE_COVER_VAL:.0f}%. "
+            "Keep overnight sector ranks."
+        )
+    elif not ir_ok:
+        reason = (
+            f"NO PROMOTE: TRAIN α={alpha:.2f} VAL IR {ir_b:+.3f} vs overnight "
+            f"{ir_a:+.3f} (delta {ir_delta:+.3f} < {LO_IR_LIFT:.2f}). "
+            "Keep overnight sector ranks."
         )
     elif not dd_ok:
         reason = (
-            f"NO PROMOTE: ensemble w={w_best:.2f} IR lift {ir_delta:+.3f} but VAL "
+            f"NO PROMOTE: ensemble α={alpha:.2f} IR lift {ir_delta:+.3f} but VAL "
             f"max DD {dd_b:+.3f} vs A {dd_a:+.3f} exceeds {LO_DD_TOL:.2f}."
         )
     else:
         reason = (
-            f"PROMOTE ensemble w={w_best:.2f}: VAL IR {ir_b:+.3f} vs overnight "
-            f"{ir_a:+.3f} (delta {ir_delta:+.3f}), max DD {dd_b:+.3f} vs {dd_a:+.3f}."
+            f"PROMOTE ensemble α={alpha:.2f}: VAL IR {ir_b:+.3f} vs overnight "
+            f"{ir_a:+.3f} (delta {ir_delta:+.3f}), max DD {dd_b:+.3f} vs "
+            f"{dd_a:+.3f}, coverage {100 * cover:.0f}%."
         )
     return {
         "promote_ensemble": promote,
         "gated_on": "val",
         "reason": reason,
-        "spec": {"weight": float(w_best) if promote else 1.0},
-        "chosen": best,
+        "spec": {"alpha": float(alpha) if promote else 1.0, "weight": float(alpha) if promote else 1.0},
+        "chosen": scored,
         "baseline": baseline,
+        "train_alpha": float(alpha) if np.isfinite(alpha) else 1.0,
         "ir_overnight": ir_a,
         "ir_ensemble": ir_b,
         "ir_delta": ir_delta,
         "dd_overnight": dd_a,
         "dd_ensemble": dd_b,
         "dd_delta": dd_delta,
+        "coverage": cover,
+        "cover_min_val": ENSEMBLE_COVER_VAL,
         "ir_lift": LO_IR_LIFT,
+        "net_ir_overnight": _as_float(baseline.get("net_ir")),
+        "net_ir_ensemble": _as_float(scored.get("net_ir")),
     }
 
 
@@ -1785,13 +1904,19 @@ def evaluate_overnight_shorting(
         if str(row.get("hedge") or "").upper() not in ("", bench)
     )
     if log_fn:
-        log_fn("IDEA 5: overnight ⊕ close-to-close rank ensemble (VAL-chosen w)")
+        log_fn("IDEA 5: overnight ⊕ close-to-close rank ensemble (TRAIN-chosen α)")
     cc_frames, _cc_min, cc_train_ic, _cc_hedges = _overnight_skip_frames(
         data_dir,
         universe,
         sector_residual=True,
         log_fn=None,
         label_return="close",
+    )
+    ens_fit = fit_ensemble_on_train(
+        frames["train"],
+        cc_frames.get("train", pd.DataFrame()),
+        min_names=min_names,
+        vol_target=vol_target,
     )
     ens_val = ensemble_on_cc_grid(
         frames["val"],
@@ -1805,12 +1930,56 @@ def evaluate_overnight_shorting(
         min_names=min_names,
         vol_target=vol_target,
     )
-    ens_promo = decide_ensemble_promote(ens_val)
+    ens_alpha = _as_float(
+        (ens_fit.get("chosen") or {}).get("alpha", (ens_fit.get("chosen") or {}).get("weight")),
+        default=1.0,
+    )
+    if not np.isfinite(ens_alpha):
+        ens_alpha = 1.0
+    ens_val_chosen = score_ensemble_alpha(
+        frames["val"],
+        cc_frames.get("val", pd.DataFrame()),
+        ens_alpha,
+        min_names=min_names,
+        vol_target=vol_target,
+    )
+    ens_val_base = score_ensemble_alpha(
+        frames["val"],
+        cc_frames.get("val", pd.DataFrame()),
+        1.0,
+        min_names=min_names,
+        vol_target=vol_target,
+    )
+    ens_test_chosen = score_ensemble_alpha(
+        frames["test"],
+        cc_frames.get("test", pd.DataFrame()),
+        ens_alpha,
+        min_names=min_names,
+        vol_target=vol_target,
+    )
+    ens_test_base = score_ensemble_alpha(
+        frames["test"],
+        cc_frames.get("test", pd.DataFrame()),
+        1.0,
+        min_names=min_names,
+        vol_target=vol_target,
+    )
+    ens_promo = decide_ensemble_promote(
+        val_overnight=ens_val_base,
+        val_chosen=ens_val_chosen,
+        chosen=ens_fit.get("chosen") or {},
+    )
     ens_compare = {
         "train_cs_ic_overnight": float(train_ic),
         "train_cs_ic_c2c": cc_train_ic,
+        "train_grid": ens_fit,
         "val_grid": ens_val,
         "test_grid": ens_test,
+        "val_chosen": ens_val_chosen,
+        "val_overnight": ens_val_base,
+        "test_chosen": ens_test_chosen,
+        "test_overnight": ens_test_base,
+        "train_alpha": ens_alpha,
     }
     sector_promo = decide_sector_promote(
         val_spy=spy_val_lo,
@@ -1967,6 +2136,7 @@ def evaluate_overnight_shorting(
         "weekday_promotion": wd_promo,
         "sector_compare": sector_compare,
         "sector_promotion": sector_promo,
+        "ensemble_fit": ens_fit,
         "ensemble_compare": ens_compare,
         "ensemble_promotion": ens_promo,
         "ls_experiment": ls_exp,
@@ -2208,36 +2378,58 @@ def _sector_block(payload: dict[str, Any]) -> str:
 def _ensemble_block(payload: dict[str, Any]) -> str:
     promo = payload.get("ensemble_promotion") or {}
     cmp_ = payload.get("ensemble_compare") or {}
+    fit = payload.get("ensemble_fit") or cmp_.get("train_grid") or {}
     val = cmp_.get("val_grid") or {}
     test = cmp_.get("test_grid") or {}
-    chosen = promo.get("chosen") or val.get("best") or {}
-    base = val.get("baseline") or promo.get("baseline") or {}
+    chosen = cmp_.get("val_chosen") or promo.get("chosen") or {}
+    base = cmp_.get("val_overnight") or promo.get("baseline") or {}
+    test_ch = cmp_.get("test_chosen") or {}
+    test_a = cmp_.get("test_overnight") or {}
+    train_ch = fit.get("chosen") or {}
 
     def _row(r: dict[str, Any]) -> str:
         return (
             f"  {str(r.get('name') or ''):14} "
             f"IR {_fmt(r.get('unlevered_net_ir'), '+.3f')}  "
             f"maxDD {_fmt(r.get('unlevered_max_dd'), '+.3f')}  "
-            f"w={_fmt(r.get('weight'), '.2f')}"
+            f"α={_fmt(r.get('alpha', r.get('weight')), '.2f')}  "
+            f"cover {_fmt(100.0 * _as_float(r.get('coverage')), '.0f')}%"
         )
 
     lines = [
         f"PROMOTE OVERNIGHT⊕C2C ENSEMBLE? "
         f"{'YES' if promo.get('promote_ensemble') else 'NO'}",
-        f"  {val.get('note')}",
+        f"  {fit.get('note') or val.get('note')}",
         f"  train CS IC overnight {_fmt(cmp_.get('train_cs_ic_overnight'), '+.4f')}  "
         f"c2c {_fmt(cmp_.get('train_cs_ic_c2c'), '+.4f')}",
+        f"  TRAIN chose α={_fmt(train_ch.get('alpha', train_ch.get('weight')), '.2f')}  "
+        f"IR {_fmt(train_ch.get('unlevered_net_ir'), '+.3f')}  "
+        f"(fit_split={fit.get('fit_split')})",
         f"  {promo.get('reason')}",
-        f"  VAL A (w=1 overnight) IR {_fmt(base.get('unlevered_net_ir'), '+.3f')}  "
-        f"maxDD {_fmt(base.get('unlevered_max_dd'), '+.3f')}",
-        f"  VAL best={chosen.get('name')}  "
+        f"  VAL A (α=1 overnight) IR {_fmt(base.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(base.get('unlevered_max_dd'), '+.3f')}  "
+        f"liveIR {_fmt(base.get('net_ir'), '+.3f')}",
+        f"  VAL TRAIN-α={_fmt(chosen.get('alpha', chosen.get('weight')), '.2f')}  "
         f"IR {_fmt(chosen.get('unlevered_net_ir'), '+.3f')}  "
-        f"maxDD {_fmt(chosen.get('unlevered_max_dd'), '+.3f')}",
-        "  VAL ensemble w (gate):",
+        f"maxDD {_fmt(chosen.get('unlevered_max_dd'), '+.3f')}  "
+        f"liveIR {_fmt(chosen.get('net_ir'), '+.3f')}  "
+        f"cover {_fmt(100.0 * _as_float(chosen.get('coverage')), '.0f')}%",
+        "  TRAIN α grid (fit):",
     ]
+    for row in list(fit.get("rows") or []):
+        lines.append(_row(row))
+    lines.append("  VAL α grid (report; α not picked here):")
     for row in list(val.get("rows") or []):
         lines.append(_row(row))
-    lines.append("  TEST ensemble w (report-only):")
+    lines.append(
+        f"  TEST A (α=1) IR {_fmt(test_a.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(test_a.get('unlevered_max_dd'), '+.3f')}  (report-only)"
+    )
+    lines.append(
+        f"  TEST TRAIN-α IR {_fmt(test_ch.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(test_ch.get('unlevered_max_dd'), '+.3f')}  (report-only)"
+    )
+    lines.append("  TEST α grid (report-only):")
     for row in list(test.get("rows") or []):
         lines.append(_row(row))
     return "\n".join(lines)
