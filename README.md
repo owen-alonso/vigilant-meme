@@ -169,11 +169,11 @@ y_t = \frac{r_{t+1} - \beta_t r^{\mathrm{hedge}}_{t+1}}{\sigma_t}
 \]
 
 `best.pt` is selected by mean CS IC when a cross-section exists. `backtest.py`
-builds a dollar-neutral (or `--long-only`) rank or quantile book on the locked
-test window, with round-trip costs, causal vol targeting, and optional hold
-smoothing. Report mean CS IC + t-stat + **unlevered** net IR and causal max DD.
-Do not call a Spearman/Pearson blend, a val number, or a 100% vol path "test IC
-0.14" / "IR 1 with a survivable book".
+builds a dollar-neutral (or `--long-only`) quantile book on the locked
+test window, with round-trip costs, 1-day hold smoothing, and causal vol
+targeting at 15% annual. Report mean CS IC + t-stat + **unlevered** net IR
+and causal max DD. Do not call a Spearman/Pearson blend, a val number, or a
+100% vol path "test IC 0.14" / "IR 1 with a survivable book".
 
 ## Tests
 

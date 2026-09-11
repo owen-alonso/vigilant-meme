@@ -271,8 +271,8 @@ def book_pnl(
     periods_per_year: float = 252.0,
     long_only: bool = False,
     min_names: int = 8,
-    weighting: str = "rank",
-    hold_halflife: float = 5.0,
+    weighting: str = "quantile",
+    hold_halflife: float = 1.0,
     causal_vol: bool = True,
     lever_cap: float = 3.0,
     min_vol_days: int = 21,
@@ -447,14 +447,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--weighting",
         choices=("quantile", "rank"),
-        default="rank",
-        help="quantile tails (high turnover) or centered CS rank (default)",
+        default="quantile",
+        help="20%% tails (default) or centered CS rank (softer, usually lower IR)",
     )
     p.add_argument(
         "--hold-halflife",
         type=float,
-        default=5.0,
-        help="EWMA half-life in days for target weights (0 = no smoothing)",
+        default=1.0,
+        help="EWMA half-life in days for target weights (0 = no smoothing; 5 is too slow for 1-day CS)",
     )
     p.add_argument("--cost-bps", type=float, default=10.0, help="round-trip cost in basis points")
     p.add_argument(

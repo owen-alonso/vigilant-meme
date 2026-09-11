@@ -62,7 +62,7 @@ python -m forecast.training --universe liquid --interval daily --skip-only --che
 python -m forecast.training --universe liquid --interval daily --checkpoint-dir checkpoints/forecast --d-model 32 --n-layer 1
 ```
 
-4. Locked-window book with costs. Default is **rank weights**, 5-day hold smoothing, **causal** expanding vol at 15% annual (not a 100% vol toy):
+4. Locked-window book with costs. Default is **quantile tails**, 1-day hold smoothing, **causal** expanding vol at 15% annual (not a 100% vol toy). A 5-day hold kills the 1-day CS signal.
 
 ```bash
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge/best.pt --cost-bps 10 --json checkpoints/forecast_ridge/backtest.json --cs-csv checkpoints/forecast_ridge/cs_ic.csv
