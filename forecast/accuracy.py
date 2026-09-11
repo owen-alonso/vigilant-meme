@@ -8,6 +8,7 @@ converts that to an implied overnight log-return ``pred * sigma`` (same as
 - excess hit rate vs the unconditional overnight-up drift (always-long)
 - implied next-open vs actual next open
 - long-only book up-rate on the within-date top residual names
+- short-sleeve overnight down-rate on the within-date bottom residual names
 
 Default recipe is the PR #5 overnight skip (rank-target ridge, ``no_long_ts``).
 PR #7 levers stay off unless a checkpoint documents them.
@@ -392,20 +393,32 @@ def collect_eval_frame(
     return df
 
 
-def long_only_book_block(
+def sleeve_book_block(
     df: pd.DataFrame,
     *,
     score_col: str = "pred",
+    side: str = "long",
     q: float = 0.80,
     min_names: int = 3,
 ) -> dict[str, float]:
-    """Overnight up-rate on the within-date top residual names (long-only sleeve)."""
+    """Overnight hit rate on a within-date residual-pred quantile sleeve.
+
+    ``side='long'``: names with score >= q (default top 20% if q=0.80),
+    overnight *up*-rate vs the unconditional up-rate.
+    ``side='short'``: names with score <= q (default bottom 20% if q=0.20),
+    overnight *down*-rate vs the unconditional down-rate.
+    """
+    is_long = str(side or "long").strip().lower() != "short"
     empty = {
+        "side": "long" if is_long else "short",
         "quantile": float(q),
         "n": 0.0,
         "coverage": float("nan"),
+        "hit_pct": float("nan"),
         "up_pct": float("nan"),
+        "down_pct": float("nan"),
         "uncond_up_pct": float("nan"),
+        "uncond_down_pct": float("nan"),
         "excess_pp": float("nan"),
         "n_dates": 0.0,
     }
@@ -422,28 +435,59 @@ def long_only_book_block(
         if int(np.isfinite(row).sum()) < int(min_names):
             continue
         cut = float(np.nanquantile(row, float(q)))
-        mask[sel] = np.isfinite(row) & (row >= cut)
+        if is_long:
+            mask[sel] = np.isfinite(row) & (row >= cut)
+        else:
+            mask[sel] = np.isfinite(row) & (row <= cut)
         n_dates += 1
     moved = mask & np.isfinite(r_on) & (r_on != 0.0)
     uncond = r_on[np.isfinite(r_on) & (r_on != 0.0)]
     uncond_up = float((uncond > 0).mean()) if uncond.size else float("nan")
+    uncond_down = float((uncond < 0).mean()) if uncond.size else float("nan")
+    empty["n_dates"] = float(n_dates)
+    empty["uncond_up_pct"] = (
+        float(100.0 * uncond_up) if np.isfinite(uncond_up) else float("nan")
+    )
+    empty["uncond_down_pct"] = (
+        float(100.0 * uncond_down) if np.isfinite(uncond_down) else float("nan")
+    )
+    empty["coverage"] = float(mask.mean()) if mask.size else float("nan")
     if int(moved.sum()) == 0:
-        empty["n_dates"] = float(n_dates)
-        empty["uncond_up_pct"] = (
-            float(100.0 * uncond_up) if np.isfinite(uncond_up) else float("nan")
-        )
-        empty["coverage"] = float(mask.mean()) if mask.size else float("nan")
         return empty
     up = float((r_on[moved] > 0).mean())
+    down = float((r_on[moved] < 0).mean())
+    if is_long:
+        hit, baseline = up, uncond_up
+    else:
+        hit, baseline = down, uncond_down
     return {
+        "side": "long" if is_long else "short",
         "quantile": float(q),
         "n": float(int(moved.sum())),
         "coverage": float(mask.mean()) if mask.size else float("nan"),
+        "hit_pct": float(100.0 * hit),
         "up_pct": float(100.0 * up),
+        "down_pct": float(100.0 * down),
         "uncond_up_pct": float(100.0 * uncond_up) if np.isfinite(uncond_up) else float("nan"),
-        "excess_pp": float(100.0 * (up - uncond_up)) if np.isfinite(uncond_up) else float("nan"),
+        "uncond_down_pct": (
+            float(100.0 * uncond_down) if np.isfinite(uncond_down) else float("nan")
+        ),
+        "excess_pp": float(100.0 * (hit - baseline)) if np.isfinite(baseline) else float("nan"),
         "n_dates": float(n_dates),
     }
+
+
+def long_only_book_block(
+    df: pd.DataFrame,
+    *,
+    score_col: str = "pred",
+    q: float = 0.80,
+    min_names: int = 3,
+) -> dict[str, float]:
+    """Overnight up-rate on the within-date top residual names (long-only sleeve)."""
+    return sleeve_book_block(
+        df, score_col=score_col, side="long", q=q, min_names=min_names
+    )
 
 
 def _restrict_cs_dates(df: pd.DataFrame, min_names: int) -> pd.DataFrame:
@@ -509,6 +553,12 @@ def score_eval_frame(
     vs_drift = hit_rate_vs_p0(ts_hits, realized_up)
     book_top20 = long_only_book_block(df, score_col="pred", q=0.80, min_names=min_names)
     book_top30 = long_only_book_block(df, score_col="pred", q=0.70, min_names=min_names)
+    book_short20 = sleeve_book_block(
+        df, score_col="pred", side="short", q=0.20, min_names=min_names
+    )
+    book_short30 = sleeve_book_block(
+        df, score_col="pred", side="short", q=0.30, min_names=min_names
+    )
     down_hi = (
         np.isfinite(pred_r)
         & np.isfinite(r_on)
@@ -549,12 +599,15 @@ def score_eval_frame(
         },
         "book": {
             "kind": (
-                "long-only runnable sleeve: within-date residual-pred quantile, "
-                "then overnight up-rate vs the unconditional gap up-rate. "
-                "This is the book object, not pooled TS direction."
+                "CS quantile sleeves on residual pred vs realized overnight r_on. "
+                "Long = top names' up-rate vs unconditional up-rate. "
+                "Short = bottom names' down-rate vs unconditional down-rate. "
+                "This is the ranking object, not pooled TS direction."
             ),
             "long_only_top20": book_top20,
             "long_only_top30": book_top30,
+            "short_bottom20": book_short20,
+            "short_bottom30": book_short30,
         },
         "cs_ic": {
             "cs_ic": float(cs.get("cs_ic", float("nan"))),
@@ -707,6 +760,7 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
     cs_sign = direction.get("cross_sectional_residual_sign") or {}
     vs_drift = direction.get("overall_vs_drift") or {}
     book_top = (payload.get("book") or {}).get("long_only_top20") or {}
+    book_short = (payload.get("book") or {}).get("short_bottom20") or {}
     up_pct = _as_float(direction.get("realized_overnight_up_pct"))
     excess = _as_float(vs_drift.get("excess_pp"))
     if not np.isfinite(excess) and np.isfinite(hit) and np.isfinite(up_pct):
@@ -739,6 +793,11 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         f"{_as_float(book_top.get('up_pct')):.1f}%  "
         f"excess {_as_float(book_top.get('excess_pp')):+.2f} pp vs {up_pct:.1f}% "
         f"n={int(_as_float(book_top.get('n'), 0.0))}",
+        f"  short BOOK bottom 20% CS residual: down-rate "
+        f"{_as_float(book_short.get('down_pct', book_short.get('hit_pct'))):.1f}%  "
+        f"excess {_as_float(book_short.get('excess_pp')):+.2f} pp vs "
+        f"{_as_float(book_short.get('uncond_down_pct')):.1f}% overnight-down "
+        f"n={int(_as_float(book_short.get('n'), 0.0))}",
         "",
         f"HEADLINE |price error|  MAE ${price.get('mae'):.4f}  "
         f"median ${price.get('median_ae'):.4f}  RMSE ${price.get('rmse'):.4f}",

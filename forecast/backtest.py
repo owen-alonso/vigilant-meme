@@ -26,6 +26,7 @@ from forecast.checkpoint import load_forecaster
 from forecast.config import DataConfig
 from forecast.overnight import (
     apply_locate_gate,
+    apply_short_constraints,
     book_side_stats,
     capacity_note,
     holding_for_label,
@@ -199,6 +200,80 @@ def rank_weights(scores: pd.Series, *, long_only: bool = False) -> pd.Series:
     return w
 
 
+def panel_overnight_r_wide(
+    panels: dict[str, pd.DataFrame],
+    like: pd.DataFrame,
+) -> pd.DataFrame:
+    """``r_on = log(open_{t+1}) - log(close_t)`` aligned to a pred frame.
+
+    Next open is a *label*, never a feature. Used only to score sleeve
+    overnight direction after the residual skip has picked names.
+    """
+    parts: list[pd.Series] = []
+    for symbol in like.columns:
+        panel = panels.get(str(symbol))
+        if panel is None or "open" not in panel.columns or "close" not in panel.columns:
+            continue
+        close = panel["close"].to_numpy(dtype=np.float64)
+        opn = panel["open"].to_numpy(dtype=np.float64)
+        r_on = np.full(close.shape[0], np.nan, dtype=np.float64)
+        if close.size > 1:
+            nxt = opn[1:]
+            c = close[:-1]
+            ok = (c > 0) & (nxt > 0) & np.isfinite(c) & np.isfinite(nxt)
+            r_on[:-1] = np.where(ok, np.log(nxt) - np.log(np.clip(c, 1e-12, None)), np.nan)
+        when = pd.to_datetime(panel["datetime"])
+        if getattr(when.dt, "tz", None) is not None:
+            when = when.dt.tz_convert("America/New_York").dt.tz_localize(None)
+        when = when.dt.normalize()
+        parts.append(pd.Series(r_on, index=when, name=symbol))
+    if not parts:
+        return pd.DataFrame(np.nan, index=like.index, columns=like.columns)
+    out = pd.concat(parts, axis=1).sort_index()
+    out = out.groupby(level=0).last()
+    return out.reindex(index=like.index, columns=like.columns)
+
+
+def sleeve_direction_from_weights(
+    weights: pd.DataFrame,
+    overnight_r: pd.DataFrame,
+) -> dict[str, float]:
+    """Overnight up/down hit rates on the *held* long and short legs."""
+    w = np.asarray(weights, dtype=np.float64)
+    r = overnight_r.reindex(index=weights.index, columns=weights.columns).to_numpy(
+        dtype=np.float64
+    )
+    long_m = (w > 1e-12) & np.isfinite(r) & (r != 0.0)
+    short_m = (w < -1e-12) & np.isfinite(r) & (r != 0.0)
+    moved = np.isfinite(r) & (r != 0.0)
+    uncond_up = float((r[moved] > 0).mean()) if int(moved.sum()) else float("nan")
+    uncond_down = float((r[moved] < 0).mean()) if int(moved.sum()) else float("nan")
+    long_up = float((r[long_m] > 0).mean()) if int(long_m.sum()) else float("nan")
+    short_down = float((r[short_m] < 0).mean()) if int(short_m.sum()) else float("nan")
+    return {
+        "uncond_up_pct": float(100.0 * uncond_up) if np.isfinite(uncond_up) else float("nan"),
+        "uncond_down_pct": (
+            float(100.0 * uncond_down) if np.isfinite(uncond_down) else float("nan")
+        ),
+        "long_n": float(int(long_m.sum())),
+        "long_up_pct": float(100.0 * long_up) if np.isfinite(long_up) else float("nan"),
+        "long_excess_pp": (
+            float(100.0 * (long_up - uncond_up))
+            if np.isfinite(long_up) and np.isfinite(uncond_up)
+            else float("nan")
+        ),
+        "short_n": float(int(short_m.sum())),
+        "short_down_pct": (
+            float(100.0 * short_down) if np.isfinite(short_down) else float("nan")
+        ),
+        "short_excess_pp": (
+            float(100.0 * (short_down - uncond_down))
+            if np.isfinite(short_down) and np.isfinite(uncond_down)
+            else float("nan")
+        ),
+    }
+
+
 def panel_feature_wide(
     panels: dict[str, pd.DataFrame],
     column: str,
@@ -322,9 +397,13 @@ def book_pnl(
     thin_mult: float = 1.0,
     thin_pctile: float = 0.0,
     locate_pctile: float = 0.0,
+    locate_haircut: float = 1.0,
+    locate_frac: float = 1.0,
+    max_short_gross: float = 0.5,
     ex_post_gap_k: float = 0.0,
     turnover_z: pd.DataFrame | None = None,
     vol_level: pd.DataFrame | None = None,
+    overnight_r: pd.DataFrame | None = None,
     adv_floor_pctile: float = 0.0,
 ) -> dict[str, Any]:
     """Cost-aware long-short with optional rank weights, hold smoothing, causal vol.
@@ -413,11 +492,14 @@ def book_pnl(
     if vol_level is not None:
         vol_kept = vol_level.reindex(index=w_panel.index, columns=w_panel.columns)
     n_blocked = np.zeros(len(w_panel), dtype=np.float64)
-    if (not long_only) and float(locate_pctile) > 0 and tz_kept is not None:
-        gated, n_blocked = apply_locate_gate(
+    if not long_only:
+        gated, n_blocked = apply_short_constraints(
             w_panel.to_numpy(dtype=np.float64),
-            tz_kept.to_numpy(dtype=np.float64),
-            pctile=float(locate_pctile),
+            None if tz_kept is None else tz_kept.to_numpy(dtype=np.float64),
+            locate_pctile=float(locate_pctile),
+            locate_haircut=float(locate_haircut),
+            locate_frac=float(locate_frac),
+            max_short_gross=float(max_short_gross),
             long_only=False,
         )
         w_panel = pd.DataFrame(gated, index=w_panel.index, columns=w_panel.columns)
@@ -507,6 +589,10 @@ def book_pnl(
     net_s = lever_s * gross_s - cost
     ics = cs_ic_by_date(pred.loc[w_panel.index], realized.loc[w_panel.index])
     sides = book_side_stats(w_arr)
+    sleeve: dict[str, float] = {}
+    if overnight_r is not None and not w_panel.empty:
+        sleeve = sleeve_direction_from_weights(w_panel, overnight_r)
+    mean_cost_unlev = float(cost_unlev.mean()) if len(cost_unlev) else float("nan")
     note = capacity_note(
         long_only=bool(long_only),
         mean_long_nav=float(sides["mean_long_nav"]),
@@ -529,7 +615,13 @@ def book_pnl(
         "unlevered_max_dd": _max_dd(net_unlev),
         "mean_turnover": float(turnover.mean()),
         "mean_cost": float(cost.mean()),
-        "mean_cost_unlev": float(cost_unlev.mean()) if len(cost_unlev) else float("nan"),
+        "mean_cost_unlev": mean_cost_unlev,
+        "mean_cost_bp": (
+            float(cost.mean()) * 1e4 if np.isfinite(float(cost.mean())) else float("nan")
+        ),
+        "mean_cost_unlev_bp": (
+            mean_cost_unlev * 1e4 if np.isfinite(mean_cost_unlev) else float("nan")
+        ),
         "round_trip_bps": float(round_trip_bps),
         "quantile": float(quantile),
         "vol_target": float(vol_target),
@@ -550,6 +642,9 @@ def book_pnl(
         "thin_mult": float(thin_mult),
         "thin_pctile": float(thin_pctile),
         "locate_pctile": float(locate_pctile),
+        "locate_haircut": float(locate_haircut) if not long_only else 0.0,
+        "locate_frac": float(locate_frac) if not long_only else 0.0,
+        "max_short_gross": float(max_short_gross) if not long_only else 0.0,
         "adv_floor_pctile": float(adv_floor_pctile),
         "ex_post_gap_k": float(ex_post_gap_k),
         "mean_long_nav": sides["mean_long_nav"],
@@ -558,6 +653,7 @@ def book_pnl(
         "mean_n_long": sides["mean_n_long"],
         "mean_n_short": sides["mean_n_short"],
         "mean_shorts_blocked": float(np.mean(n_blocked)) if len(n_blocked) else 0.0,
+        "sleeve": sleeve,
         "cost_parts": cost_parts,
         "capacity_note": note,
         "mean_cs_ic": float(ics["ic"].mean()) if len(ics) else float("nan"),
@@ -601,7 +697,10 @@ def format_report(stats: dict[str, Any], *, checkpoint: Path, test_start: Any) -
         f"  hedge {stats.get('hedge_cost_bps', 0):.1f} bp"
         f"  impact_k {stats.get('impact_vol_k', 0):.1f}"
         f"  thin x{stats.get('thin_mult', 1):.1f}@{100 * float(stats.get('thin_pctile', 0) or 0):.0f}%",
-        f"  locate     bottom {100 * float(stats.get('locate_pctile', 0) or 0):.0f}% turnover blocked"
+        f"  locate     bottom {100 * float(stats.get('locate_pctile', 0) or 0):.0f}% turnover "
+        f"haircut={float(stats.get('locate_haircut', 1) or 0):.2f} "
+        f"frac={float(stats.get('locate_frac', 1) or 0):.2f} "
+        f"max_short={float(stats.get('max_short_gross', 0.5) or 0):.2f}"
         f"  (mean names/date {stats.get('mean_shorts_blocked', 0):.2f})",
         f"  book NAV   long {stats.get('mean_long_nav', float('nan')):.3f}  "
         f"short {stats.get('mean_short_nav', float('nan')):.3f}  "
@@ -623,6 +722,7 @@ def format_report(stats: dict[str, Any], *, checkpoint: Path, test_start: Any) -
         f"  hit rate               {stats.get('hit_rate', float('nan')):.3f}",
         f"  mean turnover (1-way)  {stats.get('mean_turnover', float('nan')):.3f}",
         f"  unlev cost (NAV)       {stats.get('mean_cost_unlev', float('nan')):.5f}"
+        f"  ({float(stats.get('mean_cost_unlev_bp') or float('nan')):.1f} bp)"
         f"  (rt {parts.get('round_trip', float('nan')):.5f}"
         f"  moc {parts.get('moc', 0):.5f}"
         f"  moo {parts.get('moo', 0):.5f}"
@@ -630,6 +730,21 @@ def format_report(stats: dict[str, Any], *, checkpoint: Path, test_start: Any) -
         f"  hedge {parts.get('hedge', 0):.5f}"
         f"  impact {parts.get('impact', 0):.5f})",
     ]
+    sleeve = stats.get("sleeve") or {}
+    if sleeve:
+        lines.append(
+            f"  long sleeve overnight up-rate   {float(sleeve.get('long_up_pct') or float('nan')):.1f}%"
+            f"  excess {float(sleeve.get('long_excess_pp') or float('nan')):+.2f} pp"
+            f" vs {float(sleeve.get('uncond_up_pct') or float('nan')):.1f}% up-floor"
+            f"  n={int(float(sleeve.get('long_n') or 0))}"
+        )
+        if not stats.get("long_only"):
+            lines.append(
+                f"  short sleeve overnight down-rate {float(sleeve.get('short_down_pct') or float('nan')):.1f}%"
+                f"  excess {float(sleeve.get('short_excess_pp') or float('nan')):+.2f} pp"
+                f" vs {float(sleeve.get('uncond_down_pct') or float('nan')):.1f}% down-floor"
+                f"  n={int(float(sleeve.get('short_n') or 0))}"
+            )
     if stats.get("capacity_note"):
         lines.append(f"  capacity   {stats['capacity_note']}")
     if float(stats.get("ex_post_gap_k") or 0) > 0:
@@ -675,7 +790,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--live-costs",
         action="store_true",
-        help="shorthand for --cost-bundle live (name-level MOC/MOO + thin/vol impact)",
+        help="shorthand for --cost-bundle live_locate (honest LS) or live_long_only "
+        "with --long-only. Unconstrained shorts: --cost-bundle live.",
     )
     p.add_argument(
         "--open-auction-bps",
@@ -745,6 +861,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="block shorts in the bottom CS turnover_z percentile (HTB proxy; 0.3 = bottom 30%%)",
     )
     p.add_argument(
+        "--locate-haircut",
+        type=float,
+        default=None,
+        help="1.0 skip HTB shorts (default); 0.5 haircut them to half size (causal turnover_z)",
+    )
+    p.add_argument(
+        "--locate-frac",
+        type=float,
+        default=None,
+        help="locatable short NAV as a fraction of the 50/50 short leg (1.0 = full 0.5 NAV)",
+    )
+    p.add_argument(
+        "--max-short-gross",
+        type=float,
+        default=None,
+        help="cap short NAV after locate (default 0.5 = dollar-neutral short leg)",
+    )
+    p.add_argument(
         "--ex-post-gap-k",
         type=float,
         default=None,
@@ -772,7 +906,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--compare-long-only",
         action="store_true",
-        help="also print the long-only overnight book on the same scores (no locate)",
+        help="also print the long-only overnight book on the same scores (no locate). "
+        "Default on for overnight --live-costs long-short.",
+    )
+    p.add_argument(
+        "--no-compare-long-only",
+        action="store_true",
+        help="do not auto-print the long-only comparison next to a live LS book",
     )
     p.add_argument(
         "--min-names",
@@ -796,7 +936,7 @@ def cost_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
     """Named bundle first, then explicit CLI overrides. Defaults match paper 10 bp."""
     name = str(getattr(args, "cost_bundle", "") or "").strip()
     if bool(getattr(args, "live_costs", False)) and not name:
-        name = "live"
+        name = "live_long_only" if bool(getattr(args, "long_only", False)) else "live_locate"
     if bool(getattr(args, "long_only", False)) and name == "live":
         name = "live_long_only"
     bundle = resolve_cost_bundle(name) if name else None
@@ -890,6 +1030,11 @@ def main(argv: list[str] | None = None) -> int:
     costs = cost_kwargs_from_args(args)
     tz = panel_feature_wide(panels, "turnover_z", pred) if len(pred) else None
     vol = panel_feature_wide(panels, "vol_level", pred) if len(pred) else None
+    on_r = (
+        panel_overnight_r_wide(panels, pred)
+        if len(pred) and hold_mode == "overnight"
+        else None
+    )
     ppy = 252.0 if data_cfg.is_daily() else (52.0 if data_cfg.interval == "weekly" else 12.0)
     book_kw = dict(
         quantile=args.quantile,
@@ -912,14 +1057,33 @@ def main(argv: list[str] | None = None) -> int:
         thin_mult=float(costs["thin_mult"]),
         thin_pctile=float(costs["thin_pctile"]),
         locate_pctile=float(costs["locate_pctile"]),
+        locate_haircut=(
+            float(args.locate_haircut) if args.locate_haircut is not None else 1.0
+        ),
+        locate_frac=float(args.locate_frac) if args.locate_frac is not None else 1.0,
+        max_short_gross=(
+            float(args.max_short_gross) if args.max_short_gross is not None else 0.5
+        ),
         ex_post_gap_k=float(costs["ex_post_gap_k"]),
         turnover_z=tz,
         vol_level=vol,
+        overnight_r=on_r,
         adv_floor_pctile=float(args.adv_floor_pctile or 0.0),
     )
     stats = book_pnl(pred, realized, long_only=args.long_only, **book_kw)
     print(format_report(stats, checkpoint=ckpt_path, test_start=start))
-    if args.compare_long_only and not args.long_only:
+    bundle_name = str(costs.get("name") or getattr(args, "cost_bundle", "") or "").lower()
+    auto_compare = (
+        not args.long_only
+        and not bool(args.no_compare_long_only)
+        and hold_mode == "overnight"
+        and (
+            bool(args.live_costs)
+            or bundle_name in ("live", "live_locate")
+        )
+    )
+    compare_lo = bool(args.compare_long_only) or auto_compare
+    if compare_lo and not args.long_only:
         lo = book_pnl(pred, realized, long_only=True, **book_kw)
         print("\n--- long-only (no locate) ---\n")
         print(format_report(lo, checkpoint=ckpt_path, test_start=start))

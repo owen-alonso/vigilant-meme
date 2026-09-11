@@ -17,6 +17,7 @@ from forecast.overnight import (
     OVERNIGHT_FORMULA,
     LIVE_BUNDLE,
     apply_locate_gate,
+    apply_short_constraints,
     fill_frac_minutes,
     fill_minutes_for,
     forward_log_return,
@@ -546,6 +547,34 @@ def test_live_cost_parts_sum_to_total():
     assert parts["total"][0] > paper[0]
 
 
+def test_locate_haircut_reduces_htb_without_inflating_them_back():
+    w = np.array([-0.25, -0.25, 0.25, 0.25])
+    tz = np.array([-2.0, 1.0, -2.0, 1.0])
+    skip, blocked = apply_short_constraints(
+        w, tz, locate_pctile=0.5, locate_haircut=1.0
+    )
+    half, _ = apply_short_constraints(
+        w, tz, locate_pctile=0.5, locate_haircut=0.5
+    )
+    assert blocked[0] >= 1
+    assert skip[0] == pytest.approx(0.0)
+    assert skip[2] == pytest.approx(0.25)
+    assert skip[skip < 0].sum() == pytest.approx(-0.5)
+    # Partial haircut must not refill the HTB name back to a full short.
+    assert half[0] == pytest.approx(-0.125)
+    assert half[1] == pytest.approx(-0.25)
+    assert half[2] == pytest.approx(0.25)
+
+
+def test_max_short_gross_caps_short_nav():
+    w = np.array([-0.4, -0.4, 0.4, 0.4])
+    capped, _ = apply_short_constraints(
+        w, None, locate_pctile=0.0, max_short_gross=0.3
+    )
+    assert float((-np.clip(capped, None, 0.0)).sum()) == pytest.approx(0.3)
+    assert capped[2] == pytest.approx(0.4)
+
+
 def test_locate_gate_zeros_thin_shorts_and_keeps_longs():
     w = np.array([-0.25, -0.25, 0.25, 0.25])
     tz = np.array([-2.0, 1.0, -2.0, 1.0])
@@ -678,6 +707,8 @@ def test_backtest_live_costs_cli():
 
     args = build_arg_parser().parse_args(["--live-costs", "--holding", "overnight"])
     costs = cost_kwargs_from_args(args)
+    assert costs["name"] == "live_locate"
+    assert costs["locate_pctile"] == pytest.approx(0.3)
     assert costs["moo_bps"] == pytest.approx(10.0)
     assert costs["moc_bps"] == pytest.approx(5.0)
     assert costs["round_trip_bps"] == pytest.approx(20.0)

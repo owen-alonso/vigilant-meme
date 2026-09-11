@@ -370,6 +370,68 @@ def row_cs_thin_mask(turnover_z: np.ndarray, pctile: float) -> np.ndarray:
     return out
 
 
+def apply_short_constraints(
+    weights: np.ndarray,
+    turnover_z: np.ndarray | None = None,
+    *,
+    locate_pctile: float = 0.0,
+    locate_haircut: float = 1.0,
+    locate_frac: float = 1.0,
+    max_short_gross: float = 0.5,
+    long_only: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Causal short constraints known at close t. Longs are not resized.
+
+    ``locate_pctile``: HTB proxy — bottom CS ``turnover_z`` shorts.
+    ``locate_haircut``: 1.0 zeros those shorts (skip); 0.5 halves them.
+    Remaining locatable shorts are rescaled toward ``0.5 * locate_frac`` NAV
+    (the original locate gate filled remaining shorts back to 0.5).
+    ``max_short_gross`` then caps short NAV. If every short is blocked the
+    date stays long-biased — that is the constraint, not a silent long-only
+    renormalization.
+    """
+    w = np.asarray(weights, dtype=np.float64).copy()
+    squeeze = w.ndim == 1
+    if squeeze:
+        w = w.reshape(1, -1)
+    blocked = np.zeros(w.shape[0], dtype=np.float64)
+    if long_only:
+        return (w[0] if squeeze else w), blocked
+    haircut = float(np.clip(locate_haircut, 0.0, 1.0))
+    frac = float(np.clip(locate_frac, 0.0, 1.0))
+    cap = max(0.0, float(max_short_gross))
+    target = min(cap, 0.5 * frac) if frac > 0 else 0.0
+    thin = None
+    if float(locate_pctile) > 0 and turnover_z is not None and haircut > 0:
+        thin = row_cs_thin_mask(_as_2d(turnover_z, w.shape), float(locate_pctile))
+    for i in range(w.shape[0]):
+        short = w[i] < 0
+        if thin is not None:
+            hit = short & thin[i]
+            blocked[i] = float(hit.sum())
+            if bool(hit.any()):
+                if haircut >= 1.0 - 1e-12:
+                    w[i, hit] = 0.0
+                else:
+                    w[i, hit] = w[i, hit] * (1.0 - haircut)
+        ss = float((-np.clip(w[i], None, 0.0)).sum())
+        # Original locate skip refills remaining locatable shorts to target NAV.
+        # A partial haircut must not inflate HTB names back to full size.
+        inflate = (
+            haircut >= 1.0 - 1e-12
+            and float(locate_pctile) > 0
+            and thin is not None
+        )
+        if ss > 1e-12 and target > 0 and (inflate or ss > target + 1e-12):
+            w[i] = np.where(w[i] < 0.0, w[i] * (target / ss), w[i])
+        elif ss > 1e-12 and target <= 0:
+            w[i] = np.where(w[i] < 0.0, 0.0, w[i])
+        ss = float((-np.clip(w[i], None, 0.0)).sum())
+        if cap > 0 and ss > cap + 1e-12:
+            w[i] = np.where(w[i] < 0.0, w[i] * (cap / ss), w[i])
+    return (w[0] if squeeze else w), blocked
+
+
 def apply_locate_gate(
     weights: np.ndarray,
     turnover_z: np.ndarray | None,
@@ -383,25 +445,15 @@ def apply_locate_gate(
     long-biased at 0.5 NAV — that is the locate constraint, not a silent
     long-only renormalization. Returns ``(weights, n_blocked_per_date)``.
     """
-    w = np.asarray(weights, dtype=np.float64).copy()
-    squeeze = w.ndim == 1
-    if squeeze:
-        w = w.reshape(1, -1)
-    blocked = np.zeros(w.shape[0], dtype=np.float64)
-    if long_only or float(pctile) <= 0 or turnover_z is None:
-        return (w[0] if squeeze else w), blocked
-    thin = row_cs_thin_mask(_as_2d(turnover_z, w.shape), float(pctile))
-    for i in range(w.shape[0]):
-        short = w[i] < 0
-        hit = short & thin[i]
-        blocked[i] = float(hit.sum())
-        if not bool(hit.any()):
-            continue
-        w[i, hit] = 0.0
-        ss = float((-np.clip(w[i], None, 0.0)).sum())
-        if ss > 1e-12:
-            w[i] = np.where(w[i] < 0.0, w[i] * (0.5 / ss), w[i])
-    return (w[0] if squeeze else w), blocked
+    return apply_short_constraints(
+        weights,
+        turnover_z,
+        locate_pctile=float(pctile),
+        locate_haircut=1.0,
+        locate_frac=1.0,
+        max_short_gross=0.5,
+        long_only=bool(long_only),
+    )
 
 
 def overnight_stress_costs(

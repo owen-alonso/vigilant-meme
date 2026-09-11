@@ -269,6 +269,7 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert "excess_pp" in by_name["drift_veto"]["val"]
     assert "book" in payload
     assert "long_only_top20" in payload["book"]
+    assert "short_bottom20" in payload["book"]
     year0 = payload["year_slices"][0]
     assert "excess_pp" in year0
     assert "up_pct" in year0

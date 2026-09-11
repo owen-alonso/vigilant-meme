@@ -85,13 +85,18 @@ python scripts/cs_overnight.py --data-dir data --universe liquid --try-fill 15 -
 # optional weekly residual fallback if harsh MOO kills overnight
 python scripts/cs_overnight.py --data-dir data --universe liquid --try-weekly --no-lastbar-residual
 
-# live cost bundle (name-level MOC/MOO + thin/vol impact + borrow + hedge)
+# VAL-gated overnight LS vs long-only (TEST report-only). Cloud VM: --synthetic.
+python scripts/overnight_shorting.py --data-dir data --universe liquid \
+    --json checkpoints/forecast_ridge_overnight/shorting.json
+python scripts/overnight_shorting.py --synthetic
+
+# honest LS live_locate (locate + borrow) — default --live-costs; auto-prints long-only
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
-  --holding overnight --live-costs --compare-long-only
-# locate-gated shorts (bottom 30% CS turnover_z cannot be shorted)
+  --holding overnight --live-costs
+# unconstrained shorts (old live; not the honest default)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
-  --holding overnight --live-costs --locate-adv-pctile 0.3
-# long-only, no locate
+  --holding overnight --cost-bundle live --compare-long-only
+# long-only, no locate, borrow=0
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --live-costs --long-only
 # optional liquid sleeve (top CS turnover tercile; same skip w; use a lower min-names)
@@ -117,8 +122,8 @@ Overnight **live vs paper** (same flatten book, 15% causal vol):
 |---|---|
 | `paper` / `--cost-bps 10` | enter+exit 10 bp. Understates auction/locate. |
 | `live_flat` | 20 bp RT + 10 bp on the *exit half-notional* + 5 borrow + 10 hedge. First live-ish overlay. |
-| `live` (`--live-costs`) | 20 bp RT + **5 bp MOC + 10 bp MOO on full \|w\|**, ×2 on the bottom 30% CS `turnover_z`, + `8 * max(vol_level,0)` bp impact, + 5 borrow + 10 hedge. |
-| `live_locate` | `live` plus no shorts in the bottom 30% turnover (HTB proxy). Report IR with and without this gate. |
+| `live` | 20 bp RT + **5 bp MOC + 10 bp MOO on full \|w\|**, ×2 on the bottom 30% CS `turnover_z`, + `8 * max(vol_level,0)` bp impact, + 5 borrow + 10 hedge. Unconstrained shorts — not the honest default. |
+| `live_locate` (`--live-costs`) | `live` plus no shorts in the bottom 30% turnover (HTB proxy). Honest LS default. Report IR vs long-only on the same window. |
 | `live_long_only` | `live` with no shorts, borrow=0. Residual still assumes a liquid ETF hedge overlay. Long sleeve ADV participation is ~2× the 50/50 long sleeve. |
 | `harsh` | ugly MOO (30 bp), HTB, higher impact. If net IR dies, stop; next estimand is open+N fill or weekly residual — not bigger Mamba. |
 | `ex_post_gap` | sensitivity: extra `0.25 * \|overnight move\| * \|w\|`. Uses realized. Not the default. |
