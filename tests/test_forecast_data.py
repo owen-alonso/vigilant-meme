@@ -10,6 +10,7 @@ import pytest
 
 from forecast.config import DataConfig, ForecastModelConfig, ForecastTrainConfig, validate_loss_head
 from forecast.data import (
+    CS_PRODUCTS,
     FEATURE_NAMES,
     SequenceDataset,
     SymbolArrays,
@@ -388,6 +389,29 @@ def test_correlation_loss_is_pooled_across_sequences():
 
 def test_feature_count_matches_model_default():
     assert len(FEATURE_NAMES) == ForecastModelConfig().n_features
+    assert ForecastModelConfig().n_features == 44
+    assert {dest for _a, _b, dest in CS_PRODUCTS}.issubset(FEATURE_NAMES)
+
+
+def test_cs_products_are_same_bar_products():
+    cfg = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+    )
+    a = compute_features(_daily_grid(40), cfg)
+    b_grid = _daily_grid(40)
+    b_grid["close"] = b_grid["close"] * 1.5 + np.linspace(0, 2.0, 40)
+    b = compute_features(b_grid, cfg)
+    a["symbol"] = "AAA"
+    b["symbol"] = "BBB"
+    out = attach_cross_section_features({"AAA": a, "BBB": b}, cfg)
+    row = out["AAA"].iloc[20]
+    for left, right, dest in CS_PRODUCTS:
+        assert row[dest] == pytest.approx(float(row[left] * row[right]), abs=1e-6)
 
 
 def test_cross_section_peer_is_the_other_name_same_bar():
@@ -510,6 +534,8 @@ def test_weekly_cli_uses_week_scale_context():
     assert train_cfg.early_stop_evals == 24
     assert train_cfg.ridge_skip == pytest.approx(10.0)
     assert train_cfg.ridge_rank_target is True
+    assert train_cfg.ridge_feat_winsor == pytest.approx(3.0)
+    assert train_cfg.ridge_features == "no_long_ts"
     assert train_cfg.freeze_skip is True
     assert train_cfg.ridge_cs_demean is True
     assert train_cfg.cs_center_loss is True

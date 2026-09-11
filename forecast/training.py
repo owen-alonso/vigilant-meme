@@ -1338,7 +1338,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     g.add_argument(
         "--ridge-features",
-        default="all",
+        default=t.ridge_features,
         choices=("all", "cs", "no_calendar", "no_long_ts", "no_ohlc", "core"),
         help="mask skip features: all, CS-only, drop calendar/long-TS/OHLC, or core",
     )

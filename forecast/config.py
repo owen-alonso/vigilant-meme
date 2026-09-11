@@ -219,7 +219,7 @@ def interval_model_kwargs(interval: str) -> dict[str, Any]:
 class ForecastModelConfig:
     """Mamba backbone sized for continuous financial features."""
 
-    n_features: int = 34
+    n_features: int = 44
     d_model: int = 96
     n_layer: int = 4
     d_state: int = 16
@@ -312,14 +312,14 @@ class ForecastTrainConfig:
     ridge_rank_target: bool = True
     # Within-date z-score features in the ridge design (kills calendar constants).
     ridge_cs_zscore: bool = False
-    # ``all`` / ``cs`` / ``no_calendar`` feature mask for the skip.
-    ridge_features: str = "all"
+    # Drop long TS + calendar from the skip (val-selected with CS products).
+    ridge_features: str = "no_long_ts"
     # Exponential recency weights on train dates (0 = uniform).
     ridge_date_halflife: float = 0.0
     # Winsorize raw y within date before the ridge (ignored when rank_target).
     ridge_y_winsor: float = 0.0
-    # Winsorize features within date (in residual-std units).
-    ridge_feat_winsor: float = 0.0
+    # Winsorize features within date (in residual-std units). Val-selected 3.
+    ridge_feat_winsor: float = 3.0
     # Drop the top this fraction of train dates by residual dispersion.
     ridge_drop_disp_q: float = 0.0
     # Huber IRLS delta in MAD units (0 = closed-form ridge only).

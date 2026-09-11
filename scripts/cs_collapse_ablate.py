@@ -405,52 +405,71 @@ def main(argv: list[str] | None = None) -> int:
         "ensemble",
     )
 
-    # Greedy drop of one feature at a time on val (start from rank+lam10).
-    mask = np.ones(x_tr.shape[1], dtype=bool)
-    best_mask = mask.copy()
-    best_val_ic = float(base_fit["val"]["cs_ic"])
-    improved = True
-    while improved:
-        improved = False
-        cand_best = best_val_ic
-        cand_j = -1
-        for j in np.flatnonzero(best_mask):
-            trial = best_mask.copy()
-            trial[j] = False
-            if not bool(trial.any()):
-                continue
-            w, b, _ = fit_ridge_xy(
-                x_tr,
-                y_tr,
-                d_tr,
-                ridge=10.0,
-                min_names=min_names,
-                rank_target=True,
-                feature_mask_bool=trial,
-            )
-            st = cs_stats(x_va @ w + b, y_va, d_va, min_names=min_names)
-            if st["cs_ic"] > cand_best + 1e-5:
-                cand_best = float(st["cs_ic"])
-                cand_j = int(j)
-        if cand_j >= 0:
-            best_mask[cand_j] = False
-            best_val_ic = cand_best
-            improved = True
-    w_g, b_g, ic_g = fit_ridge_xy(
-        x_tr, y_tr, d_tr, ridge=10.0, min_names=min_names, rank_target=True, feature_mask_bool=best_mask
-    )
-    dropped = [names[j] for j, keep in enumerate(best_mask) if not keep]
-    _emit(
-        {
-            "train_is_cs_ic": ic_g,
-            "n_train": int(y_tr.size),
-            "dropped": dropped,
-            "val": cs_stats(x_va @ w_g + b_g, y_va, d_va, min_names=min_names),
-            "test": cs_stats(x_te @ w_g + b_g, y_te, d_te, min_names=min_names),
-        },
-        "greedy_drop_val",
-        "frozen",
-    )
+    # Single-pass leave-one-feature-out on val (not iterative greedy).
+    loo_best = float(base_fit["val"]["cs_ic"])
+    loo_j = -1
+    loo_val = None
+    loo_test = None
+    for j, name in enumerate(names):
+        trial = np.ones(x_tr.shape[1], dtype=bool)
+        trial[j] = False
+        w, b, _ = fit_ridge_xy(
+            x_tr,
+            y_tr,
+            d_tr,
+            ridge=10.0,
+            min_names=min_names,
+            rank_target=True,
+            feature_mask_bool=trial,
+        )
+        st = cs_stats(x_va @ w + b, y_va, d_va, min_names=min_names)
+        if st["cs_ic"] > loo_best + 1e-5:
+            loo_best = float(st["cs_ic"])
+            loo_j = int(j)
+            loo_val = st
+            loo_test = cs_stats(x_te @ w + b, y_te, d_te, min_names=min_names)
+    if loo_j >= 0 and loo_val is not None and loo_test is not None:
+        _emit(
+            {
+                "n_train": int(y_tr.size),
+                "dropped": [names[loo_j]],
+                "val": loo_val,
+                "test": loo_test,
+            },
+            f"loo_drop_{names[loo_j]}",
+            "frozen",
+        )
+    else:
+        _emit(base_fit, "loo_no_drop", "frozen")
+
+    extra_keep = np.ones(x_tr_i.shape[1] - x_tr.shape[1], dtype=bool)
+    for tag, ridge, fwinsor, use_nolong in (
+        ("prod_fwinsor", 10.0, 3.0, False),
+        ("prod_lam100", 100.0, 0.0, False),
+        ("prod_nolong", 10.0, 0.0, True),
+        ("prod_fwinsor_lam100", 100.0, 3.0, False),
+    ):
+        mask = np.concatenate([feature_mask("no_long_ts"), extra_keep]) if use_nolong else None
+        w, b, ic = fit_ridge_xy(
+            x_tr_i,
+            y_tr,
+            d_tr,
+            ridge=ridge,
+            min_names=min_names,
+            rank_target=True,
+            feat_winsor=fwinsor,
+            feature_mask_bool=mask,
+        )
+        _emit(
+            {
+                "train_is_cs_ic": ic,
+                "n_train": int(y_tr.size),
+                "val": cs_stats(x_va_i @ w + b, y_va, d_va, min_names=min_names),
+                "test": cs_stats(x_te_i @ w + b, y_te, d_te, min_names=min_names),
+            },
+            tag,
+            "frozen",
+        )
 
     promoted = _frozen(
         cache,

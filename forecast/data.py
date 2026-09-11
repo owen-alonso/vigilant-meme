@@ -59,6 +59,16 @@ FEATURE_NAMES: tuple[str, ...] = (
     "cs_ret_60",
     "cs_volume",
     "cs_vol",
+    "cs_ret1_x_vol",
+    "cs_rank_x_vol",
+    "idio_x_csvol",
+    "cs_ret1_x_idio",
+    "cs_rank_x_idio",
+    "cs_ret1_x_rank",
+    "cs_vol_sq",
+    "idio_sq",
+    "cs_ret1_sq",
+    "cs_rank_sq",
     "traded",
     "staleness",
     "new_session",
@@ -81,6 +91,30 @@ CROSS_SECTION_FEATURES: tuple[str, ...] = (
     "cs_ret_60",
     "cs_volume",
     "cs_vol",
+    "cs_ret1_x_vol",
+    "cs_rank_x_vol",
+    "idio_x_csvol",
+    "cs_ret1_x_idio",
+    "cs_rank_x_idio",
+    "cs_ret1_x_rank",
+    "cs_vol_sq",
+    "idio_sq",
+    "cs_ret1_sq",
+    "cs_rank_sq",
+)
+
+# Pairwise products of CS columns (known at close; not labels).
+CS_PRODUCTS: tuple[tuple[str, str, str], ...] = (
+    ("cs_ret_1", "cs_vol", "cs_ret1_x_vol"),
+    ("cs_rank_1", "cs_vol", "cs_rank_x_vol"),
+    ("idio_sector", "cs_vol", "idio_x_csvol"),
+    ("cs_ret_1", "idio_sector", "cs_ret1_x_idio"),
+    ("cs_rank_1", "idio_sector", "cs_rank_x_idio"),
+    ("cs_ret_1", "cs_rank_1", "cs_ret1_x_rank"),
+    ("cs_vol", "cs_vol", "cs_vol_sq"),
+    ("idio_sector", "idio_sector", "idio_sq"),
+    ("cs_ret_1", "cs_ret_1", "cs_ret1_sq"),
+    ("cs_rank_1", "cs_rank_1", "cs_rank_sq"),
 )
 
 # Same-bar CS z-scores (source column -> feature name). Known at close; not labels.
@@ -371,6 +405,8 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     out["cs_rank_1"] = 0.0
     for _src, dest in CS_ZSCORE_SOURCES:
         out[dest] = 0.0
+    for _a, _b, dest in CS_PRODUCTS:
+        out[dest] = 0.0
 
     # Bars elapsed since the last real print, so stale prices are discountable.
     position = np.arange(len(out), dtype=np.float64)
@@ -607,6 +643,10 @@ def attach_cross_section_features(
                 continue
             vals = keys.map(wide[sym]).to_numpy(dtype=np.float64)
             p[dest] = np.clip(np.where(np.isfinite(vals), vals, 0.0), -clip, clip)
+        for a, b, dest in CS_PRODUCTS:
+            left = p[a].to_numpy(dtype=np.float64) if a in p.columns else np.zeros(len(p))
+            right = p[b].to_numpy(dtype=np.float64) if b in p.columns else np.zeros(len(p))
+            p[dest] = np.clip(left * right, -clip, clip)
         out[sym] = p
     return out
 
