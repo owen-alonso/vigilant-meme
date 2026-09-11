@@ -311,15 +311,24 @@ def trailing_mean_cs_ic(
     return prior.shift(1).rolling(w, min_periods=need).mean()
 
 
-def soft_ic_gross_scale(trail_ic: float, tau: float) -> float:
-    """``clip(trail_IC / τ, 0, 1)``. NaN warmup or τ≤0 → full gross (1)."""
+def soft_ic_gross_scale(
+    trail_ic: float,
+    tau: float,
+    *,
+    s_max: float = 1.0,
+) -> float:
+    """``clip(trail_IC / τ, 0, s_max)``. NaN warmup or τ≤0 → full gross (1).
+
+    ``s_max > 1`` allows a modest lift on strong-IC nights. Not a hard flatten.
+    """
     t = float(tau)
     if not np.isfinite(t) or t <= 1e-12:
         return 1.0
     x = float(trail_ic)
     if not np.isfinite(x):
         return 1.0
-    return float(np.clip(x / t, 0.0, 1.0))
+    hi = float(s_max) if np.isfinite(s_max) and s_max > 0 else 1.0
+    return float(np.clip(x / t, 0.0, hi))
 
 
 def quantile_weights(
@@ -740,6 +749,7 @@ def book_pnl(
     ic_scale_window: int = 0,
     ic_scale_tau: float = 0.0,
     ic_scale_trail: pd.Series | None = None,
+    ic_scale_smax: float = 1.0,
     weekday_mask: str = "always",
     disp_gate_trail: pd.Series | None = None,
     disp_gate_tau: float = float("nan"),
@@ -796,6 +806,9 @@ def book_pnl(
     n_gate_dates = 0
     scale_w = int(ic_scale_window or 0)
     scale_tau = float(ic_scale_tau or 0.0)
+    scale_smax = float(ic_scale_smax) if np.isfinite(float(ic_scale_smax or 0)) else 1.0
+    if scale_smax <= 0:
+        scale_smax = 1.0
     trail_scale = ic_scale_trail
     if trail_scale is None and scale_w > 0 and scale_tau > 1e-12:
         trail_scale = trailing_mean_cs_ic(
@@ -808,6 +821,7 @@ def book_pnl(
     scale_on = trail_scale is not None and scale_tau > 1e-12
     scale_vals: list[float] = []
     n_scale_partial = 0
+    n_scale_boost = 0
     n_scale_flat = 0
     n_scale_dates = 0
     wd_kind = normalize_weekday_mask(weekday_mask)
@@ -895,10 +909,12 @@ def book_pnl(
                 if ts in trail_scale.index
                 else float("nan")
             )
-            s = soft_ic_gross_scale(sval, scale_tau)
+            s = soft_ic_gross_scale(sval, scale_tau, s_max=scale_smax)
             scale_vals.append(s)
-            if s < 1.0 - 1e-12:
+            if abs(s - 1.0) > 1e-12:
                 n_scale_partial += 1
+            if s > 1.0 + 1e-12:
+                n_scale_boost += 1
             if s <= 1e-12:
                 n_scale_flat += 1
             w = w * s
@@ -1119,12 +1135,17 @@ def book_pnl(
         ),
         "ic_scale_window": float(scale_w if scale_on else 0),
         "ic_scale_tau": float(scale_tau if scale_on else 0.0),
+        "ic_scale_smax": float(scale_smax if scale_on else 1.0),
         "mean_ic_scale": (
             float(np.mean(scale_vals)) if scale_vals else float("nan")
         ),
         "ic_scale_n_partial": float(n_scale_partial),
+        "ic_scale_n_boost": float(n_scale_boost),
         "ic_scale_n_flat": float(n_scale_flat),
         "ic_scale_n_dates": float(n_scale_dates),
+        "ic_scale_coverage": (
+            float(1.0 - n_scale_flat / n_scale_dates) if n_scale_dates else float("nan")
+        ),
         "weekday_mask": wd_kind,
         "weekday_n_flat": float(n_wd_flat),
         "weekday_n_dates": float(n_wd_dates),
@@ -1427,8 +1448,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--ic-scale-tau",
         type=float,
         default=0.0,
-        help="s_t = clip(trail_IC / tau, 0, 1). tau>0 required. Used with "
+        help="s_t = clip(trail_IC / tau, 0, s_max). tau>0 required. Used with "
         "--ic-scale-window. Full gross when trail >= tau; flat when trail <= 0.",
+    )
+    p.add_argument(
+        "--ic-scale-smax",
+        type=float,
+        default=1.25,
+        help="cap on soft IC scale (1.0 = no lift; 1.25 = modest strong-IC lift). "
+        "Used with --ic-scale-window. Not the live default.",
     )
     p.add_argument(
         "--weekday-mask",
@@ -1710,6 +1738,7 @@ def main(argv: list[str] | None = None) -> int:
         ic_gate_tau=float(getattr(args, "ic_gate_tau", 0.0) or 0.0),
         ic_scale_window=int(getattr(args, "ic_scale_window", 0) or 0),
         ic_scale_tau=float(getattr(args, "ic_scale_tau", 0.0) or 0.0),
+        ic_scale_smax=float(getattr(args, "ic_scale_smax", 1.25) or 1.25),
         weekday_mask=str(getattr(args, "weekday_mask", "always") or "always"),
         disp_gate_kind=str(getattr(args, "disp_gate_kind", "") or ""),
         disp_gate_window=int(getattr(args, "disp_gate_window", 0) or 0),

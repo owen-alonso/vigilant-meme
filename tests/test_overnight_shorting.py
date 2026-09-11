@@ -296,16 +296,17 @@ def test_decide_ic_scale_promote_is_val_only():
     yes = decide_ic_scale_promote(
         val_always=always,
         val_scaled=scaled,
-        chosen={"window": 20, "tau": 0.04},
+        chosen={"window": 20, "tau": 0.04, "s_max": 1.25},
     )
     assert yes["promote_ic_scale"] is True
     assert yes["gated_on"] == "val"
+    assert yes["spec"]["s_max"] == 1.25
     assert juicy_test["unlevered_net_ir"] > yes["ir_scaled"]
 
     no = decide_ic_scale_promote(
         val_always=always,
         val_scaled={**scaled, "unlevered_net_ir": 1.01},
-        chosen={"window": 20, "tau": 0.04},
+        chosen={"window": 20, "tau": 0.04, "s_max": 1.25},
     )
     assert no["promote_ic_scale"] is False
     assert no["spec"]["window"] == 0

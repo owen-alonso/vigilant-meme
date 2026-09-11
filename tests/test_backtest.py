@@ -477,6 +477,8 @@ def test_soft_ic_gross_scale_clips_and_warmup_is_full():
     assert soft_ic_gross_scale(0.02, 0.04) == pytest.approx(0.5)
     assert soft_ic_gross_scale(-0.01, 0.04) == pytest.approx(0.0)
     assert soft_ic_gross_scale(0.10, 0.04) == pytest.approx(1.0)
+    assert soft_ic_gross_scale(0.10, 0.04, s_max=1.25) == pytest.approx(1.25)
+    assert soft_ic_gross_scale(0.05, 0.04, s_max=1.25) == pytest.approx(1.25)
     assert soft_ic_gross_scale(float("nan"), 0.04) == pytest.approx(1.0)
     assert soft_ic_gross_scale(0.02, 0.0) == pytest.approx(1.0)
 
@@ -513,6 +515,7 @@ def test_ic_scale_halves_gross_when_trail_is_half_tau():
         ic_scale_window=20,
         ic_scale_tau=0.04,
         ic_scale_trail=trail,
+        ic_scale_smax=1.0,
     )
     assert scaled["mean_ic_scale"] == pytest.approx(0.5)
     assert scaled["mean_gross"] == pytest.approx(0.5 * always["mean_gross"], rel=1e-6)

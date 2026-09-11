@@ -147,7 +147,7 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/be
   --holding overnight --live-costs --long-only --sticky-q-enter 0.15 --sticky-q-exit 0.40
 # IDEA 7: soft trailing CS-IC gross scale (TRAIN-chosen; default off)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
-  --holding overnight --live-costs --long-only --ic-scale-window 20 --ic-scale-tau 0.04
+  --holding overnight --live-costs --long-only --ic-scale-window 20 --ic-scale-tau 0.04 --ic-scale-smax 1.25
 """
 
 
@@ -224,6 +224,7 @@ def _run_overnight_book(
     ic_scale_window: int = 0,
     ic_scale_tau: float = 0.0,
     ic_scale_trail: pd.Series | None = None,
+    ic_scale_smax: float = 1.0,
     weekday_mask: str = "always",
     disp_gate_trail: pd.Series | None = None,
     disp_gate_tau: float = float("nan"),
@@ -258,6 +259,7 @@ def _run_overnight_book(
         ic_scale_window=int(ic_scale_window or 0),
         ic_scale_tau=float(ic_scale_tau or 0.0),
         ic_scale_trail=ic_scale_trail,
+        ic_scale_smax=float(ic_scale_smax or 1.0),
         weekday_mask=str(weekday_mask or "always"),
         disp_gate_trail=disp_gate_trail,
         disp_gate_tau=float(disp_gate_tau),
@@ -683,6 +685,7 @@ def _lo_q20_book(
     ic_scale_window: int = 0,
     ic_scale_tau: float = 0.0,
     ic_scale_trail: pd.Series | None = None,
+    ic_scale_smax: float = 1.0,
     weekday_mask: str = "always",
     disp_gate_trail: pd.Series | None = None,
     disp_gate_tau: float = float("nan"),
@@ -711,6 +714,7 @@ def _lo_q20_book(
         ic_scale_window=int(ic_scale_window or 0),
         ic_scale_tau=float(ic_scale_tau or 0.0),
         ic_scale_trail=ic_scale_trail,
+        ic_scale_smax=float(ic_scale_smax or 1.0),
         weekday_mask=str(weekday_mask or "always"),
         disp_gate_trail=disp_gate_trail,
         disp_gate_tau=float(disp_gate_tau),
@@ -864,6 +868,54 @@ def decide_ic_gate_promote(
 
 IC_SCALE_WINDOWS = (20, 60, 120)
 IC_SCALE_TAUS = (0.02, 0.04, 0.06, 0.08)
+IC_SCALE_SMAX = (1.0, 1.25)
+
+
+def _train_ic_scale_taus(
+    pred: pd.DataFrame,
+    y: pd.DataFrame,
+    *,
+    window: int,
+    min_names: int,
+) -> list[float]:
+    """Fixed taus plus TRAIN trail percentiles so s_t can actually vary."""
+    taus = [float(t) for t in IC_SCALE_TAUS]
+    trail = trailing_mean_cs_ic(pred, y, window=int(window), min_names=int(min_names))
+    finite = trail.to_numpy(dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size >= 8:
+        for q in (0.25, 0.50, 0.75):
+            t = float(np.quantile(finite, q))
+            if t > 1e-4:
+                taus.append(t)
+    out: list[float] = []
+    seen: set[float] = set()
+    for t in taus:
+        key = round(float(t), 4)
+        if key > 0 and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def _ic_scale_row(stats: dict[str, Any], *, window: int, tau: float, s_max: float) -> dict[str, Any]:
+    return {
+        "name": f"ic_scale_W{window}_t{tau:.3f}_x{s_max:.2f}",
+        "window": window,
+        "tau": tau,
+        "s_max": s_max,
+        "unlevered_net_ir": stats.get("unlevered_net_ir"),
+        "unlevered_max_dd": stats.get("unlevered_max_dd"),
+        "mean_cost_unlev_bp": stats.get("mean_cost_unlev_bp"),
+        "mean_turnover": stats.get("mean_turnover"),
+        "mean_name_churn": stats.get("mean_name_churn"),
+        "mean_ic_scale": stats.get("mean_ic_scale"),
+        "ic_scale_n_partial": stats.get("ic_scale_n_partial"),
+        "ic_scale_n_boost": stats.get("ic_scale_n_boost"),
+        "ic_scale_n_flat": stats.get("ic_scale_n_flat"),
+        "coverage": stats.get("ic_scale_coverage", stats.get("sticky_coverage")),
+        "n_dates": stats.get("n_dates"),
+    }
 
 
 def fit_ic_scale_on_train(
@@ -872,7 +924,7 @@ def fit_ic_scale_on_train(
     min_names: int,
     vol_target: float = 0.15,
 ) -> dict[str, Any]:
-    """Select soft-scale (W, τ) on TRAIN only. VAL/TEST must never enter."""
+    """Select soft-scale (W, τ, s_max) on TRAIN only. VAL/TEST must never enter."""
     empty = {"rows": [], "chosen": {}, "baseline": {}, "fit_split": "train"}
     if df.empty:
         return empty
@@ -887,30 +939,22 @@ def fit_ic_scale_on_train(
     chosen: dict[str, Any] = {}
     best_ir = -1e18
     for window in IC_SCALE_WINDOWS:
-        for tau in IC_SCALE_TAUS:
-            stats = _lo_q20_book(
-                pred, y, min_names=min_names, vol_target=vol_target,
-                overnight_r=r_on, turnover_z=tz, vol_level=vol,
-                ic_scale_window=window, ic_scale_tau=tau,
-            )
-            ir = _as_float(stats.get("unlevered_net_ir"))
-            row = {
-                "name": f"ic_scale_W{window}_t{tau:.2f}",
-                "window": window,
-                "tau": tau,
-                "unlevered_net_ir": stats.get("unlevered_net_ir"),
-                "unlevered_max_dd": stats.get("unlevered_max_dd"),
-                "mean_cost_unlev_bp": stats.get("mean_cost_unlev_bp"),
-                "mean_ic_scale": stats.get("mean_ic_scale"),
-                "ic_scale_n_partial": stats.get("ic_scale_n_partial"),
-                "ic_scale_n_flat": stats.get("ic_scale_n_flat"),
-            }
-            rows.append(row)
-            if not np.isfinite(ir):
-                continue
-            if ir > best_ir + 1e-12:
-                best_ir = ir
-                chosen = dict(row)
+        taus = _train_ic_scale_taus(pred, y, window=window, min_names=min_names)
+        for tau in taus:
+            for s_max in IC_SCALE_SMAX:
+                stats = _lo_q20_book(
+                    pred, y, min_names=min_names, vol_target=vol_target,
+                    overnight_r=r_on, turnover_z=tz, vol_level=vol,
+                    ic_scale_window=window, ic_scale_tau=tau, ic_scale_smax=s_max,
+                )
+                ir = _as_float(stats.get("unlevered_net_ir"))
+                row = _ic_scale_row(stats, window=window, tau=tau, s_max=s_max)
+                rows.append(row)
+                if not np.isfinite(ir):
+                    continue
+                if ir > best_ir + 1e-12:
+                    best_ir = ir
+                    chosen = dict(row)
     rows.sort(
         key=lambda r: (
             -_as_float(r.get("unlevered_net_ir"), default=-1e9),
@@ -925,12 +969,16 @@ def fit_ic_scale_on_train(
             "unlevered_net_ir": base.get("unlevered_net_ir"),
             "unlevered_max_dd": base.get("unlevered_max_dd"),
             "mean_cost_unlev_bp": base.get("mean_cost_unlev_bp"),
+            "mean_turnover": base.get("mean_turnover"),
+            "mean_name_churn": base.get("mean_name_churn"),
             "mean_ic_scale": 1.0,
+            "coverage": 1.0,
         },
         "fit_split": "train",
         "note": (
-            "s_t = clip(trail_IC_{t-}/τ, 0, 1); trade every night; "
-            "NaN warmup = full gross. Causal dates < t only."
+            "s_t = clip(trail_IC_{t-}/τ, 0, s_max); s_max in {1.00, 1.25}; "
+            "trade every night; NaN warmup = full gross. Causal dates < t only. "
+            "τ grid = fixed + TRAIN trail p25/p50/p75."
         ),
     }
 
@@ -953,18 +1001,19 @@ def decide_ic_scale_promote(
         float(dd_g - dd_on) if np.isfinite(dd_g) and np.isfinite(dd_on) else float("nan")
     )
     have_spec = bool(chosen.get("window"))
+    s_max = _as_float(chosen.get("s_max"), default=1.0)
     ir_ok = bool(np.isfinite(ir_delta) and ir_delta >= LO_IR_LIFT)
     dd_ok = bool(not np.isfinite(dd_delta) or dd_delta >= -LO_DD_TOL)
     promote = bool(have_spec and ir_ok and dd_ok)
     if not have_spec:
         reason = (
-            "NO PROMOTE: TRAIN did not select a soft-scale (W, τ). "
+            "NO PROMOTE: TRAIN did not select a soft-scale (W, τ, s_max). "
             "Keep ungated q20."
         )
     elif not ir_ok:
         reason = (
-            f"NO PROMOTE: IC scale W={chosen.get('window')} τ={chosen.get('tau'):.2f} "
-            f"VAL unlev net IR {ir_g:+.3f} vs ungated {ir_on:+.3f} "
+            f"NO PROMOTE: IC scale W={chosen.get('window')} τ={chosen.get('tau'):.3f} "
+            f"s_max={s_max:.2f} VAL unlev net IR {ir_g:+.3f} vs ungated {ir_on:+.3f} "
             f"(delta {ir_delta:+.3f} < {LO_IR_LIFT:.2f}). Keep ungated q20."
         )
     elif not dd_ok:
@@ -975,9 +1024,9 @@ def decide_ic_scale_promote(
         )
     else:
         reason = (
-            f"PROMOTE IC scale W={chosen.get('window')} τ={chosen.get('tau'):.2f}: "
-            f"VAL IR {ir_g:+.3f} vs {ir_on:+.3f} (delta {ir_delta:+.3f}), "
-            f"max DD {dd_g:+.3f} vs {dd_on:+.3f}, "
+            f"PROMOTE IC scale W={chosen.get('window')} τ={chosen.get('tau'):.3f} "
+            f"s_max={s_max:.2f}: VAL IR {ir_g:+.3f} vs {ir_on:+.3f} "
+            f"(delta {ir_delta:+.3f}), max DD {dd_g:+.3f} vs {dd_on:+.3f}, "
             f"mean_s {_as_float(val_scaled.get('mean_ic_scale')):.2f}."
         )
     return {
@@ -986,9 +1035,13 @@ def decide_ic_scale_promote(
         "fit_split": "train",
         "reason": reason,
         "spec": (
-            {"window": chosen.get("window", 0), "tau": chosen.get("tau", 0.0)}
+            {
+                "window": chosen.get("window", 0),
+                "tau": chosen.get("tau", 0.0),
+                "s_max": float(s_max) if np.isfinite(s_max) else 1.0,
+            }
             if promote
-            else {"window": 0, "tau": 0.0}
+            else {"window": 0, "tau": 0.0, "s_max": 1.0}
         ),
         "chosen": chosen,
         "ir_always": ir_on,
@@ -998,6 +1051,9 @@ def decide_ic_scale_promote(
         "dd_scaled": dd_g,
         "dd_delta": dd_delta,
         "mean_ic_scale": _as_float(val_scaled.get("mean_ic_scale")),
+        "name_churn_always": _as_float(val_always.get("mean_name_churn")),
+        "name_churn_scaled": _as_float(val_scaled.get("mean_name_churn")),
+        "coverage_scaled": _as_float(val_scaled.get("ic_scale_coverage", val_scaled.get("coverage"))),
         "ir_lift": LO_IR_LIFT,
     }
 
@@ -2311,8 +2367,15 @@ def evaluate_overnight_shorting(
     ics_chosen = ics_fit.get("chosen") or {}
     ics_W = int(ics_chosen.get("window") or 0)
     ics_tau = float(ics_chosen.get("tau") or 0.0)
+    ics_smax = float(ics_chosen.get("s_max") or 1.0)
 
-    def _scaled_lo(split: str, hist: tuple[str, ...], window: int, tau: float) -> dict[str, Any]:
+    def _scaled_lo(
+        split: str,
+        hist: tuple[str, ...],
+        window: int,
+        tau: float,
+        s_max: float = 1.0,
+    ) -> dict[str, Any]:
         if frames[split].empty:
             return {}
         pred, y, r_on, tz, vol = _wide_from_frame(frames[split])
@@ -2347,17 +2410,18 @@ def evaluate_overnight_shorting(
             ic_scale_window=window,
             ic_scale_tau=tau,
             ic_scale_trail=trail,
+            ic_scale_smax=s_max,
         )
 
     ics_val_always = _scaled_lo("val", ("train", "val"), 0, 0.0)
     ics_val_scaled = (
-        _scaled_lo("val", ("train", "val"), ics_W, ics_tau)
+        _scaled_lo("val", ("train", "val"), ics_W, ics_tau, ics_smax)
         if ics_W
         else dict(ics_val_always)
     )
     ics_test_always = _scaled_lo("test", ("train", "val", "test"), 0, 0.0)
     ics_test_scaled = (
-        _scaled_lo("test", ("train", "val", "test"), ics_W, ics_tau)
+        _scaled_lo("test", ("train", "val", "test"), ics_W, ics_tau, ics_smax)
         if ics_W
         else dict(ics_test_always)
     )
@@ -2910,21 +2974,27 @@ def _ic_scale_block(payload: dict[str, Any]) -> str:
         f"PROMOTE IC-SCALE? {'YES' if promo.get('promote_ic_scale') else 'NO'}",
         f"  {fit.get('note')}",
         f"  TRAIN chose W={chosen.get('window')} τ={chosen.get('tau')}  "
+        f"s_max={_fmt(chosen.get('s_max'), '.2f')}  "
         f"mean_s {_fmt(chosen.get('mean_ic_scale'), '.2f')}  "
         f"(fit_split={fit.get('fit_split')})",
         f"  {promo.get('reason')}",
         f"  VAL ungated    IR {_fmt(va.get('unlevered_net_ir'), '+.3f')}  "
-        f"maxDD {_fmt(va.get('unlevered_max_dd'), '+.3f')}",
+        f"maxDD {_fmt(va.get('unlevered_max_dd'), '+.3f')}  "
+        f"churn {_fmt(va.get('mean_name_churn'), '.3f')}",
         f"  VAL scaled     IR {_fmt(vs.get('unlevered_net_ir'), '+.3f')}  "
         f"maxDD {_fmt(vs.get('unlevered_max_dd'), '+.3f')}  "
         f"mean_s {_fmt(vs.get('mean_ic_scale'), '.2f')}  "
+        f"churn {_fmt(vs.get('mean_name_churn'), '.3f')}  "
+        f"cover {_fmt(100.0 * _as_float(vs.get('ic_scale_coverage')), '.0f')}%  "
         f"partial {int(_as_float(vs.get('ic_scale_n_partial'), 0.0))}/"
         f"{int(_as_float(vs.get('ic_scale_n_dates'), 0.0))}",
         f"  TEST ungated   IR {_fmt(ta.get('unlevered_net_ir'), '+.3f')}  "
-        f"maxDD {_fmt(ta.get('unlevered_max_dd'), '+.3f')}  (report-only)",
+        f"maxDD {_fmt(ta.get('unlevered_max_dd'), '+.3f')}  "
+        f"churn {_fmt(ta.get('mean_name_churn'), '.3f')}  (report-only)",
         f"  TEST scaled    IR {_fmt(ts.get('unlevered_net_ir'), '+.3f')}  "
         f"maxDD {_fmt(ts.get('unlevered_max_dd'), '+.3f')}  "
-        f"mean_s {_fmt(ts.get('mean_ic_scale'), '.2f')}  (report-only)",
+        f"mean_s {_fmt(ts.get('mean_ic_scale'), '.2f')}  "
+        f"churn {_fmt(ts.get('mean_name_churn'), '.3f')}  (report-only)",
         "  TRAIN (W, τ) grid (fit):",
     ]
     for row in list(fit.get("rows") or [])[:8]:
@@ -2932,7 +3002,8 @@ def _ic_scale_block(payload: dict[str, Any]) -> str:
             f"  {str(row.get('name') or ''):22} "
             f"IR {_fmt(row.get('unlevered_net_ir'), '+.3f')}  "
             f"maxDD {_fmt(row.get('unlevered_max_dd'), '+.3f')}  "
-            f"mean_s {_fmt(row.get('mean_ic_scale'), '.2f')}"
+            f"mean_s {_fmt(row.get('mean_ic_scale'), '.2f')}  "
+            f"churn {_fmt(row.get('mean_name_churn'), '.3f')}"
         )
     return "\n".join(lines)
 
