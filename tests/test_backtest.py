@@ -8,10 +8,13 @@ import pytest
 
 from forecast.backtest import (
     book_pnl,
+    causal_cc_dispersion,
+    causal_disp_series,
     quantile_weights,
     rank_weights,
     resize_long_only,
     trailing_mean_cs_ic,
+    trailing_on_resid_dispersion,
     weekday_mask_is_flat,
 )
 
@@ -311,4 +314,74 @@ def test_softer_vol_target_shrinks_max_dd_not_unlevered_ir():
     assert cool["unlevered_gross_ir"] == pytest.approx(hot["unlevered_gross_ir"], rel=1e-8)
     assert hot["max_dd"] < 0
     assert abs(cool["max_dd"]) == pytest.approx(0.15 * abs(hot["max_dd"]), rel=1e-6)
+
+
+def test_causal_cc_dispersion_ignores_next_open_and_same_day_overnight():
+    dates = pd.bdate_range("2022-01-03", periods=30)
+    names = [f"S{i}" for i in range(8)]
+    close = pd.DataFrame(
+        100.0 + np.linspace(0, 2, 30)[:, None] + np.linspace(0, 1, 8),
+        index=dates,
+        columns=names,
+    )
+    y = pd.DataFrame(0.01, index=dates, columns=names)
+    cc = causal_cc_dispersion(close, min_names=5, window=1)
+    y2 = y.copy()
+    y2.loc[dates[-1]] = 9.0
+    cc2 = causal_disp_series("cc", close=close, resid=y2, window=1, min_names=5)
+    assert np.allclose(cc, cc2, equal_nan=True)
+    on = trailing_on_resid_dispersion(y, window=5, min_names=5)
+    on2 = trailing_on_resid_dispersion(y2, window=5, min_names=5)
+    # Date t's own overnight residual must not enter the t decision.
+    assert np.allclose(on, on2, equal_nan=True)
+    assert not np.isfinite(on.iloc[0])
+
+
+def test_disp_gate_flattens_high_cs_chaos_nights():
+    dates = pd.bdate_range("2022-01-03", periods=40)
+    names = [f"S{i}" for i in range(10)]
+    close = pd.DataFrame(100.0, index=dates, columns=names)
+    rng = np.random.default_rng(0)
+    for i, ts in enumerate(dates):
+        shock = 0.08 if i >= 25 else 0.004
+        r = rng.normal(scale=shock, size=10)
+        close.loc[ts] = close.iloc[max(0, i - 1)] * np.exp(r) if i else 100.0 * np.exp(r)
+    pred = pd.DataFrame(
+        np.tile(np.linspace(-1, 1, 10), (40, 1)), index=dates, columns=names
+    )
+    realized = pred * 0.02
+    trail = causal_cc_dispersion(close, min_names=5, window=1)
+    tau = float(np.nanquantile(trail.to_numpy(dtype=np.float64), 0.7))
+    always = book_pnl(
+        pred,
+        realized,
+        holding="overnight",
+        hold_halflife=0.0,
+        vol_target=0.0,
+        causal_vol=False,
+        long_only=True,
+        min_names=8,
+        round_trip_bps=10.0,
+    )
+    gated = book_pnl(
+        pred,
+        realized,
+        holding="overnight",
+        hold_halflife=0.0,
+        vol_target=0.0,
+        causal_vol=False,
+        long_only=True,
+        min_names=8,
+        round_trip_bps=10.0,
+        disp_gate_trail=trail,
+        disp_gate_tau=tau,
+        disp_gate_kind="cc",
+        disp_gate_window=1,
+        close_px=close,
+    )
+    assert gated["disp_gate_kind"] == "cc"
+    assert gated["disp_gate_n_flat"] > 0
+    assert gated["disp_gate_coverage"] < 1.0
+    assert gated["disp_gate_coverage"] >= 0.30
+    assert gated["n_dates"] == always["n_dates"]
 

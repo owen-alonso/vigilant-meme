@@ -17,6 +17,7 @@ from forecast.shorting import (
     decide_lo_promote,
     decide_weekday_promote,
     decide_sector_promote,
+    decide_disp_gate_promote,
     decide_lo_refine,
     decide_ls_promote,
     evaluate_overnight_shorting,
@@ -354,6 +355,33 @@ def test_decide_sector_promote_is_val_only():
     assert no_lift["promote_sector"] is False
 
 
+def test_decide_disp_gate_promote_is_val_only_and_needs_coverage():
+    always = {"unlevered_net_ir": 1.0, "unlevered_max_dd": -0.20}
+    gated = {
+        "unlevered_net_ir": 1.20,
+        "unlevered_max_dd": -0.18,
+        "disp_gate_coverage": 0.55,
+    }
+    juicy_test = {"unlevered_net_ir": 9.9}
+    yes = decide_disp_gate_promote(
+        val_always=always,
+        val_gated=gated,
+        chosen={"kind": "cc", "window": 1, "tau": 0.02, "q": 0.8},
+    )
+    assert yes["promote_disp_gate"] is True
+    assert yes["gated_on"] == "val"
+    assert yes["fit_split"] == "train"
+    assert juicy_test["unlevered_net_ir"] > yes["ir_gated"]
+
+    thin = decide_disp_gate_promote(
+        val_always=always,
+        val_gated={**gated, "disp_gate_coverage": 0.10},
+        chosen={"kind": "cc", "window": 1, "tau": 0.02, "q": 0.9},
+    )
+    assert thin["promote_disp_gate"] is False
+    assert thin["spec"]["kind"] == ""
+
+
 def test_synthetic_names_map_to_sector_etfs_and_etfs_are_not_book_names():
     assert hedge_symbol_for("S00", sector_residual=True) == "XLK"
     assert hedge_symbol_for("S05", sector_residual=True) == "XLK"
@@ -457,9 +485,12 @@ def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
     assert payload["weekday_promotion"]["gated_on"] == "val"
     assert payload["sector_promotion"]["gated_on"] == "val"
     assert payload["sector_compare"]["n_sector_hedges"] > 0
+    assert payload["disp_gate_fit"]["fit_split"] == "train"
+    assert payload["disp_gate_promotion"]["gated_on"] == "val"
     assert "PROMOTE IC-GATE" in text
     assert "PROMOTE WEEKDAY MASK" in text
     assert "PROMOTE SECTOR-OVERNIGHT" in text
+    assert "PROMOTE DISP-GATE" in text
     assert "VAL LONG-ONLY GRID" in text
     assert "VAL LONG-ONLY REFINE" in text
     assert "LS HAIRCUT EXPERIMENT" in text

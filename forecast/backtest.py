@@ -193,6 +193,94 @@ def weekday_mask_is_flat(ts: Any, mask: str | None) -> bool:
     return False
 
 
+def cs_std_by_date(panel: pd.DataFrame, *, min_names: int = 3) -> pd.Series:
+    """Per-date cross-sectional standard deviation. NaN if too few names."""
+    if panel is None or panel.empty:
+        return pd.Series(dtype=np.float64)
+    p = panel.sort_index()
+    vals: dict[Any, float] = {}
+    need = max(2, int(min_names))
+    for ts in p.index:
+        row = p.loc[ts]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[-1]
+        x = np.asarray(row, dtype=np.float64)
+        x = x[np.isfinite(x)]
+        if x.size < need:
+            vals[ts] = float("nan")
+        else:
+            vals[ts] = float(np.std(x, ddof=1))
+    return pd.Series(vals)
+
+
+def causal_cc_dispersion(
+    close: pd.DataFrame,
+    *,
+    min_names: int = 3,
+    window: int = 1,
+) -> pd.Series:
+    """CS std of close-to-close log returns known at close ``t``.
+
+    Date ``t`` uses ``close_t`` and ``close_{t-1}`` only — never ``open_{t+1}``.
+    ``window>1`` is a trailing mean of that same-day CS std over dates ``≤ t``.
+    """
+    if close is None or close.empty:
+        return pd.Series(dtype=np.float64)
+    c = close.sort_index().astype(np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.log(c.where(c > 0.0)).diff()
+    raw = cs_std_by_date(r, min_names=min_names)
+    w = max(1, int(window))
+    if w == 1:
+        return raw
+    need = max(3, w // 3)
+    return raw.rolling(w, min_periods=need).mean()
+
+
+def trailing_on_resid_dispersion(
+    resid: pd.DataFrame,
+    *,
+    window: int = 20,
+    min_names: int = 3,
+) -> pd.Series:
+    """Trailing CS std of overnight residual ``y``.
+
+    ``y[s]`` realizes at ``open_{s+1}``, so the value at ``t`` uses only
+    dates ``s < t``. Date ``t``'s own overnight never enters.
+    """
+    raw = cs_std_by_date(resid, min_names=min_names)
+    if raw.empty:
+        return raw
+    w = max(1, int(window))
+    need = max(3, w // 3)
+    return raw.shift(1).rolling(w, min_periods=need).mean()
+
+
+def causal_disp_series(
+    kind: str,
+    *,
+    close: pd.DataFrame | None = None,
+    resid: pd.DataFrame | None = None,
+    window: int = 1,
+    min_names: int = 3,
+) -> pd.Series:
+    """Dispatch a causal dispersion proxy. Next open is never a feature."""
+    key = str(kind or "cc").strip().lower().replace("-", "_")
+    if key in ("cc", "close", "ret_1", "cc_trail"):
+        return causal_cc_dispersion(
+            close if close is not None else pd.DataFrame(),
+            min_names=min_names,
+            window=window,
+        )
+    if key in ("on_trail", "on", "resid", "y", "overnight"):
+        return trailing_on_resid_dispersion(
+            resid if resid is not None else pd.DataFrame(),
+            window=window,
+            min_names=min_names,
+        )
+    raise ValueError(f"unknown disp kind {kind!r}; expected cc or on_trail")
+
+
 def trailing_mean_cs_ic(
     pred: pd.DataFrame,
     realized: pd.DataFrame,
@@ -543,6 +631,11 @@ def book_pnl(
     ic_gate_kind: str = "pearson",
     ic_gate_trail: pd.Series | None = None,
     weekday_mask: str = "always",
+    disp_gate_trail: pd.Series | None = None,
+    disp_gate_tau: float = float("nan"),
+    disp_gate_kind: str = "",
+    disp_gate_window: int = 0,
+    close_px: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Cost-aware long-short with optional rank weights, hold smoothing, causal vol.
 
@@ -591,6 +684,22 @@ def book_pnl(
     wd_kind = normalize_weekday_mask(weekday_mask)
     n_wd_flat = 0
     n_wd_dates = 0
+    disp_trail = disp_gate_trail
+    disp_tau = float(disp_gate_tau) if disp_gate_tau is not None else float("nan")
+    disp_kind = str(disp_gate_kind or "").strip().lower()
+    disp_w = int(disp_gate_window or 0)
+    n_disp_flat = 0
+    n_disp_dates = 0
+    if disp_trail is None and disp_kind and np.isfinite(disp_tau):
+        if disp_kind in ("on_trail", "on", "resid", "y", "overnight"):
+            disp_trail = trailing_on_resid_dispersion(
+                realized, window=max(1, disp_w or 20), min_names=int(min_names)
+            )
+        elif close_px is not None and not close_px.empty:
+            disp_trail = causal_cc_dispersion(
+                close_px, min_names=int(min_names), window=max(1, disp_w or 1)
+            )
+    disp_on = disp_trail is not None and np.isfinite(disp_tau)
     for ts in dates:
         pair_all = pd.concat(
             [pred.loc[ts], realized.loc[ts]], axis=1, keys=["p", "r"]
@@ -642,6 +751,17 @@ def book_pnl(
             if weekday_mask_is_flat(ts, wd_kind):
                 w = w * 0.0
                 n_wd_flat += 1
+        if disp_on:
+            n_disp_dates += 1
+            dval = (
+                float(disp_trail.loc[ts])
+                if ts in disp_trail.index
+                else float("nan")
+            )
+            # NaN warmup: leave the date on.
+            if np.isfinite(dval) and dval >= disp_tau:
+                w = w * 0.0
+                n_disp_flat += 1
         r = pair_all["r"].reindex(w.index)
         pair = pd.concat([w, r], axis=1, keys=["w", "r"]).dropna()
         if len(pair) < 2:
@@ -849,6 +969,14 @@ def book_pnl(
             if n_wd_dates
             else (1.0 if wd_kind == "always" else float("nan"))
         ),
+        "disp_gate_kind": disp_kind if disp_on else "",
+        "disp_gate_window": float(disp_w if disp_on else 0),
+        "disp_gate_tau": float(disp_tau) if disp_on else 0.0,
+        "disp_gate_n_flat": float(n_disp_flat),
+        "disp_gate_n_dates": float(n_disp_dates),
+        "disp_gate_coverage": (
+            float(1.0 - n_disp_flat / n_disp_dates) if n_disp_dates else float("nan")
+        ),
         "ex_post_gap_k": float(ex_post_gap_k),
         "mean_long_nav": sides["mean_long_nav"],
         "mean_short_nav": sides["mean_short_nav"],
@@ -902,6 +1030,14 @@ def format_report(stats: dict[str, Any], *, checkpoint: Path, test_start: Any) -
             f"  weekday_mask={stats.get('weekday_mask')} "
             f"cover {100 * float(stats.get('weekday_coverage') or float('nan')):.0f}%"
             if str(stats.get("weekday_mask") or "always") not in ("", "always")
+            else ""
+        )
+        + (
+            f"  disp_gate {stats.get('disp_gate_kind')} "
+            f"W={int(stats.get('disp_gate_window') or 0)} "
+            f"τ={float(stats.get('disp_gate_tau') or 0):.4f} "
+            f"cover {100 * float(stats.get('disp_gate_coverage') or float('nan')):.0f}%"
+            if str(stats.get("disp_gate_kind") or "")
             else ""
         ),
         f"  round-trip  {stats.get('round_trip_bps', float('nan')):.1f} bp"
@@ -1105,6 +1241,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="causal calendar mask using weekday(t) at close t: always | "
         "flat_friday (no weekend gap) | weekend_only (Friday overnight only) | "
         "flat_monday (no Mon close→Tue open). Default always (off).",
+    )
+    p.add_argument(
+        "--disp-gate-kind",
+        default="",
+        choices=("", "cc", "on_trail"),
+        help="causal CS-dispersion stress gate: cc = same-day close-to-close "
+        "CS std (dates ≤ t); on_trail = trailing overnight residual CS std "
+        "(dates < t only). Empty = off.",
+    )
+    p.add_argument(
+        "--disp-gate-window",
+        type=int,
+        default=1,
+        help="trailing sessions for --disp-gate-kind (1 = same-day cc). "
+        "on_trail always excludes date t.",
+    )
+    p.add_argument(
+        "--disp-gate-tau",
+        type=float,
+        default=float("nan"),
+        help="flat overnight when causal dispersion >= this (NaN = off).",
     )
     p.add_argument(
         "--locate-adv-pctile",
@@ -1341,6 +1498,10 @@ def main(argv: list[str] | None = None) -> int:
         ic_gate_window=int(getattr(args, "ic_gate_window", 0) or 0),
         ic_gate_tau=float(getattr(args, "ic_gate_tau", 0.0) or 0.0),
         weekday_mask=str(getattr(args, "weekday_mask", "always") or "always"),
+        disp_gate_kind=str(getattr(args, "disp_gate_kind", "") or ""),
+        disp_gate_window=int(getattr(args, "disp_gate_window", 0) or 0),
+        disp_gate_tau=float(getattr(args, "disp_gate_tau", float("nan"))),
+        close_px=panel_feature_wide(panels, "close", pred) if len(pred) else None,
     )
     stats = book_pnl(pred, realized, long_only=args.long_only, **book_kw)
     print(format_report(stats, checkpoint=ckpt_path, test_start=start))

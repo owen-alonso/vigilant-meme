@@ -126,6 +126,9 @@ python -m forecast.training --universe liquid --interval daily --skip-only \
   --checkpoint-dir checkpoints/forecast_ridge_overnight_spy
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight_spy/best.pt \
   --holding overnight --live-costs --long-only
+# causal CS-dispersion stress gate (TRAIN-fit kind/W/τ; default off)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --long-only --disp-gate-kind cc --disp-gate-window 1 --disp-gate-tau 0.02
 # harsh auction stress
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --cost-bundle harsh

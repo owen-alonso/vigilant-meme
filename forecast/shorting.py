@@ -26,7 +26,7 @@ from forecast.accuracy import (
     overnight_skip_data_config,
     score_eval_frame,
 )
-from forecast.backtest import book_pnl, trailing_mean_cs_ic
+from forecast.backtest import book_pnl, causal_disp_series, trailing_mean_cs_ic
 from forecast.data import build_datasets
 from forecast.overnight import (
     LIVE_BUNDLE,
@@ -125,6 +125,11 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight_sp
   --holding overnight --live-costs --long-only
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only
+# causal CS-dispersion stress gate (TRAIN-fit kind/W/τ; default off until VAL promote)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
+  --holding overnight --live-costs --long-only --disp-gate-kind cc --disp-gate-window 1 --disp-gate-tau 0.02
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
+  --holding overnight --live-costs --long-only --disp-gate-kind on_trail --disp-gate-window 20 --disp-gate-tau 1.0
 """
 
 
@@ -199,6 +204,11 @@ def _run_overnight_book(
     ic_gate_tau: float = 0.0,
     ic_gate_trail: pd.Series | None = None,
     weekday_mask: str = "always",
+    disp_gate_trail: pd.Series | None = None,
+    disp_gate_tau: float = float("nan"),
+    disp_gate_kind: str = "",
+    disp_gate_window: int = 0,
+    close_px: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     stats = book_pnl(
         pred,
@@ -222,6 +232,11 @@ def _run_overnight_book(
         ic_gate_tau=float(ic_gate_tau or 0.0),
         ic_gate_trail=ic_gate_trail,
         weekday_mask=str(weekday_mask or "always"),
+        disp_gate_trail=disp_gate_trail,
+        disp_gate_tau=float(disp_gate_tau),
+        disp_gate_kind=str(disp_gate_kind or ""),
+        disp_gate_window=int(disp_gate_window or 0),
+        close_px=close_px,
         overnight_r=overnight_r,
         turnover_z=turnover_z,
         vol_level=vol_level,
@@ -636,6 +651,11 @@ def _lo_q20_book(
     ic_gate_tau: float = 0.0,
     ic_gate_trail: pd.Series | None = None,
     weekday_mask: str = "always",
+    disp_gate_trail: pd.Series | None = None,
+    disp_gate_tau: float = float("nan"),
+    disp_gate_kind: str = "",
+    disp_gate_window: int = 0,
+    close_px: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     return _run_overnight_book(
         pred,
@@ -653,6 +673,11 @@ def _lo_q20_book(
         ic_gate_tau=float(ic_gate_tau),
         ic_gate_trail=ic_gate_trail,
         weekday_mask=str(weekday_mask or "always"),
+        disp_gate_trail=disp_gate_trail,
+        disp_gate_tau=float(disp_gate_tau),
+        disp_gate_kind=str(disp_gate_kind or ""),
+        disp_gate_window=int(disp_gate_window or 0),
+        close_px=close_px,
     )
 
 
@@ -791,6 +816,211 @@ def decide_ic_gate_promote(
         "dd_delta": dd_delta,
         "coverage": cover,
         "cover_min_val": IC_GATE_COVER_VAL,
+        "ir_lift": LO_IR_LIFT,
+    }
+
+
+DISP_SPECS = (("cc", 1), ("cc", 20), ("on_trail", 20))
+DISP_QS = (0.70, 0.80, 0.90)
+DISP_COVER_TRAIN = 0.40
+DISP_COVER_VAL = 0.30
+
+
+def _close_wide(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "close" not in df.columns:
+        return pd.DataFrame()
+    return frame_to_wide(df, "close")
+
+
+def _hist_disp_series(
+    frames: dict[str, pd.DataFrame],
+    hist: tuple[str, ...],
+    kind: str,
+    window: int,
+    min_names: int,
+) -> pd.Series:
+    parts_c = [
+        _close_wide(frames[s])
+        for s in hist
+        if s in frames and not frames[s].empty
+    ]
+    parts_y = [
+        frame_to_wide(frames[s], "y")
+        for s in hist
+        if s in frames and not frames[s].empty
+    ]
+    close = (
+        pd.concat(parts_c).sort_index().groupby(level=0).last() if parts_c else None
+    )
+    resid = (
+        pd.concat(parts_y).sort_index().groupby(level=0).last() if parts_y else None
+    )
+    return causal_disp_series(
+        kind, close=close, resid=resid, window=int(window), min_names=int(min_names)
+    )
+
+
+def fit_disp_gate_on_train(
+    df: pd.DataFrame,
+    *,
+    min_names: int,
+    vol_target: float = 0.15,
+) -> dict[str, Any]:
+    """Select (kind, W, τ) on TRAIN only. VAL/TEST must never enter."""
+    empty = {"rows": [], "chosen": {}, "baseline": {}, "fit_split": "train"}
+    if df.empty:
+        return empty
+    pred, y, r_on, tz, vol = _wide_from_frame(df)
+    if pred.empty or pred.shape[1] < 2:
+        return empty
+    close = _close_wide(df)
+    base = _lo_q20_book(
+        pred, y, min_names=min_names, vol_target=vol_target,
+        overnight_r=r_on, turnover_z=tz, vol_level=vol,
+    )
+    rows: list[dict[str, Any]] = []
+    chosen: dict[str, Any] = {}
+    best_ir = -1e18
+    for kind, window in DISP_SPECS:
+        series = causal_disp_series(
+            kind, close=close, resid=y, window=window, min_names=min_names
+        )
+        finite = series.to_numpy(dtype=np.float64)
+        finite = finite[np.isfinite(finite)]
+        if finite.size < 8:
+            continue
+        for q in DISP_QS:
+            tau = float(np.quantile(finite, q))
+            stats = _lo_q20_book(
+                pred, y, min_names=min_names, vol_target=vol_target,
+                overnight_r=r_on, turnover_z=tz, vol_level=vol,
+                disp_gate_trail=series, disp_gate_tau=tau,
+                disp_gate_kind=kind, disp_gate_window=window,
+            )
+            cover = _as_float(stats.get("disp_gate_coverage"))
+            ir = _as_float(stats.get("unlevered_net_ir"))
+            row = {
+                "name": f"disp_{kind}_W{window}_q{int(100 * q)}",
+                "kind": kind,
+                "window": window,
+                "q": q,
+                "tau": tau,
+                "unlevered_net_ir": stats.get("unlevered_net_ir"),
+                "unlevered_max_dd": stats.get("unlevered_max_dd"),
+                "mean_cost_unlev_bp": stats.get("mean_cost_unlev_bp"),
+                "disp_gate_coverage": cover,
+                "disp_gate_n_flat": stats.get("disp_gate_n_flat"),
+            }
+            rows.append(row)
+            if (not np.isfinite(ir)) or (not np.isfinite(cover)):
+                continue
+            if cover < DISP_COVER_TRAIN:
+                continue
+            if ir > best_ir + 1e-12:
+                best_ir = ir
+                chosen = dict(row)
+    rows.sort(
+        key=lambda r: (
+            -_as_float(r.get("unlevered_net_ir"), default=-1e9),
+            str(r.get("name")),
+        )
+    )
+    return {
+        "rows": rows,
+        "chosen": chosen,
+        "baseline": {
+            "name": "live_long_only_q20",
+            "unlevered_net_ir": base.get("unlevered_net_ir"),
+            "unlevered_max_dd": base.get("unlevered_max_dd"),
+            "mean_cost_unlev_bp": base.get("mean_cost_unlev_bp"),
+            "disp_gate_coverage": 1.0,
+        },
+        "fit_split": "train",
+        "cover_min_train": DISP_COVER_TRAIN,
+        "note": (
+            "cc = same-day close-to-close CS std (dates ≤ t); "
+            "on_trail = overnight residual CS std on dates < t only"
+        ),
+    }
+
+
+def decide_disp_gate_promote(
+    *,
+    val_always: dict[str, Any],
+    val_gated: dict[str, Any],
+    chosen: dict[str, Any],
+) -> dict[str, Any]:
+    """VAL-only vs ungated q20. TEST never enters."""
+    ir_on = _as_float(val_always.get("unlevered_net_ir"))
+    ir_g = _as_float(val_gated.get("unlevered_net_ir"))
+    dd_on = _as_float(val_always.get("unlevered_max_dd"))
+    dd_g = _as_float(val_gated.get("unlevered_max_dd"))
+    cover = _as_float(val_gated.get("disp_gate_coverage"))
+    ir_delta = (
+        float(ir_g - ir_on) if np.isfinite(ir_g) and np.isfinite(ir_on) else float("nan")
+    )
+    dd_delta = (
+        float(dd_g - dd_on) if np.isfinite(dd_g) and np.isfinite(dd_on) else float("nan")
+    )
+    have_spec = bool(chosen.get("kind")) and np.isfinite(_as_float(chosen.get("tau")))
+    ir_ok = bool(np.isfinite(ir_delta) and ir_delta >= LO_IR_LIFT)
+    dd_ok = bool(not np.isfinite(dd_delta) or dd_delta >= -LO_DD_TOL)
+    cover_ok = bool(np.isfinite(cover) and cover >= DISP_COVER_VAL)
+    promote = bool(have_spec and ir_ok and dd_ok and cover_ok)
+    kind = chosen.get("kind")
+    window = chosen.get("window")
+    tau = chosen.get("tau")
+    if not have_spec:
+        reason = (
+            "NO PROMOTE: TRAIN did not select a dispersion (kind, W, τ) with "
+            f"coverage >= {DISP_COVER_TRAIN:.0%}. Keep ungated q20."
+        )
+    elif not cover_ok:
+        reason = (
+            f"NO PROMOTE: TRAIN chose {kind} W={window} τ={tau} "
+            f"but VAL coverage {100 * cover:.0f}% < {100 * DISP_COVER_VAL:.0f}% "
+            "(catastrophic flatten). Keep ungated q20."
+        )
+    elif not ir_ok:
+        reason = (
+            f"NO PROMOTE: disp gate {kind} W={window} τ={_fmt(tau, '.4f')} "
+            f"VAL unlev net IR {ir_g:+.3f} vs ungated {ir_on:+.3f} "
+            f"(delta {ir_delta:+.3f} < {LO_IR_LIFT:.2f}). Keep ungated q20."
+        )
+    elif not dd_ok:
+        reason = (
+            f"NO PROMOTE: disp gate IR lift {ir_delta:+.3f} but VAL max DD "
+            f"{dd_g:+.3f} vs ungated {dd_on:+.3f} exceeds {LO_DD_TOL:.2f}. "
+            "Keep ungated q20."
+        )
+    else:
+        reason = (
+            f"PROMOTE disp gate {kind} W={window} τ={_fmt(tau, '.4f')}: "
+            f"VAL IR {ir_g:+.3f} vs {ir_on:+.3f} (delta {ir_delta:+.3f}), "
+            f"max DD {dd_g:+.3f} vs {dd_on:+.3f}, coverage {100 * cover:.0f}%."
+        )
+    return {
+        "promote_disp_gate": promote,
+        "gated_on": "val",
+        "fit_split": "train",
+        "reason": reason,
+        "spec": {
+            "kind": kind,
+            "window": window,
+            "tau": tau,
+            "q": chosen.get("q"),
+        }
+        if promote
+        else {"kind": "", "window": 0, "tau": 0.0, "q": 0.0},
+        "chosen": chosen,
+        "ir_always": ir_on,
+        "ir_gated": ir_g,
+        "ir_delta": ir_delta,
+        "dd_always": dd_on,
+        "dd_gated": dd_g,
+        "dd_delta": dd_delta,
+        "coverage": cover,
+        "cover_min_val": DISP_COVER_VAL,
         "ir_lift": LO_IR_LIFT,
     }
 
@@ -1318,6 +1548,52 @@ def evaluate_overnight_shorting(
     ic_promo = decide_ic_gate_promote(
         val_always=ic_val_always, val_gated=ic_val_gated, chosen=ic_chosen
     )
+    disp_fit = fit_disp_gate_on_train(
+        frames["train"], min_names=min_names, vol_target=vol_target
+    )
+    disp_chosen = disp_fit.get("chosen") or {}
+    disp_kind = str(disp_chosen.get("kind") or "")
+    disp_W = int(disp_chosen.get("window") or 0)
+    disp_tau = float(disp_chosen.get("tau") or float("nan"))
+
+    def _disp_lo(split: str, hist: tuple[str, ...], kind: str, window: int, tau: float) -> dict[str, Any]:
+        if frames[split].empty:
+            return {}
+        pred, y, r_on, tz, vol = _wide_from_frame(frames[split])
+        if pred.empty or pred.shape[1] < 2:
+            return {}
+        trail = None
+        if kind:
+            trail = _hist_disp_series(frames, hist, kind, window, min_names)
+        return _lo_q20_book(
+            pred,
+            y,
+            min_names=min_names,
+            vol_target=vol_target,
+            overnight_r=r_on,
+            turnover_z=tz,
+            vol_level=vol,
+            disp_gate_trail=trail,
+            disp_gate_tau=tau,
+            disp_gate_kind=kind,
+            disp_gate_window=window,
+        )
+
+    disp_val_always = _disp_lo("val", ("train", "val"), "", 0, float("nan"))
+    disp_val_gated = (
+        _disp_lo("val", ("train", "val"), disp_kind, disp_W, disp_tau)
+        if disp_kind
+        else dict(disp_val_always)
+    )
+    disp_test_always = _disp_lo("test", ("train", "val", "test"), "", 0, float("nan"))
+    disp_test_gated = (
+        _disp_lo("test", ("train", "val", "test"), disp_kind, disp_W, disp_tau)
+        if disp_kind
+        else dict(disp_test_always)
+    )
+    disp_promo = decide_disp_gate_promote(
+        val_always=disp_val_always, val_gated=disp_val_gated, chosen=disp_chosen
+    )
     wd_val = weekday_mask_grid(
         frames["val"], min_names=min_names, vol_target=vol_target
     )
@@ -1496,6 +1772,12 @@ def evaluate_overnight_shorting(
         "ic_gate_val_gated": ic_val_gated,
         "ic_gate_test_always": ic_test_always,
         "ic_gate_test_gated": ic_test_gated,
+        "disp_gate_fit": disp_fit,
+        "disp_gate_promotion": disp_promo,
+        "disp_gate_val_always": disp_val_always,
+        "disp_gate_val_gated": disp_val_gated,
+        "disp_gate_test_always": disp_test_always,
+        "disp_gate_test_gated": disp_test_gated,
         "weekday_val_grid": wd_val,
         "weekday_test_grid": wd_test,
         "weekday_promotion": wd_promo,
@@ -1534,6 +1816,8 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
         f"  {(payload.get('lo_refine_promotion') or {}).get('reason')}",
         "",
         _ic_gate_block(payload),
+        "",
+        _disp_gate_block(payload),
         "",
         _weekday_block(payload),
         "",
@@ -1616,6 +1900,43 @@ def _ic_gate_block(payload: dict[str, Any]) -> str:
         f"  TEST gated     IR {_fmt(tg.get('unlevered_net_ir'), '+.3f')}  "
         f"maxDD {_fmt(tg.get('unlevered_max_dd'), '+.3f')}  "
         f"cover {_cov(tg.get('ic_gate_coverage'))}  (report-only)",
+    ]
+    return "\n".join(lines)
+
+
+def _disp_gate_block(payload: dict[str, Any]) -> str:
+    promo = payload.get("disp_gate_promotion") or {}
+    fit = payload.get("disp_gate_fit") or {}
+    chosen = fit.get("chosen") or promo.get("chosen") or {}
+    va = payload.get("disp_gate_val_always") or {}
+    vg = payload.get("disp_gate_val_gated") or {}
+    ta = payload.get("disp_gate_test_always") or {}
+    tg = payload.get("disp_gate_test_gated") or {}
+
+    def _cov(value: Any) -> str:
+        x = _as_float(value)
+        return "nan%" if not np.isfinite(x) else f"{100.0 * x:.0f}%"
+
+    lines = [
+        f"PROMOTE DISP-GATE? {'YES' if promo.get('promote_disp_gate') else 'NO'}",
+        f"  {fit.get('note')}",
+        f"  TRAIN chose {chosen.get('kind')} W={chosen.get('window')} "
+        f"q={chosen.get('q')} τ={_fmt(chosen.get('tau'), '.4f')}  "
+        f"cover {_cov(chosen.get('disp_gate_coverage'))}  "
+        f"(fit_split={fit.get('fit_split')})",
+        f"  {promo.get('reason')}",
+        f"  VAL ungated    IR {_fmt(va.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(va.get('unlevered_max_dd'), '+.3f')}",
+        f"  VAL gated      IR {_fmt(vg.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(vg.get('unlevered_max_dd'), '+.3f')}  "
+        f"cover {_cov(vg.get('disp_gate_coverage'))}  "
+        f"flat {int(_as_float(vg.get('disp_gate_n_flat'), 0.0))}/"
+        f"{int(_as_float(vg.get('disp_gate_n_dates'), 0.0))}",
+        f"  TEST ungated   IR {_fmt(ta.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(ta.get('unlevered_max_dd'), '+.3f')}  (report-only)",
+        f"  TEST gated     IR {_fmt(tg.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(tg.get('unlevered_max_dd'), '+.3f')}  "
+        f"cover {_cov(tg.get('disp_gate_coverage'))}  (report-only)",
     ]
     return "\n".join(lines)
 
