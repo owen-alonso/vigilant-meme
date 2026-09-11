@@ -344,6 +344,102 @@ def quantile_weights(
     return w
 
 
+def as_quantile_frac(value: float) -> float:
+    """Accept 0.20 or 20 (percent). Non-positive / non-finite → 0 (off)."""
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(x) or x <= 0:
+        return 0.0
+    if x > 1.0:
+        x = x / 100.0
+    return float(x)
+
+
+def sticky_long_step(
+    scores: pd.Series,
+    held: set[Any] | frozenset[Any] | None,
+    *,
+    q_enter: float,
+    q_exit: float,
+    min_names: int = 8,
+) -> tuple[pd.Series, set[Any]]:
+    """Equal-weight sticky longs: enter top ``q_enter``, hold while in top ``q_exit``.
+
+    Ranks use only today's scores (known at close t). ``held`` is yesterday's
+    active set. Empty set → flat that night (caller keeps the date in IR).
+    """
+    s = scores.dropna()
+    w = pd.Series(0.0, index=s.index, dtype=np.float64)
+    n = int(s.size)
+    if n < max(2, int(min_names)):
+        return w, set()
+    qe = as_quantile_frac(q_enter)
+    qx = as_quantile_frac(q_exit)
+    if qe <= 0 or qx <= qe:
+        return w, set()
+    qe = min(0.49, max(0.05, qe))
+    qx = min(0.90, max(qe + 1e-9, qx))
+    k_enter = max(1, int(math.floor(n * qe)))
+    k_exit = max(k_enter + 1, int(math.floor(n * qx)))
+    order = s.sort_values()
+    enter = set(order.index[-k_enter:])
+    keep_band = set(order.index[-k_exit:])
+    prev = set(held or ()) & set(s.index)
+    new_held = (prev & keep_band) | enter
+    if not new_held:
+        return w, set()
+    wt = 1.0 / float(len(new_held))
+    for name in new_held:
+        w.loc[name] = wt
+    return w, new_held
+
+
+def last_sticky_held(
+    pred: pd.DataFrame,
+    *,
+    q_enter: float,
+    q_exit: float,
+    min_names: int,
+) -> set[Any]:
+    """Walk scores date-by-date (causal). Used to warm VAL/TEST from prior splits."""
+    held: set[Any] = set()
+    if pred is None or pred.empty:
+        return held
+    for ts in pred.index:
+        row = pred.loc[ts]
+        if int(row.dropna().size) < int(min_names):
+            continue
+        _w, held = sticky_long_step(
+            row, held, q_enter=q_enter, q_exit=q_exit, min_names=min_names
+        )
+    return held
+
+
+def name_membership_churn(weights: pd.DataFrame) -> dict[str, float]:
+    """Night-to-night long-set Hamming fraction (not flatten one-way cost turn)."""
+    empty = {
+        "mean_name_churn": float("nan"),
+        "mean_n_held": float("nan"),
+        "sticky_coverage": float("nan"),
+    }
+    if weights is None or weights.empty:
+        return empty
+    held = weights.gt(1e-12)
+    prev = held.shift(1)
+    prev = prev.where(prev.notna(), False).astype(bool)
+    delta = (held.astype("int8") - prev.astype("int8")).abs().sum(axis=1)
+    n_univ = float(max(1, int(weights.shape[1])))
+    n_held = held.sum(axis=1).astype(np.float64)
+    invested = n_held > 0
+    return {
+        "mean_name_churn": float((delta.astype(np.float64) / n_univ).mean()),
+        "mean_n_held": float(n_held.mean()) if len(n_held) else float("nan"),
+        "sticky_coverage": float(invested.mean()) if len(invested) else float("nan"),
+    }
+
+
 def rank_weights(scores: pd.Series, *, long_only: bool = False) -> pd.Series:
     """Dollar-neutral weights from centered CS rank (softer than 20% tails)."""
     s = scores.dropna()
@@ -636,6 +732,9 @@ def book_pnl(
     disp_gate_kind: str = "",
     disp_gate_window: int = 0,
     close_px: pd.DataFrame | None = None,
+    sticky_q_enter: float = 0.0,
+    sticky_q_exit: float = 0.0,
+    sticky_held0: set[Any] | frozenset[Any] | None = None,
 ) -> dict[str, Any]:
     """Cost-aware long-short with optional rank weights, hold smoothing, causal vol.
 
@@ -700,6 +799,10 @@ def book_pnl(
                 close_px, min_names=int(min_names), window=max(1, disp_w or 1)
             )
     disp_on = disp_trail is not None and np.isfinite(disp_tau)
+    sticky_qe = as_quantile_frac(sticky_q_enter)
+    sticky_qx = as_quantile_frac(sticky_q_exit)
+    sticky_on = bool(long_only and sticky_qe > 0 and sticky_qx > sticky_qe)
+    sticky_held: set[Any] = set(sticky_held0 or ()) if sticky_on else set()
     for ts in dates:
         pair_all = pd.concat(
             [pred.loc[ts], realized.loc[ts]], axis=1, keys=["p", "r"]
@@ -716,12 +819,21 @@ def book_pnl(
                 pair_all = pair_all.loc[finite & (tzrow >= cut)]
         if len(pair_all) < int(min_names):
             continue
-        w = date_weights(
-            pair_all["p"],
-            weighting=weighting,
-            quantile=quantile,
-            long_only=long_only,
-        )
+        if sticky_on:
+            w, sticky_held = sticky_long_step(
+                pair_all["p"],
+                sticky_held,
+                q_enter=sticky_qe,
+                q_exit=sticky_qx,
+                min_names=int(min_names),
+            )
+        else:
+            w = date_weights(
+                pair_all["p"],
+                weighting=weighting,
+                quantile=quantile,
+                long_only=long_only,
+            )
         if long_only and (
             str(long_size or "equal").lower() != "equal" or float(conf_pctile) > 0
         ):
@@ -977,6 +1089,9 @@ def book_pnl(
         "disp_gate_coverage": (
             float(1.0 - n_disp_flat / n_disp_dates) if n_disp_dates else float("nan")
         ),
+        **name_membership_churn(w_panel),
+        "sticky_q_enter": float(sticky_qe if sticky_on else 0.0),
+        "sticky_q_exit": float(sticky_qx if sticky_on else 0.0),
         "ex_post_gap_k": float(ex_post_gap_k),
         "mean_long_nav": sides["mean_long_nav"],
         "mean_short_nav": sides["mean_short_nav"],
@@ -1038,6 +1153,14 @@ def format_report(stats: dict[str, Any], *, checkpoint: Path, test_start: Any) -
             f"τ={float(stats.get('disp_gate_tau') or 0):.4f} "
             f"cover {100 * float(stats.get('disp_gate_coverage') or float('nan')):.0f}%"
             if str(stats.get("disp_gate_kind") or "")
+            else ""
+        )
+        + (
+            f"  sticky enter={100 * float(stats.get('sticky_q_enter') or 0):.0f}% "
+            f"exit={100 * float(stats.get('sticky_q_exit') or 0):.0f}% "
+            f"name_churn {float(stats.get('mean_name_churn') or float('nan')):.3f} "
+            f"cover {100 * float(stats.get('sticky_coverage') or float('nan')):.0f}%"
+            if float(stats.get("sticky_q_enter") or 0) > 0
             else ""
         ),
         f"  round-trip  {stats.get('round_trip_bps', float('nan')):.1f} bp"
@@ -1262,6 +1385,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=float("nan"),
         help="flat overnight when causal dispersion >= this (NaN = off).",
+    )
+    p.add_argument(
+        "--sticky-q-enter",
+        type=float,
+        default=0.0,
+        help="long-only hysteresis: enter when rank is in the top this quantile "
+        "(0=off, 0.15 or 15 = top 15%%). TRAIN/VAL gated in overnight_shorting; "
+        "not the live default.",
+    )
+    p.add_argument(
+        "--sticky-q-exit",
+        type=float,
+        default=0.0,
+        help="long-only hysteresis: keep a prior long until rank falls below "
+        "this quantile (must exceed --sticky-q-enter). 0=off.",
     )
     p.add_argument(
         "--locate-adv-pctile",
@@ -1502,6 +1640,8 @@ def main(argv: list[str] | None = None) -> int:
         disp_gate_window=int(getattr(args, "disp_gate_window", 0) or 0),
         disp_gate_tau=float(getattr(args, "disp_gate_tau", float("nan"))),
         close_px=panel_feature_wide(panels, "close", pred) if len(pred) else None,
+        sticky_q_enter=float(getattr(args, "sticky_q_enter", 0.0) or 0.0),
+        sticky_q_exit=float(getattr(args, "sticky_q_exit", 0.0) or 0.0),
     )
     stats = book_pnl(pred, realized, long_only=args.long_only, **book_kw)
     print(format_report(stats, checkpoint=ckpt_path, test_start=start))

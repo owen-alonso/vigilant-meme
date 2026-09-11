@@ -10,9 +10,11 @@ from forecast.backtest import (
     book_pnl,
     causal_cc_dispersion,
     causal_disp_series,
+    name_membership_churn,
     quantile_weights,
     rank_weights,
     resize_long_only,
+    sticky_long_step,
     trailing_mean_cs_ic,
     trailing_on_resid_dispersion,
     weekday_mask_is_flat,
@@ -384,4 +386,87 @@ def test_disp_gate_flattens_high_cs_chaos_nights():
     assert gated["disp_gate_coverage"] < 1.0
     assert gated["disp_gate_coverage"] >= 0.30
     assert gated["n_dates"] == always["n_dates"]
+
+
+def test_sticky_long_step_keeps_mid_rank_and_drops_below_exit():
+    names = [f"S{i}" for i in range(10)]
+    scores = pd.Series(np.linspace(-1.0, 1.0, 10), index=names)
+    # top 20% = S8,S9; top 40% = S6..S9
+    w0, held0 = sticky_long_step(
+        scores, set(), q_enter=0.20, q_exit=0.40, min_names=8
+    )
+    assert set(held0) == {"S8", "S9"}
+    assert w0[w0 > 0].sum() == pytest.approx(1.0)
+
+    # S7 is 4th from top (in exit band, not enter). Keep if already held.
+    w1, held1 = sticky_long_step(
+        scores, {"S7"}, q_enter=0.20, q_exit=0.40, min_names=8
+    )
+    assert "S7" in held1 and "S8" in held1 and "S9" in held1
+    assert w1["S7"] == pytest.approx(1.0 / 3.0)
+
+    # S5 is 6th from top — below exit band. Drop.
+    w2, held2 = sticky_long_step(
+        scores, {"S5"}, q_enter=0.20, q_exit=0.40, min_names=8
+    )
+    assert "S5" not in held2
+    assert set(held2) == {"S8", "S9"}
+    assert float(w2.get("S5", 0.0)) == pytest.approx(0.0)
+
+
+def test_sticky_book_churns_less_than_q20_rebuild_when_ranks_persist():
+    dates = pd.bdate_range("2022-01-03", periods=40)
+    names = [f"S{i}" for i in range(10)]
+    # Slow rank rotation: each name stays near its rank most nights.
+    base = np.linspace(-1.0, 1.0, 10)
+    pred = pd.DataFrame(
+        [base + 0.05 * np.sin(i / 4.0 + np.linspace(0, 0.4, 10)) for i in range(40)],
+        index=dates,
+        columns=names,
+    )
+    realized = pred * 0.02
+    q20 = book_pnl(
+        pred,
+        realized,
+        holding="overnight",
+        hold_halflife=0.0,
+        vol_target=0.0,
+        causal_vol=False,
+        long_only=True,
+        min_names=8,
+        round_trip_bps=10.0,
+    )
+    sticky = book_pnl(
+        pred,
+        realized,
+        holding="overnight",
+        hold_halflife=0.0,
+        vol_target=0.0,
+        causal_vol=False,
+        long_only=True,
+        min_names=8,
+        round_trip_bps=10.0,
+        sticky_q_enter=0.15,
+        sticky_q_exit=0.40,
+    )
+    assert sticky["sticky_q_enter"] == pytest.approx(0.15)
+    assert sticky["mean_name_churn"] < q20["mean_name_churn"]
+    assert sticky["sticky_coverage"] >= 0.30
+    assert sticky["n_dates"] == q20["n_dates"]
+    # Overnight flatten still charges ~1.0 one-way; name churn is the diagnostic.
+    assert q20["mean_turnover"] == pytest.approx(1.0, abs=0.05)
+
+
+def test_name_membership_churn_is_zero_when_holdings_never_change():
+    dates = pd.bdate_range("2022-01-03", periods=5)
+    w = pd.DataFrame(
+        [[0.5, 0.5, 0.0, 0.0]] * 5,
+        index=dates,
+        columns=["A", "B", "C", "D"],
+    )
+    out = name_membership_churn(w)
+    # First night: enter A,B from empty → 2/4. Later nights: 0.
+    assert out["mean_name_churn"] == pytest.approx((0.5 + 0 + 0 + 0 + 0) / 5)
+    assert out["mean_n_held"] == pytest.approx(2.0)
+    assert out["sticky_coverage"] == pytest.approx(1.0)
 

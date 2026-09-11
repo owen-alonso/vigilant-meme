@@ -22,6 +22,10 @@ from forecast.shorting import (
     blend_cs_scores,
     ENSEMBLE_ALPHAS,
     fit_ensemble_on_train,
+    STICKY_ENTERS,
+    STICKY_EXITS,
+    decide_sticky_promote,
+    fit_sticky_on_train,
     decide_lo_refine,
     decide_ls_promote,
     evaluate_overnight_shorting,
@@ -486,6 +490,77 @@ def test_fit_ensemble_on_train_picks_overnight_when_c2c_is_anti():
     assert {round(float(r["alpha"]), 2) for r in fit["rows"]} <= set(ENSEMBLE_ALPHAS)
 
 
+def test_decide_sticky_promote_is_val_only():
+    val_q20 = {
+        "name": "q20_rebuild",
+        "unlevered_net_ir": 1.0,
+        "unlevered_max_dd": -0.20,
+        "coverage": 1.0,
+        "mean_name_churn": 0.30,
+        "mean_turnover": 1.0,
+    }
+    val_st = {
+        "name": "sticky_e15_x40",
+        "q_enter": 0.15,
+        "q_exit": 0.40,
+        "unlevered_net_ir": 1.20,
+        "unlevered_max_dd": -0.18,
+        "coverage": 1.0,
+        "mean_name_churn": 0.12,
+        "mean_turnover": 1.0,
+    }
+    juicy_test = {"unlevered_net_ir": 9.9}
+    yes = decide_sticky_promote(
+        val_baseline=val_q20,
+        val_chosen=val_st,
+        chosen={"q_enter": 0.15, "q_exit": 0.40},
+    )
+    assert yes["promote_sticky"] is True
+    assert yes["gated_on"] == "val"
+    assert yes["spec"]["q_enter"] == 0.15
+    assert juicy_test["unlevered_net_ir"] > yes["ir_sticky"]
+
+    no = decide_sticky_promote(
+        val_baseline=val_q20,
+        val_chosen=val_q20,
+        chosen={},
+    )
+    assert no["promote_sticky"] is False
+
+    thin = decide_sticky_promote(
+        val_baseline=val_q20,
+        val_chosen={**val_st, "coverage": 0.10},
+        chosen={"q_enter": 0.15, "q_exit": 0.40},
+    )
+    assert thin["promote_sticky"] is False
+
+
+def test_fit_sticky_on_train_requires_exit_gt_enter():
+    rng = np.random.default_rng(1)
+    n_days, n_names = 50, 10
+    dates = np.repeat(np.arange(n_days, dtype=np.int64) + 18000, n_names)
+    names = np.tile([f"S{i}" for i in range(n_names)], n_days)
+    true = np.tile(np.linspace(-1.0, 1.0, n_names), n_days)
+    amp = np.repeat(0.4 + np.abs(rng.normal(1.0, 0.35, n_days)), n_names)
+    day_shock = np.repeat(rng.normal(0.0, 0.008, n_days), n_names)
+    frame = pd.DataFrame(
+        {
+            "symbol": names,
+            "date": dates,
+            "pred": true,
+            "y": true * amp,
+            "r_on": true * 0.012 + day_shock,
+            "turnover_z": -true,
+            "vol_level": np.full(len(dates), 0.2),
+        }
+    )
+    fit = fit_sticky_on_train(frame, min_names=6, vol_target=0.15)
+    assert fit["fit_split"] == "train"
+    assert fit["chosen"]
+    assert float(fit["chosen"]["q_exit"]) > float(fit["chosen"]["q_enter"])
+    assert {round(float(r["q_enter"]), 2) for r in fit["rows"]} <= set(STICKY_ENTERS)
+
+
 def test_synthetic_names_map_to_sector_etfs_and_etfs_are_not_book_names():
     assert hedge_symbol_for("S00", sector_residual=True) == "XLK"
     assert hedge_symbol_for("S05", sector_residual=True) == "XLK"
@@ -601,6 +676,14 @@ def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
     assert train_a in set(ENSEMBLE_ALPHAS)
     assert payload["ensemble_compare"]["train_alpha"] == pytest.approx(train_a)
     assert "PROMOTE OVERNIGHT" in text and "ENSEMBLE" in text
+    assert payload["sticky_fit"]["fit_split"] == "train"
+    assert payload["sticky_promotion"]["gated_on"] == "val"
+    chosen_st = payload["sticky_fit"].get("chosen") or {}
+    if chosen_st:
+        assert float(chosen_st["q_enter"]) in set(STICKY_ENTERS)
+        assert float(chosen_st["q_exit"]) in set(STICKY_EXITS)
+        assert float(chosen_st["q_exit"]) > float(chosen_st["q_enter"])
+    assert "PROMOTE STICKY" in text
     assert "VAL LONG-ONLY GRID" in text
     assert "VAL LONG-ONLY REFINE" in text
     assert "LS HAIRCUT EXPERIMENT" in text

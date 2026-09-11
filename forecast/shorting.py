@@ -26,7 +26,12 @@ from forecast.accuracy import (
     overnight_skip_data_config,
     score_eval_frame,
 )
-from forecast.backtest import book_pnl, causal_disp_series, trailing_mean_cs_ic
+from forecast.backtest import (
+    book_pnl,
+    causal_disp_series,
+    last_sticky_held,
+    trailing_mean_cs_ic,
+)
 from forecast.data import build_datasets
 from forecast.overnight import (
     LIVE_BUNDLE,
@@ -137,6 +142,9 @@ python -m forecast.training --universe liquid --interval daily --skip-only \\
   --label-return close --checkpoint-dir checkpoints/forecast_ridge
 python scripts/overnight_shorting.py --data-dir data --universe liquid \\
     --json checkpoints/forecast_ridge_overnight/shorting.json
+# IDEA 6: sticky long-only enter/exit (TRAIN-chosen; default off / always-rebuild q20)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
+  --holding overnight --live-costs --long-only --sticky-q-enter 0.15 --sticky-q-exit 0.40
 """
 
 
@@ -216,6 +224,9 @@ def _run_overnight_book(
     disp_gate_kind: str = "",
     disp_gate_window: int = 0,
     close_px: pd.DataFrame | None = None,
+    sticky_q_enter: float = 0.0,
+    sticky_q_exit: float = 0.0,
+    sticky_held0: set | frozenset | None = None,
 ) -> dict[str, Any]:
     stats = book_pnl(
         pred,
@@ -247,6 +258,9 @@ def _run_overnight_book(
         overnight_r=overnight_r,
         turnover_z=turnover_z,
         vol_level=vol_level,
+        sticky_q_enter=float(sticky_q_enter or 0.0),
+        sticky_q_exit=float(sticky_q_exit or 0.0),
+        sticky_held0=sticky_held0,
         **_bundle_costs(bundle),
     )
     return scalar_book(stats)
@@ -663,6 +677,9 @@ def _lo_q20_book(
     disp_gate_kind: str = "",
     disp_gate_window: int = 0,
     close_px: pd.DataFrame | None = None,
+    sticky_q_enter: float = 0.0,
+    sticky_q_exit: float = 0.0,
+    sticky_held0: set | frozenset | None = None,
 ) -> dict[str, Any]:
     return _run_overnight_book(
         pred,
@@ -685,6 +702,9 @@ def _lo_q20_book(
         disp_gate_kind=str(disp_gate_kind or ""),
         disp_gate_window=int(disp_gate_window or 0),
         close_px=close_px,
+        sticky_q_enter=float(sticky_q_enter or 0.0),
+        sticky_q_exit=float(sticky_q_exit or 0.0),
+        sticky_held0=sticky_held0,
     )
 
 
@@ -1570,6 +1590,313 @@ def decide_ensemble_promote(
     }
 
 
+STICKY_ENTERS = (0.10, 0.15, 0.20)
+STICKY_EXITS = (0.30, 0.40, 0.50)
+STICKY_COVER_VAL = 0.30
+
+
+def score_sticky_book(
+    frame: pd.DataFrame,
+    *,
+    q_enter: float,
+    q_exit: float,
+    min_names: int,
+    vol_target: float = 0.15,
+    held0: set | frozenset | None = None,
+) -> dict[str, Any]:
+    """Overnight live long-only sticky vs flatten-every-night q20 costs."""
+    empty = {
+        "name": f"sticky_e{int(round(100 * float(q_enter)))}_x{int(round(100 * float(q_exit)))}",
+        "q_enter": float(q_enter),
+        "q_exit": float(q_exit),
+        "unlevered_net_ir": float("nan"),
+        "net_ir": float("nan"),
+        "unlevered_max_dd": float("nan"),
+        "mean_cost_unlev_bp": float("nan"),
+        "mean_turnover": float("nan"),
+        "mean_name_churn": float("nan"),
+        "mean_n_held": float("nan"),
+        "n_dates": 0.0,
+        "coverage": float("nan"),
+        "sticky_coverage": float("nan"),
+    }
+    if frame is None or frame.empty:
+        return empty
+    pred, y, r_on, tz, vol = _wide_from_frame(frame)
+    if pred.empty or pred.shape[1] < 2:
+        return empty
+    stats = _lo_q20_book(
+        pred,
+        y,
+        min_names=min_names,
+        vol_target=vol_target,
+        overnight_r=r_on,
+        turnover_z=tz,
+        vol_level=vol,
+        sticky_q_enter=float(q_enter),
+        sticky_q_exit=float(q_exit),
+        sticky_held0=held0,
+    )
+    n_cal = float(len(pred.index.intersection(y.index)))
+    n_book = _as_float(stats.get("n_dates"))
+    cover = (
+        float(n_book / n_cal)
+        if n_cal > 0 and np.isfinite(n_book)
+        else _as_float(stats.get("sticky_coverage"))
+    )
+    invested = _as_float(stats.get("sticky_coverage"))
+    if np.isfinite(invested):
+        cover = invested
+    return {
+        "name": empty["name"],
+        "q_enter": float(q_enter),
+        "q_exit": float(q_exit),
+        "unlevered_net_ir": stats.get("unlevered_net_ir"),
+        "net_ir": stats.get("net_ir"),
+        "unlevered_max_dd": stats.get("unlevered_max_dd"),
+        "mean_cost_unlev_bp": stats.get("mean_cost_unlev_bp"),
+        "mean_turnover": stats.get("mean_turnover"),
+        "mean_name_churn": stats.get("mean_name_churn"),
+        "mean_n_held": stats.get("mean_n_held"),
+        "n_dates": n_book,
+        "coverage": cover,
+        "sticky_coverage": invested,
+    }
+
+
+def score_q20_rebuild(
+    frame: pd.DataFrame,
+    *,
+    min_names: int,
+    vol_target: float = 0.15,
+) -> dict[str, Any]:
+    """Always-rebuild q20 equal — the live default baseline."""
+    row = score_sticky_book(
+        frame,
+        q_enter=0.0,
+        q_exit=0.0,
+        min_names=min_names,
+        vol_target=vol_target,
+    )
+    if frame is None or frame.empty:
+        row["name"] = "q20_rebuild"
+        return row
+    pred, y, r_on, tz, vol = _wide_from_frame(frame)
+    if pred.empty or pred.shape[1] < 2:
+        row["name"] = "q20_rebuild"
+        return row
+    stats = _lo_q20_book(
+        pred,
+        y,
+        min_names=min_names,
+        vol_target=vol_target,
+        overnight_r=r_on,
+        turnover_z=tz,
+        vol_level=vol,
+    )
+    n_cal = float(len(pred.index.intersection(y.index)))
+    n_book = _as_float(stats.get("n_dates"))
+    cover = (
+        float(n_book / n_cal)
+        if n_cal > 0 and np.isfinite(n_book)
+        else 1.0
+    )
+    invested = _as_float(stats.get("sticky_coverage"))
+    if np.isfinite(invested):
+        cover = invested
+    return {
+        "name": "q20_rebuild",
+        "q_enter": 0.20,
+        "q_exit": 0.20,
+        "unlevered_net_ir": stats.get("unlevered_net_ir"),
+        "net_ir": stats.get("net_ir"),
+        "unlevered_max_dd": stats.get("unlevered_max_dd"),
+        "mean_cost_unlev_bp": stats.get("mean_cost_unlev_bp"),
+        "mean_turnover": stats.get("mean_turnover"),
+        "mean_name_churn": stats.get("mean_name_churn"),
+        "mean_n_held": stats.get("mean_n_held"),
+        "n_dates": n_book,
+        "coverage": cover,
+        "sticky_coverage": invested,
+    }
+
+
+def sticky_grid(
+    frame: pd.DataFrame,
+    *,
+    min_names: int,
+    vol_target: float = 0.15,
+    held0: set | frozenset | None = None,
+) -> dict[str, Any]:
+    """Score the TRAIN (q_enter, q_exit) grid on one split. Does not pick."""
+    note = (
+        "sticky long-only: enter top q_enter, hold while in top q_exit; "
+        "equal-weight active set; empty = flat (still in IR). "
+        "Ranks = sector-overnight residual skip. α-ensemble is not the default path. "
+        "(q_enter, q_exit) fit on TRAIN only."
+    )
+    empty = {"rows": [], "best": {}, "baseline": {}, "note": note}
+    if frame is None or frame.empty:
+        return empty
+    rows: list[dict[str, Any]] = []
+    for qe in STICKY_ENTERS:
+        for qx in STICKY_EXITS:
+            if qx <= qe:
+                continue
+            row = score_sticky_book(
+                frame,
+                q_enter=qe,
+                q_exit=qx,
+                min_names=min_names,
+                vol_target=vol_target,
+                held0=held0,
+            )
+            if not np.isfinite(_as_float(row.get("unlevered_net_ir"))):
+                continue
+            rows.append(row)
+    baseline = score_q20_rebuild(frame, min_names=min_names, vol_target=vol_target)
+    if not rows:
+        return {**empty, "baseline": baseline}
+    rows.sort(
+        key=lambda r: (
+            -_as_float(r.get("unlevered_net_ir"), default=-1e9),
+            _as_float(r.get("mean_name_churn"), default=1e9),
+            str(r.get("name")),
+        )
+    )
+    return {
+        "rows": rows,
+        "best": dict(rows[0]),
+        "baseline": baseline,
+        "note": note,
+    }
+
+
+def fit_sticky_on_train(
+    frame: pd.DataFrame,
+    *,
+    min_names: int,
+    vol_target: float = 0.15,
+) -> dict[str, Any]:
+    """Select (q_enter, q_exit) on TRAIN only. VAL/TEST must never enter."""
+    grid = sticky_grid(frame, min_names=min_names, vol_target=vol_target, held0=None)
+    rows = list(grid.get("rows") or [])
+    baseline = dict(grid.get("baseline") or {})
+    chosen: dict[str, Any] = {}
+    best_ir = -1e18
+    for row in rows:
+        ir = _as_float(row.get("unlevered_net_ir"))
+        cover = _as_float(row.get("coverage"))
+        if not np.isfinite(ir):
+            continue
+        if np.isfinite(cover) and cover < STICKY_COVER_VAL:
+            continue
+        churn = _as_float(row.get("mean_name_churn"), default=1e9)
+        better = ir > best_ir + 1e-12
+        tie = abs(ir - best_ir) <= 1e-12 and churn < _as_float(
+            chosen.get("mean_name_churn"), default=1e9
+        )
+        if better or tie:
+            best_ir = ir
+            chosen = dict(row)
+    return {
+        "rows": rows,
+        "chosen": chosen,
+        "baseline": baseline,
+        "fit_split": "train",
+        "enters": list(STICKY_ENTERS),
+        "exits": list(STICKY_EXITS),
+        "note": grid.get("note"),
+    }
+
+
+def decide_sticky_promote(
+    *,
+    val_baseline: dict[str, Any],
+    val_chosen: dict[str, Any],
+    chosen: dict[str, Any],
+) -> dict[str, Any]:
+    """VAL-only vs always-rebuild q20. TEST never enters. Spec is TRAIN-chosen."""
+    base = dict(val_baseline or {})
+    scored = dict(val_chosen or {})
+    ir_a = _as_float(base.get("unlevered_net_ir"))
+    ir_b = _as_float(scored.get("unlevered_net_ir"))
+    dd_a = _as_float(base.get("unlevered_max_dd"))
+    dd_b = _as_float(scored.get("unlevered_max_dd"))
+    cover = _as_float(scored.get("coverage"))
+    ir_delta = (
+        float(ir_b - ir_a) if np.isfinite(ir_b) and np.isfinite(ir_a) else float("nan")
+    )
+    dd_delta = (
+        float(dd_b - dd_a) if np.isfinite(dd_b) and np.isfinite(dd_a) else float("nan")
+    )
+    qe = _as_float(chosen.get("q_enter"))
+    qx = _as_float(chosen.get("q_exit"))
+    have = bool(chosen) and np.isfinite(qe) and np.isfinite(qx) and qx > qe
+    ir_ok = bool(np.isfinite(ir_delta) and ir_delta >= LO_IR_LIFT)
+    dd_ok = bool(not np.isfinite(dd_delta) or dd_delta >= -LO_DD_TOL)
+    cover_ok = bool(not np.isfinite(cover) or cover >= STICKY_COVER_VAL)
+    promote = bool(have and ir_ok and dd_ok and cover_ok)
+    if not have:
+        reason = (
+            "NO PROMOTE: TRAIN did not select a (q_enter, q_exit) with "
+            f"coverage >= {STICKY_COVER_VAL:.0%}. Keep always-rebuild q20."
+        )
+    elif not cover_ok:
+        reason = (
+            f"NO PROMOTE: TRAIN sticky e{100 * qe:.0f}/x{100 * qx:.0f} but VAL "
+            f"coverage {100 * cover:.0f}% < {100 * STICKY_COVER_VAL:.0f}%. "
+            "Keep always-rebuild q20."
+        )
+    elif not ir_ok:
+        reason = (
+            f"NO PROMOTE: TRAIN sticky e{100 * qe:.0f}/x{100 * qx:.0f} VAL IR "
+            f"{ir_b:+.3f} vs q20 {ir_a:+.3f} (delta {ir_delta:+.3f} < "
+            f"{LO_IR_LIFT:.2f}). Keep always-rebuild q20."
+        )
+    elif not dd_ok:
+        reason = (
+            f"NO PROMOTE: sticky e{100 * qe:.0f}/x{100 * qx:.0f} IR lift "
+            f"{ir_delta:+.3f} but VAL max DD {dd_b:+.3f} vs q20 {dd_a:+.3f} "
+            f"exceeds {LO_DD_TOL:.2f}."
+        )
+    else:
+        reason = (
+            f"PROMOTE sticky e{100 * qe:.0f}/x{100 * qx:.0f}: VAL IR {ir_b:+.3f} "
+            f"vs q20 {ir_a:+.3f} (delta {ir_delta:+.3f}), max DD {dd_b:+.3f} vs "
+            f"{dd_a:+.3f}, coverage {100 * cover:.0f}%, name_churn "
+            f"{_as_float(scored.get('mean_name_churn')):.3f} vs "
+            f"{_as_float(base.get('mean_name_churn')):.3f}."
+        )
+    return {
+        "promote_sticky": promote,
+        "gated_on": "val",
+        "reason": reason,
+        "spec": (
+            {"q_enter": float(qe), "q_exit": float(qx)}
+            if promote
+            else {"q_enter": 0.20, "q_exit": 0.20}
+        ),
+        "chosen": scored,
+        "baseline": base,
+        "train_q_enter": float(qe) if np.isfinite(qe) else 0.20,
+        "train_q_exit": float(qx) if np.isfinite(qx) else 0.20,
+        "ir_q20": ir_a,
+        "ir_sticky": ir_b,
+        "ir_delta": ir_delta,
+        "dd_q20": dd_a,
+        "dd_sticky": dd_b,
+        "dd_delta": dd_delta,
+        "coverage": cover,
+        "cover_min_val": STICKY_COVER_VAL,
+        "ir_lift": LO_IR_LIFT,
+        "name_churn_q20": _as_float(base.get("mean_name_churn")),
+        "name_churn_sticky": _as_float(scored.get("mean_name_churn")),
+        "mean_turnover_q20": _as_float(base.get("mean_turnover")),
+        "mean_turnover_sticky": _as_float(scored.get("mean_turnover")),
+    }
+
+
 def decide_ls_experiment(val: dict[str, Any], experiment_book: dict[str, Any]) -> dict[str, Any]:
     """VAL-only haircut experiment. Never changes the default live book."""
     lo = (val.get("books") or {}).get("live_long_only") or {}
@@ -1981,6 +2308,88 @@ def evaluate_overnight_shorting(
         "test_overnight": ens_test_base,
         "train_alpha": ens_alpha,
     }
+    if log_fn:
+        log_fn("IDEA 6: sticky long-only enter/exit hysteresis (TRAIN-chosen q)")
+    sticky_fit = fit_sticky_on_train(
+        frames["train"], min_names=min_names, vol_target=vol_target
+    )
+    sticky_qe = _as_float((sticky_fit.get("chosen") or {}).get("q_enter"))
+    sticky_qx = _as_float((sticky_fit.get("chosen") or {}).get("q_exit"))
+    have_sticky = (
+        np.isfinite(sticky_qe) and np.isfinite(sticky_qx) and sticky_qx > sticky_qe
+    )
+    train_pred = frame_to_wide(frames["train"], "pred")
+    val_pred = frame_to_wide(frames["val"], "pred")
+    sticky_held_val = (
+        last_sticky_held(
+            train_pred, q_enter=sticky_qe, q_exit=sticky_qx, min_names=min_names
+        )
+        if have_sticky
+        else set()
+    )
+    hist_parts = [p for p in (train_pred, val_pred) if p is not None and not p.empty]
+    hist_tv = pd.concat(hist_parts) if hist_parts else pd.DataFrame()
+    if not hist_tv.empty:
+        hist_tv = hist_tv.sort_index().groupby(level=0).last()
+    sticky_held_test = (
+        last_sticky_held(
+            hist_tv, q_enter=sticky_qe, q_exit=sticky_qx, min_names=min_names
+        )
+        if have_sticky
+        else set()
+    )
+    sticky_val = sticky_grid(
+        frames["val"], min_names=min_names, vol_target=vol_target
+    )
+    sticky_test = sticky_grid(
+        frames["test"], min_names=min_names, vol_target=vol_target
+    )
+    sticky_val_base = score_q20_rebuild(
+        frames["val"], min_names=min_names, vol_target=vol_target
+    )
+    sticky_test_base = score_q20_rebuild(
+        frames["test"], min_names=min_names, vol_target=vol_target
+    )
+    sticky_val_chosen = (
+        score_sticky_book(
+            frames["val"],
+            q_enter=sticky_qe,
+            q_exit=sticky_qx,
+            min_names=min_names,
+            vol_target=vol_target,
+            held0=sticky_held_val,
+        )
+        if have_sticky
+        else dict(sticky_val_base)
+    )
+    sticky_test_chosen = (
+        score_sticky_book(
+            frames["test"],
+            q_enter=sticky_qe,
+            q_exit=sticky_qx,
+            min_names=min_names,
+            vol_target=vol_target,
+            held0=sticky_held_test,
+        )
+        if have_sticky
+        else dict(sticky_test_base)
+    )
+    sticky_promo = decide_sticky_promote(
+        val_baseline=sticky_val_base,
+        val_chosen=sticky_val_chosen,
+        chosen=sticky_fit.get("chosen") or {},
+    )
+    sticky_compare = {
+        "train_grid": sticky_fit,
+        "val_grid": sticky_val,
+        "test_grid": sticky_test,
+        "val_chosen": sticky_val_chosen,
+        "val_baseline": sticky_val_base,
+        "test_chosen": sticky_test_chosen,
+        "test_baseline": sticky_test_base,
+        "train_q_enter": sticky_qe if have_sticky else 0.20,
+        "train_q_exit": sticky_qx if have_sticky else 0.20,
+    }
     sector_promo = decide_sector_promote(
         val_spy=spy_val_lo,
         val_sector=sector_val_lo,
@@ -2139,6 +2548,9 @@ def evaluate_overnight_shorting(
         "ensemble_fit": ens_fit,
         "ensemble_compare": ens_compare,
         "ensemble_promotion": ens_promo,
+        "sticky_fit": sticky_fit,
+        "sticky_compare": sticky_compare,
+        "sticky_promotion": sticky_promo,
         "ls_experiment": ls_exp,
         "test_long_only_promoted": test_lo_promoted,
         "test_long_only_refine_best": test_refine_best,
@@ -2180,6 +2592,8 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
         _sector_block(payload),
         "",
         _ensemble_block(payload),
+        "",
+        _sticky_block(payload),
         "",
         _lo_refine_block(
             payload.get("val_long_only_refine") or {},
@@ -2430,6 +2844,68 @@ def _ensemble_block(payload: dict[str, Any]) -> str:
         f"maxDD {_fmt(test_ch.get('unlevered_max_dd'), '+.3f')}  (report-only)"
     )
     lines.append("  TEST α grid (report-only):")
+    for row in list(test.get("rows") or []):
+        lines.append(_row(row))
+    return "\n".join(lines)
+
+
+def _sticky_block(payload: dict[str, Any]) -> str:
+    promo = payload.get("sticky_promotion") or {}
+    cmp_ = payload.get("sticky_compare") or {}
+    fit = payload.get("sticky_fit") or cmp_.get("train_grid") or {}
+    val = cmp_.get("val_grid") or {}
+    test = cmp_.get("test_grid") or {}
+    chosen = cmp_.get("val_chosen") or promo.get("chosen") or {}
+    base = cmp_.get("val_baseline") or promo.get("baseline") or {}
+    test_ch = cmp_.get("test_chosen") or {}
+    test_a = cmp_.get("test_baseline") or {}
+    train_ch = fit.get("chosen") or {}
+
+    def _row(r: dict[str, Any]) -> str:
+        return (
+            f"  {str(r.get('name') or ''):18} "
+            f"IR {_fmt(r.get('unlevered_net_ir'), '+.3f')}  "
+            f"maxDD {_fmt(r.get('unlevered_max_dd'), '+.3f')}  "
+            f"churn {_fmt(r.get('mean_name_churn'), '.3f')}  "
+            f"n_held {_fmt(r.get('mean_n_held'), '.1f')}  "
+            f"cover {_fmt(100.0 * _as_float(r.get('coverage')), '.0f')}%"
+        )
+
+    lines = [
+        f"PROMOTE STICKY HYSTERESIS? "
+        f"{'YES' if promo.get('promote_sticky') else 'NO'}",
+        f"  {fit.get('note') or val.get('note')}",
+        f"  TRAIN chose e={_fmt(100.0 * _as_float(train_ch.get('q_enter')), '.0f')}% "
+        f"x={_fmt(100.0 * _as_float(train_ch.get('q_exit')), '.0f')}%  "
+        f"IR {_fmt(train_ch.get('unlevered_net_ir'), '+.3f')}  "
+        f"churn {_fmt(train_ch.get('mean_name_churn'), '.3f')}  "
+        f"(fit_split={fit.get('fit_split')})",
+        f"  {promo.get('reason')}",
+        f"  VAL q20 rebuild IR {_fmt(base.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(base.get('unlevered_max_dd'), '+.3f')}  "
+        f"churn {_fmt(base.get('mean_name_churn'), '.3f')}  "
+        f"turn {_fmt(base.get('mean_turnover'), '.3f')}",
+        f"  VAL TRAIN-sticky IR {_fmt(chosen.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(chosen.get('unlevered_max_dd'), '+.3f')}  "
+        f"churn {_fmt(chosen.get('mean_name_churn'), '.3f')}  "
+        f"turn {_fmt(chosen.get('mean_turnover'), '.3f')}  "
+        f"cover {_fmt(100.0 * _as_float(chosen.get('coverage')), '.0f')}%",
+        "  TRAIN (q_enter, q_exit) grid (fit):",
+    ]
+    for row in list(fit.get("rows") or []):
+        lines.append(_row(row))
+    lines.append("  VAL grid (report; q not picked here):")
+    for row in list(val.get("rows") or []):
+        lines.append(_row(row))
+    lines.append(
+        f"  TEST q20 IR {_fmt(test_a.get('unlevered_net_ir'), '+.3f')}  "
+        f"churn {_fmt(test_a.get('mean_name_churn'), '.3f')}  (report-only)"
+    )
+    lines.append(
+        f"  TEST TRAIN-sticky IR {_fmt(test_ch.get('unlevered_net_ir'), '+.3f')}  "
+        f"churn {_fmt(test_ch.get('mean_name_churn'), '.3f')}  (report-only)"
+    )
+    lines.append("  TEST grid (report-only):")
     for row in list(test.get("rows") or []):
         lines.append(_row(row))
     return "\n".join(lines)
