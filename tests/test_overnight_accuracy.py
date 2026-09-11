@@ -20,12 +20,15 @@ from forecast.accuracy import (
     apply_readout,
     cond_abs_mask,
     cs_relative_blocks,
+    cs_stack_mask,
     cs_top_abs_mask,
     decide_book_aligned_promote,
     decide_relative_dir_promote,
+    decide_rel_e_stack_promote,
     decide_sector_mae_promote,
     fit_book_aligned_on_train,
     fit_relative_dir_on_train,
+    fit_rel_e_stack_on_train,
     fit_residual_mae_maps,
     fit_cond_dir_blend,
     fit_confidence_blend,
@@ -46,6 +49,7 @@ from forecast.accuracy import (
     long_only_book_block,
     score_book_aligned_sleeve,
     score_eval_frame,
+    score_rel_e_stack,
     score_relative_direction,
     slim_accuracy,
     two_sided_normal_p,
@@ -348,6 +352,23 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert rel_promo["live_book_unchanged"] is True
     assert "PROMOTE RELATIVE-DIR" in report
     assert "PROMOTE LONG-HALF UP" in report
+    stack_fit = payload["rel_e_stack_fit"]
+    assert stack_fit["fit_split"] == "train"
+    assert stack_fit["score_col"] == "pred"
+    stack_cmp = payload["rel_e_stack_compare"]
+    assert "chosen" in stack_cmp["val"] and "e_sleeve" in stack_cmp["val"]
+    assert "chosen" in stack_cmp["test"]
+    stack_promo = payload["rel_e_stack_promotion"]
+    assert stack_promo["gated_on"] == "val"
+    assert "promote_stack_rel" in stack_promo
+    assert "promote_stack_abs" in stack_promo
+    assert "promote_stack_live" in stack_promo
+    assert stack_promo["default_book_unchanged"] is True
+    assert "rel_e_stack_live" in payload
+    assert "q20" in payload["rel_e_stack_live"]["val"]
+    assert "PROMOTE STACK RELATIVE-DIR" in report
+    assert "PROMOTE STACK ABSOLUTE-UP" in report
+    assert "PROMOTE STACK LIVE IR" in report
 
 
 def test_zero_move_direction_is_zero_not_nan():
@@ -795,6 +816,129 @@ def test_decide_relative_dir_promote_is_val_only():
     assert d5["promote_relative_dir"] is False
     assert d5["promote_long_half"] is False
     assert d5["gated_on"] == "val"
+
+
+def test_cs_stack_mask_is_long_half_intersect_top_q():
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "date": [1, 1, 1, 1, 2, 2, 2, 2],
+            "pred": [-2.0, -1.0, 1.0, 2.0, -2.0, -1.0, 1.0, 2.0],
+            "r_on": [-0.02, -0.01, 0.01, 0.02, -0.02, -0.01, 0.01, 0.02],
+        }
+    )
+    top = cs_top_abs_mask(df, q=0.75, abs_tau=0.0, min_names=3)
+    stack = cs_stack_mask(df, q=0.75, abs_tau=0.0, min_names=3)
+    assert top.tolist() == [False, False, False, True, False, False, False, True]
+    assert stack.tolist() == top.tolist()
+    scored = score_rel_e_stack(df, q=0.75, abs_tau=0.0, min_names=3)
+    assert abs(scored["rel_hit_pct"] - 100.0) < 1e-9
+    assert abs(scored["long_up_pct"] - 100.0) < 1e-9
+    assert scored["long_n"] == 2.0
+
+
+def test_fit_rel_e_stack_on_train_is_train_only():
+    import pandas as pd
+
+    rng = np.random.default_rng(1)
+    dates = np.repeat(np.arange(20, dtype=np.int64), 10)
+    pred = rng.normal(size=dates.size)
+    r_train = np.where(pred > 0.0, 0.02, -0.01)
+    r_later = np.where(pred > 0.0, -0.02, 0.01)
+    train = pd.DataFrame({"date": dates, "pred": pred, "r_on": r_train})
+    later = pd.DataFrame({"date": dates + 100, "pred": pred, "r_on": r_later})
+    e = {"q": 0.80, "abs_q": 0.0, "abs_tau": 0.0}
+    spec = fit_rel_e_stack_on_train(train, min_names=3, e_chosen=e)
+    leaked = fit_rel_e_stack_on_train(later, min_names=3, e_chosen=e)
+    assert spec["fit_split"] == "train"
+    assert leaked["fit_split"] == "train"
+    assert spec["score_col"] == "pred"
+    assert (
+        spec["chosen"]["q"] != leaked["chosen"]["q"]
+        or spec["chosen"]["abs_tau"] != leaked["chosen"]["abs_tau"]
+        or spec["chosen"]["rel_hit_pct"] != leaked["chosen"]["rel_hit_pct"]
+    )
+
+
+def test_decide_rel_e_stack_promote_is_val_only():
+    chosen = {"q": 0.90, "abs_tau": 0.2, "abs_q": 0.70}
+    val_ok = {
+        "rel_hit_pct": 70.0,
+        "rel_z": 3.0,
+        "rel_coverage": 0.10,
+        "long_up_pct": 81.0,
+        "long_uncond_up_pct": 54.0,
+        "long_excess_pp": 27.0,
+        "long_coverage": 0.10,
+    }
+    val_e = {"up_pct": 80.0}
+    live_ok = {
+        "unlevered_net_ir": 1.20,
+        "unlevered_max_dd": -0.10,
+        "coverage": 0.10,
+    }
+    q20 = {
+        "unlevered_net_ir": 1.00,
+        "unlevered_max_dd": -0.12,
+        "coverage": 0.25,
+    }
+    d = decide_rel_e_stack_promote(
+        val_chosen=val_ok,
+        val_e=val_e,
+        val_live_stack=live_ok,
+        val_live_q20=q20,
+        chosen=chosen,
+    )
+    assert d["promote_stack_rel"] is True
+    assert d["promote_stack_abs"] is True
+    assert d["promote_stack_live"] is True
+    assert d["gated_on"] == "val"
+    val_rel_fail = dict(val_ok, rel_hit_pct=50.2)
+    d2 = decide_rel_e_stack_promote(
+        val_chosen=val_rel_fail,
+        val_e=val_e,
+        val_live_stack=live_ok,
+        val_live_q20=q20,
+        chosen=chosen,
+    )
+    assert d2["promote_stack_rel"] is False
+    weaker = dict(val_ok, long_up_pct=80.05, long_excess_pp=26.05)
+    d3 = decide_rel_e_stack_promote(
+        val_chosen=weaker,
+        val_e=val_e,
+        val_live_stack=live_ok,
+        val_live_q20=q20,
+        chosen=chosen,
+    )
+    assert d3["promote_stack_abs"] is False
+    assert d3["weaker_than_e"] is False or d3["val_vs_e_pp"] < 0.2
+    live_fail = {
+        "unlevered_net_ir": 0.90,
+        "unlevered_max_dd": -0.10,
+        "coverage": 0.10,
+    }
+    juicy_test = {
+        "rel_hit_pct": 90.0,
+        "rel_z": 8.0,
+        "rel_coverage": 0.20,
+        "long_up_pct": 90.0,
+        "long_uncond_up_pct": 50.0,
+        "long_excess_pp": 40.0,
+        "long_coverage": 0.20,
+    }
+    d4 = decide_rel_e_stack_promote(
+        val_chosen=val_rel_fail,
+        val_e=val_e,
+        val_live_stack=live_fail,
+        val_live_q20=q20,
+        chosen=chosen,
+    )
+    del juicy_test
+    assert d4["promote_stack_rel"] is False
+    assert d4["promote_stack_live"] is False
+    assert d4["gated_on"] == "val"
+    assert d4["default_book_unchanged"] is True
 
 
 def test_decide_book_aligned_promote_is_val_only():

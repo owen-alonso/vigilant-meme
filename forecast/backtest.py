@@ -337,11 +337,13 @@ def conviction_long_weights(
     q: float,
     abs_tau: float = 0.0,
     min_names: int = 3,
+    require_above_median: bool = False,
 ) -> pd.Series:
     """Equal-weight names with ``pred >= nanquantile(q)`` and optional ``|pred|`` floor.
 
     ``q=0.90`` is the top 10% (accuracy IDEA E). Matches ``cs_top_abs_mask``.
-    Next open is never used.
+    ``require_above_median`` also drops names at or below the date CS median
+    (IDEA I stack). Default off. Next open is never used.
     """
     s = pd.to_numeric(scores, errors="coerce")
     w = pd.Series(0.0, index=s.index, dtype=np.float64)
@@ -353,6 +355,10 @@ def conviction_long_weights(
     tau = float(abs_tau)
     if tau > 0.0:
         keep = keep & (s.abs() >= tau)
+    if require_above_median:
+        med = float(np.nanmedian(s.to_numpy(dtype=np.float64)))
+        if np.isfinite(med):
+            keep = keep & (s > med)
     n = int(keep.sum())
     if n <= 0:
         return w
@@ -782,6 +788,7 @@ def book_pnl(
     conf_pctile: float = 0.0,
     conf_abs: float = 0.0,
     conviction_q: float = 0.0,
+    stack_long_half: bool = False,
     ic_gate_window: int = 0,
     ic_gate_tau: float = 0.0,
     ic_gate_kind: str = "pearson",
@@ -917,6 +924,7 @@ def book_pnl(
                 q=float(conviction_q),
                 abs_tau=float(conf_abs or 0.0),
                 min_names=int(min_names),
+                require_above_median=bool(stack_long_half),
             )
         else:
             w = date_weights(
@@ -1177,6 +1185,7 @@ def book_pnl(
         "conf_pctile": float(conf_pctile),
         "conf_abs": float(conf_abs or 0.0),
         "conviction_q": float(conviction_q or 0.0),
+        "stack_long_half": bool(stack_long_half),
         "ic_gate_window": float(gate_w),
         "ic_gate_tau": float(ic_gate_tau) if gate_w > 0 else 0.0,
         "ic_gate_kind": str(ic_gate_kind or "pearson") if gate_w > 0 else "",

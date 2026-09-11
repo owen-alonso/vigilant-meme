@@ -22,6 +22,7 @@ from forecast.accuracy import (
     DIR_LIFT,
     PROMOTED_SKIP,
     _frame_for_split,
+    cs_stack_mask,
     cs_top_abs_mask,
     fit_book_aligned_on_train,
     fit_promoted_overnight_skip,
@@ -230,6 +231,7 @@ def _run_overnight_book(
     conf_pctile: float = 0.0,
     conf_abs: float = 0.0,
     conviction_q: float = 0.0,
+    stack_long_half: bool = False,
     ic_gate_window: int = 0,
     ic_gate_tau: float = 0.0,
     ic_gate_trail: pd.Series | None = None,
@@ -267,6 +269,7 @@ def _run_overnight_book(
         conf_pctile=float(conf_pctile),
         conf_abs=float(conf_abs or 0.0),
         conviction_q=float(conviction_q or 0.0),
+        stack_long_half=bool(stack_long_half),
         ic_gate_window=int(ic_gate_window or 0),
         ic_gate_tau=float(ic_gate_tau or 0.0),
         ic_gate_trail=ic_gate_trail,
@@ -554,6 +557,7 @@ def score_conviction_live_book(
     conviction_q: float = 0.0,
     conf_abs: float = 0.0,
     quantile: float = 0.2,
+    stack_long_half: bool = False,
     name: str = "",
 ) -> dict[str, Any]:
     """``--live-costs --long-only`` unlev net IR / DD / turnover on one split."""
@@ -592,11 +596,39 @@ def score_conviction_live_book(
         long_size="equal",
         conviction_q=float(conviction_q or 0.0),
         conf_abs=float(conf_abs or 0.0),
+        stack_long_half=bool(stack_long_half),
     )
     acc_q = float(conviction_q) if float(conviction_q or 0.0) > 0 else 0.80
-    cov = _sleeve_coverage(
-        df, q=acc_q, abs_tau=float(conf_abs or 0.0), min_names=min_names
-    )
+    if stack_long_half:
+        mask = cs_stack_mask(
+            df,
+            q=acc_q,
+            abs_tau=float(conf_abs or 0.0),
+            score_col="pred",
+            min_names=min_names,
+        )
+        cover = float(mask.mean()) if mask.size else float("nan")
+        n = float(int(mask.sum()))
+        n_dates = (
+            float(pd.Series(df["date"].to_numpy()[mask]).nunique())
+            if int(mask.sum()) and "date" in df.columns
+            else 0.0
+        )
+        n_all = (
+            float(df["date"].nunique())
+            if not df.empty and "date" in df.columns
+            else 0.0
+        )
+        cov = {
+            "coverage": cover,
+            "n": n,
+            "n_dates": n_dates,
+            "date_coverage": (float(n_dates / n_all) if n_all else float("nan")),
+        }
+    else:
+        cov = _sleeve_coverage(
+            df, q=acc_q, abs_tau=float(conf_abs or 0.0), min_names=min_names
+        )
     return {
         "name": name or ("conviction" if conviction_q else "live_long_only_q20"),
         "unlevered_net_ir": stats.get("unlevered_net_ir"),
@@ -611,6 +643,7 @@ def score_conviction_live_book(
         "conviction_q": float(conviction_q or 0.0),
         "conf_abs": float(conf_abs or 0.0),
         "quantile": float(quantile),
+        "stack_long_half": bool(stack_long_half),
         "long_only": True,
         "cost_bundle": "live_long_only",
     }

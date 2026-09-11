@@ -180,6 +180,12 @@ def test_conviction_long_weights_matches_top_q_and_abs_floor():
     assert w[["a", "b", "c"]].sum() == pytest.approx(0.0)
     w2 = conviction_long_weights(s, q=0.75, abs_tau=2.5, min_names=3)
     assert w2.sum() == pytest.approx(0.0)
+    s3 = pd.Series([-2.0, -1.0, 1.0, 2.0], index=list("abcd"))
+    w3 = conviction_long_weights(
+        s3, q=0.50, abs_tau=0.0, min_names=3, require_above_median=True
+    )
+    assert w3[["c", "d"]].sum() == pytest.approx(1.0)
+    assert w3[["a", "b"]].sum() == pytest.approx(0.0)
 
 
 def test_decide_conviction_live_promote_is_val_only():

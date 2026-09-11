@@ -11,6 +11,7 @@ converts that to an implied overnight log-return ``pred * sigma`` (same as
 - book-aligned sleeve overnight-up (TRAIN q / |pred| grid, VAL-gated)
 - within-date relative direction vs CS median (VAL-gated vs 50%)
 - long-half absolute overnight-up (pred > CS median) vs the up-floor
+- H∩E stack (long-half ∩ TRAIN top-q) relative / absolute / live-IR gates
 - short-sleeve overnight down-rate on the within-date bottom residual names
 
 Default recipe is the PR #5 overnight skip (rank-target ridge, ``no_long_ts``).
@@ -68,6 +69,11 @@ REL_DIR_LIFT_PP = 0.50
 REL_DIR_Z = 1.0
 REL_COVER = 0.05
 REL_ABS_QS = (0.0, 0.50, 0.70)
+# IDEA I: H relative-dir ∩ E top-q / |pred| (light TRAIN re-grid).
+STACK_QS = BOOK_ALIGN_QS
+STACK_ABS_QS = BOOK_ALIGN_ABS_QS
+STACK_IR_LIFT = 0.05
+STACK_DD_TOL = 0.05
 TURNOVER_COL = FEATURE_NAMES.index("turnover_z") if "turnover_z" in FEATURE_NAMES else None
 VOL_LEVEL_COL = FEATURE_NAMES.index("vol_level") if "vol_level" in FEATURE_NAMES else None
 # PR #8 locked-TEST residual*sigma print (do not retarget; compare on the same window).
@@ -1099,6 +1105,370 @@ def decide_relative_dir_promote(
     }
 
 
+def cs_stack_mask(
+    df: pd.DataFrame,
+    *,
+    q: float,
+    abs_tau: float = 0.0,
+    score_col: str = "pred",
+    min_names: int = 3,
+) -> np.ndarray:
+    """E top-q ∩ |pred| floor ∩ within-date ``pred > CS median``.
+
+    Next open is never used.
+    """
+    top = cs_top_abs_mask(
+        df, q=float(q), abs_tau=float(abs_tau), score_col=score_col, min_names=min_names
+    )
+    _pr, _rr, _ad, long_half, date_ok = cs_relative_blocks(
+        df, score_col=score_col, min_names=min_names
+    )
+    del _pr, _rr, _ad
+    return date_ok & long_half & top
+
+
+def score_rel_e_stack(
+    df: pd.DataFrame,
+    *,
+    q: float,
+    abs_tau: float = 0.0,
+    min_names: int = 3,
+) -> dict[str, Any]:
+    """Relative CS-median sign hit and absolute overnight-up on the H∩E stack."""
+    empty = {
+        "q": float(q),
+        "abs_tau": float(abs_tau),
+        "rel_hit_pct": float("nan"),
+        "rel_excess_pp": float("nan"),
+        "rel_z": float("nan"),
+        "rel_p": float("nan"),
+        "rel_n": 0.0,
+        "rel_coverage": float("nan"),
+        "rel_n_dates": 0.0,
+        "long_up_pct": float("nan"),
+        "long_uncond_up_pct": float("nan"),
+        "long_excess_pp": float("nan"),
+        "long_n": 0.0,
+        "long_coverage": float("nan"),
+        "long_n_dates": 0.0,
+    }
+    if df.empty:
+        return empty
+    pred_rel, r_rel, _abs_dev, _lh, date_ok = cs_relative_blocks(
+        df, score_col="pred", min_names=min_names
+    )
+    mask = cs_stack_mask(
+        df, q=float(q), abs_tau=float(abs_tau), score_col="pred", min_names=min_names
+    )
+    rel_ok = (
+        mask
+        & date_ok
+        & np.isfinite(pred_rel)
+        & np.isfinite(r_rel)
+        & (pred_rel != 0.0)
+        & (r_rel != 0.0)
+    )
+    long_ok = mask
+    hits = (np.sign(pred_rel[rel_ok]) == np.sign(r_rel[rel_ok])).astype(np.float64)
+    inf = hit_rate_inference(hits)
+    dates = df["date"].to_numpy(dtype=np.int64)
+    r = df["r_on"].to_numpy(dtype=np.float64)
+    moved = np.isfinite(r) & (r != 0.0)
+    uncond = r[moved]
+    uncond_up = float((uncond > 0).mean()) if uncond.size else float("nan")
+    long_moved = long_ok & moved
+    up = float((r[long_moved] > 0).mean()) if int(long_moved.sum()) else float("nan")
+    rel_dates = float(pd.Series(dates[rel_ok]).nunique()) if int(rel_ok.sum()) else 0.0
+    long_dates = float(pd.Series(dates[long_ok]).nunique()) if int(long_ok.sum()) else 0.0
+    return {
+        **empty,
+        "rel_hit_pct": _as_float(inf.get("hit_rate_pct")),
+        "rel_excess_pp": (
+            _as_float(inf.get("hit_rate_pct")) - 50.0
+            if np.isfinite(_as_float(inf.get("hit_rate_pct")))
+            else float("nan")
+        ),
+        "rel_z": _as_float(inf.get("z_vs_half")),
+        "rel_p": _as_float(inf.get("p_vs_half")),
+        "rel_n": _as_float(inf.get("n"), default=0.0),
+        "rel_coverage": float(rel_ok.mean()) if rel_ok.size else float("nan"),
+        "rel_n_dates": rel_dates,
+        "long_up_pct": float(100.0 * up) if np.isfinite(up) else float("nan"),
+        "long_uncond_up_pct": (
+            float(100.0 * uncond_up) if np.isfinite(uncond_up) else float("nan")
+        ),
+        "long_excess_pp": (
+            float(100.0 * (up - uncond_up))
+            if np.isfinite(up) and np.isfinite(uncond_up)
+            else float("nan")
+        ),
+        "long_n": float(int(long_moved.sum())),
+        "long_coverage": float(long_ok.mean()) if long_ok.size else float("nan"),
+        "long_n_dates": long_dates,
+    }
+
+
+def fit_rel_e_stack_on_train(
+    df: pd.DataFrame,
+    *,
+    min_names: int,
+    e_chosen: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Select (q, |pred| floor) ∩ long-half on TRAIN to max relative hit."""
+    mag = np.abs(df["pred"].to_numpy(dtype=np.float64)) if not df.empty else np.array([])
+    mag = mag[np.isfinite(mag)]
+    candidates: list[tuple[float, float, float]] = []
+    for q in STACK_QS:
+        for aq in STACK_ABS_QS:
+            tau = (
+                0.0
+                if float(aq) <= 0.0
+                else (float(np.quantile(mag, float(aq))) if mag.size else 0.0)
+            )
+            candidates.append((float(q), float(aq), float(tau)))
+    e_spec = dict(e_chosen or {})
+    if e_spec:
+        candidates.append(
+            (
+                float(e_spec.get("q") or 0.80),
+                float(e_spec.get("abs_q") or 0.0),
+                float(e_spec.get("abs_tau") or 0.0),
+            )
+        )
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[float, float]] = set()
+    for q, aq, tau in candidates:
+        key = (round(float(q), 6), round(float(tau), 8))
+        if key in seen:
+            continue
+        seen.add(key)
+        row = score_rel_e_stack(df, q=float(q), abs_tau=float(tau), min_names=min_names)
+        row["abs_q"] = float(aq)
+        if not np.isfinite(_as_float(row.get("rel_hit_pct"))):
+            continue
+        cover = _as_float(row.get("rel_coverage"))
+        if np.isfinite(cover) and cover < REL_COVER:
+            continue
+        rows.append(row)
+    chosen: dict[str, Any] = {}
+    best_key = (-1e18, -1e18, -1.0)
+    for row in rows:
+        hit = _as_float(row.get("rel_hit_pct"))
+        xs = _as_float(row.get("rel_excess_pp"))
+        cover = _as_float(row.get("rel_coverage"))
+        if not np.isfinite(hit):
+            continue
+        key = (hit, xs, cover)
+        if key > best_key:
+            best_key = key
+            chosen = dict(row)
+    e_q = float(e_spec.get("q") or 0.80)
+    e_tau = float(e_spec.get("abs_tau") or 0.0)
+    e_aq = float(e_spec.get("abs_q") or 0.0)
+    e_ref = score_rel_e_stack(df, q=e_q, abs_tau=e_tau, min_names=min_names)
+    e_ref["abs_q"] = e_aq
+    if not chosen:
+        chosen = dict(e_ref)
+    return {
+        "rows": rows,
+        "chosen": chosen,
+        "e_ref": e_ref,
+        "e_chosen": {
+            "q": e_q,
+            "abs_q": e_aq,
+            "abs_tau": e_tau,
+        },
+        "fit_split": "train",
+        "qs": list(STACK_QS),
+        "abs_qs": list(STACK_ABS_QS),
+        "score_col": "pred",
+        "note": (
+            "H∩E stack: pred > CS median and within-date top-q residual "
+            "(optional TRAIN |pred| floor). TRAIN picks max relative hit vs 50% "
+            "with cover ≥ 5%. Absolute up vs E's sleeve. Live IR vs q20. "
+            "Live q20 unchanged unless the F IR gate clears."
+        ),
+    }
+
+
+def decide_rel_e_stack_promote(
+    *,
+    val_chosen: dict[str, Any],
+    val_e: dict[str, Any],
+    val_live_stack: dict[str, Any] | None = None,
+    val_live_q20: dict[str, Any] | None = None,
+    chosen: dict[str, Any],
+) -> dict[str, Any]:
+    """VAL-only relative hit, absolute up vs E, and optional live IR vs q20."""
+    rel = dict(val_chosen or {})
+    e_row = dict(val_e or {})
+    live = dict(val_live_stack or {})
+    q20 = dict(val_live_q20 or {})
+    hit = _as_float(rel.get("rel_hit_pct"))
+    z = _as_float(rel.get("rel_z"))
+    cover = _as_float(rel.get("rel_coverage"))
+    q = _as_float((chosen or {}).get("q"), default=0.80)
+    abs_tau = _as_float((chosen or {}).get("abs_tau"), default=0.0)
+    abs_q = _as_float((chosen or {}).get("abs_q"), default=0.0)
+    hit_ok = bool(np.isfinite(hit) and hit >= 50.0 + REL_DIR_LIFT_PP)
+    z_ok = bool(np.isfinite(z) and z >= REL_DIR_Z)
+    cover_ok = bool(np.isfinite(cover) and cover >= REL_COVER)
+    promote_rel = bool(hit_ok and z_ok and cover_ok)
+
+    long_up = _as_float(rel.get("long_up_pct"))
+    long_floor = _as_float(rel.get("long_uncond_up_pct"))
+    long_xs = _as_float(rel.get("long_excess_pp"))
+    if not np.isfinite(long_xs) and np.isfinite(long_up) and np.isfinite(long_floor):
+        long_xs = float(long_up - long_floor)
+    e_up = _as_float(e_row.get("up_pct"))
+    if not np.isfinite(e_up):
+        e_up = _as_float(e_row.get("long_up_pct"))
+    long_cover = _as_float(rel.get("long_coverage"))
+    floor_ok = bool(np.isfinite(long_xs) and long_xs >= BOOK_UP_FLOOR_PP)
+    vs_e = bool(
+        np.isfinite(long_up) and np.isfinite(e_up) and long_up >= e_up + BOOK_UP_BASE_PP
+    )
+    long_cover_ok = bool(not np.isfinite(long_cover) or long_cover >= REL_COVER)
+    promote_abs = bool(floor_ok and vs_e and long_cover_ok)
+    weaker_than_e = bool(np.isfinite(long_up) and np.isfinite(e_up) and long_up < e_up)
+
+    ir = _as_float(live.get("unlevered_net_ir"))
+    ir20 = _as_float(q20.get("unlevered_net_ir"))
+    dd = _as_float(live.get("unlevered_max_dd"))
+    dd20 = _as_float(q20.get("unlevered_max_dd"))
+    live_cover = _as_float(live.get("coverage"))
+    if not np.isfinite(live_cover):
+        live_cover = cover
+    ir_delta = (
+        float(ir - ir20) if np.isfinite(ir) and np.isfinite(ir20) else float("nan")
+    )
+    dd_delta = (
+        float(dd - dd20) if np.isfinite(dd) and np.isfinite(dd20) else float("nan")
+    )
+    ir_ok = bool(np.isfinite(ir_delta) and ir_delta >= STACK_IR_LIFT)
+    dd_ok = bool(not np.isfinite(dd_delta) or dd_delta >= -STACK_DD_TOL)
+    live_cover_ok = bool(np.isfinite(live_cover) and live_cover >= REL_COVER)
+    promote_live = bool(ir_ok and dd_ok and live_cover_ok)
+
+    if not cover_ok:
+        rel_reason = (
+            f"NO PROMOTE stack relative-dir: VAL cover {100.0 * cover:.1f}% "
+            f"< {100.0 * REL_COVER:.0f}%."
+        )
+    elif not hit_ok:
+        rel_reason = (
+            f"NO PROMOTE stack relative-dir: VAL hit {hit:.2f}% "
+            f"< 50%+{REL_DIR_LIFT_PP:.1f}pp."
+        )
+    elif not z_ok:
+        rel_reason = (
+            f"NO PROMOTE stack relative-dir: VAL hit {hit:.2f}% but z={z:.2f} "
+            f"< {REL_DIR_Z:.1f} (not z-sensible)."
+        )
+    else:
+        rel_reason = (
+            f"PROMOTE stack relative-dir q={q:.2f} abs_q={abs_q:.2f}: VAL hit "
+            f"{hit:.2f}% (xs {hit - 50.0:+.2f} pp vs 50%, z={z:.2f})."
+        )
+
+    if not long_cover_ok:
+        abs_reason = (
+            f"NO PROMOTE stack absolute-up: VAL cover {100.0 * long_cover:.1f}% "
+            f"< {100.0 * REL_COVER:.0f}%."
+        )
+    elif not floor_ok:
+        abs_reason = (
+            f"NO PROMOTE stack absolute-up: VAL up {long_up:.2f}% vs floor "
+            f"{long_floor:.2f}% (xs {long_xs:+.2f} pp < +{BOOK_UP_FLOOR_PP:.1f} pp)."
+        )
+    elif not vs_e:
+        note = " weaker than IDEA E sleeve." if weaker_than_e else ""
+        abs_reason = (
+            f"NO PROMOTE stack absolute-up: VAL up {long_up:.2f}% vs E "
+            f"{e_up:.2f}% (delta {long_up - e_up:+.2f} pp < +{BOOK_UP_BASE_PP:.1f} pp)."
+            + note
+        )
+    else:
+        abs_reason = (
+            f"PROMOTE stack absolute-up: VAL up {long_up:.2f}% vs floor "
+            f"{long_floor:.2f}% (xs {long_xs:+.2f} pp) and vs E {e_up:.2f}% "
+            f"(delta {long_up - e_up:+.2f} pp)."
+        )
+
+    if not live_cover_ok:
+        live_reason = (
+            f"NO PROMOTE stack live IR: VAL cover {100.0 * live_cover:.1f}% "
+            f"< {100.0 * REL_COVER:.0f}%. Keep q20 default."
+        )
+    elif not ir_ok:
+        live_reason = (
+            f"NO PROMOTE stack live IR: VAL unlev net IR {ir:+.3f} vs q20 "
+            f"{ir20:+.3f} (delta {ir_delta:+.3f} < +{STACK_IR_LIFT:.2f}). "
+            "Keep q20 default. Hit-rate-only."
+        )
+    elif not dd_ok:
+        live_reason = (
+            f"NO PROMOTE stack live IR: VAL max DD {dd:+.3f} vs q20 "
+            f"{dd20:+.3f} (delta {dd_delta:+.3f} < -{STACK_DD_TOL:.2f}). "
+            "Keep q20 default."
+        )
+    else:
+        live_reason = (
+            f"PROMOTE stack live IR q={q:.2f} abs_q={abs_q:.2f}: VAL unlev "
+            f"net IR {ir:+.3f} vs q20 {ir20:+.3f} (delta {ir_delta:+.3f}). "
+            "Default CLI stays q20 until liquid."
+        )
+    return {
+        "promote_stack_rel": promote_rel,
+        "promote_stack_abs": promote_abs,
+        "promote_stack_live": promote_live,
+        "gated_on": "val",
+        "rel_reason": rel_reason,
+        "abs_reason": abs_reason,
+        "live_reason": live_reason,
+        "reason": f"{rel_reason} {abs_reason} {live_reason}",
+        "spec": {
+            "q": float(q),
+            "abs_q": float(abs_q),
+            "abs_tau": float(abs_tau),
+            "score_col": "pred",
+            "stack_long_half": True,
+        },
+        "chosen": rel,
+        "e_sleeve": e_row,
+        "train_q": float(q),
+        "train_abs_q": float(abs_q),
+        "train_abs_tau": float(abs_tau),
+        "val_rel_hit": hit,
+        "val_rel_z": z,
+        "val_rel_coverage": cover,
+        "val_long_up": long_up,
+        "val_long_floor": long_floor,
+        "val_long_excess_pp": long_xs,
+        "val_e_up": e_up,
+        "val_vs_e_pp": (
+            float(long_up - e_up)
+            if np.isfinite(long_up) and np.isfinite(e_up)
+            else float("nan")
+        ),
+        "weaker_than_e": weaker_than_e,
+        "val_ir": ir,
+        "val_ir_q20": ir20,
+        "val_ir_delta": ir_delta,
+        "val_dd": dd,
+        "val_dd_q20": dd20,
+        "val_dd_delta": dd_delta,
+        "rel_lift_pp": REL_DIR_LIFT_PP,
+        "rel_z_floor": REL_DIR_Z,
+        "cover_floor": REL_COVER,
+        "abs_vs_e_pp": BOOK_UP_BASE_PP,
+        "ir_lift": STACK_IR_LIFT,
+        "dd_tol": STACK_DD_TOL,
+        "live_book_unchanged": (not promote_live),
+        "default_book_unchanged": True,
+    }
+
+
 def _restrict_cs_dates(df: pd.DataFrame, min_names: int) -> pd.DataFrame:
     if df.empty:
         return df
@@ -1485,6 +1855,9 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         rel_txt = format_relative_dir_block(payload)
         if rel_txt:
             lines.extend(["", rel_txt])
+        stack_txt = format_rel_e_stack_block(payload)
+        if stack_txt:
+            lines.extend(["", stack_txt])
     conf = payload.get("confidence")
     if conf:
         lines.extend(["", format_confidence_block(conf)])
@@ -3486,6 +3859,79 @@ def format_relative_dir_block(payload: dict[str, Any]) -> str:
     )
 
 
+def _fmt_stack_live(label: str, row: Mapping[str, Any] | None) -> str:
+    r = dict(row or {})
+    return (
+        f"  {label:<16}  "
+        f"IR {_as_float(r.get('unlevered_net_ir')):+.3f}  "
+        f"maxDD {_as_float(r.get('unlevered_max_dd')):+.3f}  "
+        f"to {_as_float(r.get('mean_turnover')):.3f}  "
+        f"cost {_as_float(r.get('mean_cost_unlev_bp')):.1f}bp  "
+        f"cover {100.0 * _as_float(r.get('coverage')):.1f}%  "
+        f"n={int(_as_float(r.get('n'), 0.0))}"
+    )
+
+
+def format_rel_e_stack_block(payload: dict[str, Any]) -> str:
+    promo = payload.get("rel_e_stack_promotion") or {}
+    fit = payload.get("rel_e_stack_fit") or {}
+    cmp = payload.get("rel_e_stack_compare") or {}
+    live = payload.get("rel_e_stack_live") or {}
+    if not promo and not fit:
+        return ""
+    yes_rel = bool(promo.get("promote_stack_rel"))
+    yes_abs = bool(promo.get("promote_stack_abs"))
+    yes_live = bool(promo.get("promote_stack_live"))
+    chosen = fit.get("chosen") or {}
+    va = (cmp.get("val") or {}).get("chosen") or {}
+    va_e = (cmp.get("val") or {}).get("e_sleeve") or {}
+    va_h = (cmp.get("val") or {}).get("h_chosen") or {}
+    te = (cmp.get("test") or {}).get("chosen") or {}
+    te_e = (cmp.get("test") or {}).get("e_sleeve") or {}
+    va_live = (live.get("val") or {})
+    te_live = (live.get("test") or {})
+    return "\n".join(
+        [
+            f"PROMOTE STACK RELATIVE-DIR? {'YES' if yes_rel else 'NO'}  "
+            f"PROMOTE STACK ABSOLUTE-UP? {'YES' if yes_abs else 'NO'}  "
+            f"PROMOTE STACK LIVE IR? {'YES' if yes_live else 'NO'}",
+            "  H∩E stack: pred > CS median and TRAIN top-q / |pred| floor "
+            "on sector-overnight skip pred. Relative hit vs 50% (cover ≥ 5%). "
+            "Absolute overnight-up vs E's sleeve (+0.2pp) and the up-floor. "
+            "Live IR vs q20 (F gate +0.05). TEST report-only. "
+            "Live q20 unchanged unless the IR gate clears.",
+            f"  TRAIN pick q={_as_float(chosen.get('q')):.2f}  "
+            f"abs_q={_as_float(chosen.get('abs_q')):.2f}  "
+            f"|pred|>={_as_float(chosen.get('abs_tau')):.5f}  "
+            f"fit_split={fit.get('fit_split')!r}",
+            "  VAL (gate):",
+            _fmt_rel_row("H∩E stack", va),
+            f"  VAL E sleeve up {_as_float(va_e.get('up_pct')):.2f}%  "
+            f"xs {_as_float(va_e.get('excess_pp')):+.2f}pp  "
+            f"cover {100.0 * _as_float(va_e.get('coverage')):.1f}%",
+            f"  VAL H sleeve rel {_as_float(va_h.get('rel_hit_pct')):.2f}%  "
+            f"z={_as_float(va_h.get('rel_z')):.2f}",
+            f"  VAL rel vs 50% {_as_float(promo.get('val_rel_hit')):.2f}%  "
+            f"z={_as_float(promo.get('val_rel_z')):.2f}  "
+            f"(need ≥{50.0 + REL_DIR_LIFT_PP:.1f}% and z≥{REL_DIR_Z:.1f})  "
+            f"abs vs E {_as_float(promo.get('val_vs_e_pp')):+.2f}pp  "
+            f"(need ≥+{BOOK_UP_BASE_PP:.1f}pp)",
+            _fmt_stack_live("q20", va_live.get("q20")),
+            _fmt_stack_live("H∩E live", va_live.get("stack")),
+            _fmt_stack_live("E live", va_live.get("e")),
+            "  TEST (report-only):",
+            _fmt_rel_row("H∩E stack", te),
+            f"  TEST E sleeve up {_as_float(te_e.get('up_pct')):.2f}%  "
+            f"xs {_as_float(te_e.get('excess_pp')):+.2f}pp",
+            _fmt_stack_live("q20", te_live.get("q20")),
+            _fmt_stack_live("H∩E live", te_live.get("stack")),
+            f"  {promo.get('rel_reason') or 'no stack relative decision'}",
+            f"  {promo.get('abs_reason') or 'no stack absolute decision'}",
+            f"  {promo.get('live_reason') or 'no stack live decision'}",
+        ]
+    )
+
+
 def format_confidence_block(conf: dict[str, Any]) -> str:
     lines = [
         "CONFIDENCE ( |pred_r| vs TRAIN quantiles; scored on locked TEST )",
@@ -3637,6 +4083,9 @@ def evaluate_overnight_accuracy(
     logit_up = fit_logistic_up(train_pred_r, train_r)
     book_aligned_fit = fit_book_aligned_on_train(tr, min_names=min_names)
     relative_dir_fit = fit_relative_dir_on_train(tr, min_names=min_names)
+    rel_e_stack_fit = fit_rel_e_stack_on_train(
+        tr, min_names=min_names, e_chosen=book_aligned_fit.get("chosen") or {}
+    )
     dow_table, dow_default = fit_group_median(
         train_r, weekday_of_dates(tr["date"].to_numpy(dtype=np.int64))
     )
@@ -4227,6 +4676,17 @@ def evaluate_overnight_accuracy(
                 "score_col": "pred",
                 "fit_split": "train",
             },
+            "rel_e_stack": {
+                "q": float((rel_e_stack_fit.get("chosen") or {}).get("q") or 0.80),
+                "abs_tau": float(
+                    (rel_e_stack_fit.get("chosen") or {}).get("abs_tau") or 0.0
+                ),
+                "abs_q": float(
+                    (rel_e_stack_fit.get("chosen") or {}).get("abs_q") or 0.0
+                ),
+                "score_col": "pred",
+                "fit_split": "train",
+            },
             "piecewise_l1": piecewise_spec,
             "bin_calibrate": bin_spec,
             "dow_gap": dow_spec,
@@ -4447,6 +4907,7 @@ def evaluate_overnight_accuracy(
     from forecast.shorting import (
         compare_conviction_live,
         decide_conviction_live_promote,
+        score_conviction_live_book,
     )
 
     conviction_live = compare_conviction_live(
@@ -4462,6 +4923,75 @@ def evaluate_overnight_accuracy(
     )
     payload["conviction_live"] = conviction_live
     payload["conviction_live_promotion"] = conviction_live_promotion
+    chosen_stack = rel_e_stack_fit.get("chosen") or {}
+    sq = float(chosen_stack.get("q") or 0.80)
+    stau = float(chosen_stack.get("abs_tau") or 0.0)
+    e_q = float((book_aligned_fit.get("chosen") or {}).get("q") or 0.80)
+    e_tau = float((book_aligned_fit.get("chosen") or {}).get("abs_tau") or 0.0)
+    val_stack = score_rel_e_stack(va, q=sq, abs_tau=stau, min_names=min_names)
+    test_stack = score_rel_e_stack(te, q=sq, abs_tau=stau, min_names=min_names)
+    val_e_on_stack = score_rel_e_stack(va, q=e_q, abs_tau=e_tau, min_names=min_names)
+    test_e_on_stack = score_rel_e_stack(te, q=e_q, abs_tau=e_tau, min_names=min_names)
+
+    rel_e_stack_live: dict[str, Any] = {}
+    for split_name, split_df in (("train", tr), ("val", va), ("test", te)):
+        q20_row = (conviction_live.get(split_name) or {}).get("q20") or {}
+        e_live = (conviction_live.get(split_name) or {}).get("chosen") or {}
+        if not q20_row:
+            q20_row = score_conviction_live_book(
+                split_df,
+                min_names=min_names,
+                vol_target=0.15,
+                name="q20_equal",
+            )
+        rel_e_stack_live[split_name] = {
+            "q20": q20_row,
+            "stack": score_conviction_live_book(
+                split_df,
+                min_names=min_names,
+                vol_target=0.15,
+                conviction_q=sq,
+                conf_abs=stau,
+                stack_long_half=True,
+                name=f"rel_e_q{sq:.2f}_abs{float(chosen_stack.get('abs_q') or 0.0):.2f}",
+            ),
+            "e": e_live,
+        }
+    rel_e_stack_promotion = decide_rel_e_stack_promote(
+        val_chosen=val_stack,
+        val_e=val_chosen_ba,
+        val_live_stack=(rel_e_stack_live.get("val") or {}).get("stack") or {},
+        val_live_q20=(rel_e_stack_live.get("val") or {}).get("q20") or {},
+        chosen=chosen_stack,
+    )
+    payload["rel_e_stack_fit"] = rel_e_stack_fit
+    payload["rel_e_stack_compare"] = {
+        "train": {
+            "chosen": chosen_stack,
+            "e_ref": rel_e_stack_fit.get("e_ref"),
+            "e_sleeve": book_aligned_fit.get("chosen"),
+        },
+        "val": {
+            "chosen": val_stack,
+            "e_ref": val_e_on_stack,
+            "e_sleeve": val_chosen_ba,
+            "h_chosen": val_chosen_rel,
+        },
+        "test": {
+            "chosen": test_stack,
+            "e_ref": test_e_on_stack,
+            "e_sleeve": test_chosen_ba,
+            "h_chosen": test_chosen_rel,
+        },
+        "note": (
+            "H∩E stack: pred > CS median and TRAIN top-q / |pred| floor. "
+            "Relative hit vs 50%. Absolute overnight-up vs E's sleeve. "
+            "Live IR vs q20 (F gate). TEST report-only. "
+            "Live q20 unchanged unless the IR gate clears."
+        ),
+    }
+    payload["rel_e_stack_live"] = rel_e_stack_live
+    payload["rel_e_stack_promotion"] = rel_e_stack_promotion
     if log_fn:
         log_fn(
             f"accuracy default={default_name!r}  "
@@ -4476,6 +5006,12 @@ def evaluate_overnight_accuracy(
             f"promote_relative_dir="
             f"{bool(relative_dir_promotion.get('promote_relative_dir'))}  "
             f"promote_long_half="
-            f"{bool(relative_dir_promotion.get('promote_long_half'))}"
+            f"{bool(relative_dir_promotion.get('promote_long_half'))}  "
+            f"promote_stack_rel="
+            f"{bool(rel_e_stack_promotion.get('promote_stack_rel'))}  "
+            f"promote_stack_abs="
+            f"{bool(rel_e_stack_promotion.get('promote_stack_abs'))}  "
+            f"promote_stack_live="
+            f"{bool(rel_e_stack_promotion.get('promote_stack_live'))}"
         )
     return payload

@@ -23,6 +23,8 @@ IDEA H scores within-date sign(pred − CS median) vs sign(r_on − CS median)
 on the sector-overnight skip (hit vs 50%) and the absolute overnight-up of
 the long half (pred > CS median) vs the uncond floor / top-20%. Optional
 TRAIN |pred−median| floor. Live q20 unchanged.
+IDEA I stacks H's long-half with E's TRAIN top-q / |pred| floor (light
+re-grid on TRAIN relative hit). Absolute up vs E; live IR vs q20 (F gate).
 """
 
 from __future__ import annotations
