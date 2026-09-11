@@ -604,20 +604,32 @@ def main(argv: list[str] | None = None) -> int:
     out_path = Path(args.out)
     out_path.write_text(json.dumps(payload, indent=2, default=str))
     print(f"wrote {out_path}")
-    if payload.get("promoted"):
-        print(f"PROMOTE {payload['promoted']} on locked val; report its test in the PR.")
-    else:
-        print(
-            "NO PROMOTE: trailing skip-IC shrink did not lift locked val by "
-            f">={VAL_LIFT:.3f} with val-2017 recovery "
-            f"(floor {VAL_2017_FLOOR:+.3f}, t>={VAL_2017_T})."
-        )
-        if not payload.get("labels"):
+        if payload.get("promoted"):
+            print(f"PROMOTE {payload['promoted']} on locked val; report its test in the PR.")
+        else:
             print(
-                "Close-to-close last-bar daily residual CS may not reach 0.04–0.08 "
-                "on this tape. Keep IR~1 as the honest book. Re-run with "
-                "--also-labels for overnight/session residual (new estimand)."
+                "NO PROMOTE: trailing skip-IC shrink did not lift locked val by "
+                f">={VAL_LIFT:.3f} with val-2017 recovery "
+                f"(floor {VAL_2017_FLOOR:+.3f}, t>={VAL_2017_T})."
             )
+            print(
+                "Close-to-close last-bar daily residual CS did not reach 0.04–0.08. "
+                "Keep IR~1 as the honest close-to-close book."
+            )
+            overnight = next(
+                (r for r in payload.get("labels") or [] if r.get("label_return") == "overnight"),
+                None,
+            )
+            if overnight:
+                val = overnight["val"]
+                test = overnight["test"]
+                print(
+                    "Overnight residual is a different estimand: "
+                    f"val CS IC={val['cs_ic']:+.4f} t={val['cs_ic_tstat']:.2f} "
+                    f"val2017={val['cs_ic_2017']:+.4f} t2017={val['cs_t_2017']:.2f} "
+                    f"test={test['cs_ic']:+.4f} t={test['cs_ic_tstat']:.2f}. "
+                    "Do not mix into the close-to-close headline."
+                )
     return 0
 
 

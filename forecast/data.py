@@ -736,6 +736,8 @@ def attach_residual_target(
     ``industry_residual`` adds a mapped industry ETF when present.
     ``residualize_features`` subtracts the same causal betas times same-bar
     hedge ``ret_*`` from the name's own ``ret_*`` (not a label leak).
+    ``label_return`` selects which forward log-return is residualized:
+    close-to-close (default), overnight gap, or next-session open-to-close.
     """
     bench = str(cfg.benchmark_symbol or "").upper()
     if not cfg.residual_target:

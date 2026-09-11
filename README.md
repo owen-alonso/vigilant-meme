@@ -159,7 +159,8 @@ python -m forecast.backtest --checkpoint checkpoints/forecast/best.pt --cost-bps
 python scripts/cs_collapse_ablate.py --data-dir data --universe liquid
 python scripts/cs_year_ablate.py --data-dir data --universe liquid
 python scripts/cs_regime_ablate.py --data-dir data --universe liquid
-python scripts/cs_shrink_ablate.py --data-dir data --universe liquid
+python scripts/cs_shrink_ablate.py --data-dir data --universe liquid --also-labels
+python -m forecast.training --universe liquid --skip-only --label-return overnight
 python scripts/ablate_cs.py
 python scripts/split_report.py data/AAPL_daily.parquet
 ```
