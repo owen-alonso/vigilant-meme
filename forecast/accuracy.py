@@ -326,6 +326,10 @@ def score_eval_frame(
 
     cs = cs_stats(pred, y, dates, min_names=min_names)
     cs_sign = mean_cs_sign_hit(pred, y, dates, min_names=min_names)
+    finite_r = r_on[np.isfinite(r_on) & (r_on != 0.0)]
+    finite_p = pred_r[np.isfinite(pred_r)]
+    realized_up = float((finite_r > 0).mean()) if finite_r.size else float("nan")
+    pred_up = float((finite_p > 0).mean()) if finite_p.size else float("nan")
 
     return {
         "empty": False,
@@ -344,6 +348,8 @@ def score_eval_frame(
             "long_only_pred_positive": hit_rate_inference(long_hits),
             "abs_pred_above_median": hit_rate_inference(conv_hits),
             "cross_sectional_residual_sign": cs_sign,
+            "realized_overnight_up_pct": float(100.0 * realized_up),
+            "pred_positive_pct": float(100.0 * pred_up),
         },
         "cs_ic": {
             "cs_ic": float(cs.get("cs_ic", float("nan"))),
@@ -471,9 +477,12 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
     """Human headline for the locked-test overnight accuracy eval."""
     direction = payload.get("direction") or {}
     overall = direction.get("overall") or {}
-    price = (payload.get("price_error") or {}).get("dollars") or {}
-    pct = (payload.get("price_error") or {}).get("pct_of_prior_close") or {}
-    bp = (payload.get("price_error") or {}).get("bp_of_prior_close") or {}
+    errors = payload.get("price_error") or {}
+    price = errors.get("dollars") or {}
+    pct = errors.get("pct_of_prior_close") or {}
+    bp = errors.get("bp_of_prior_close") or {}
+    zero_d = errors.get("zero_pred_baseline_dollars") or {}
+    zero_p = errors.get("zero_pred_baseline_pct") or {}
     cs = payload.get("cs_ic") or {}
     p = overall.get("p_vs_half", float("nan"))
     z = overall.get("z_vs_half", float("nan"))
@@ -509,6 +518,8 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         f"CS demeaned residual sign={float(cs_sign.get('cs_sign_hit_pct') or float('nan')):.1f}% "
         f"(that last one is the cross-sectional object).",
         f"  long-only (pred>0): {long_only.get('hit_rate_pct'):.1f}%  "
+        f"(unconditional overnight up-rate {direction.get('realized_overnight_up_pct'):.1f}%; "
+        f"model predicts up {direction.get('pred_positive_pct'):.1f}% of the time)  "
         f"|pred|>=median: {conv.get('hit_rate_pct'):.1f}%",
         "",
         f"HEADLINE |price error|  MAE ${price.get('mae'):.4f}  "
@@ -516,6 +527,8 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         f"  vs prior close: MAE {100.0 * float(pct.get('mae') or float('nan')):.4f}% "
         f"({float(bp.get('mae') or float('nan')):.1f} bp)  "
         f"median {100.0 * float(pct.get('median_ae') or float('nan')):.4f}%",
+        f"  zero-move baseline MAE ${float(zero_d.get('mae') or float('nan')):.4f} / "
+        f"{100.0 * float(zero_p.get('mae') or float('nan')):.4f}%",
         "  implied next open = close_t * exp(pred * sigma); residual omits the hedge overnight.",
         "  Do not treat this as a tradable edge or live profitability.",
     ]

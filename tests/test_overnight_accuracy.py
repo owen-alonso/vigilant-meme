@@ -82,6 +82,7 @@ def test_score_eval_frame_perfect_overnight_prices():
     assert out["n_samples"] == 4
     assert out["n_dates"] == 2
     assert out["direction"]["overall"]["hit_rate"] == 1.0
+    assert out["direction"]["realized_overnight_up_pct"] == 50.0
     assert out["price_error"]["dollars"]["mae"] < 1e-9
 
 
