@@ -13,12 +13,14 @@ from forecast.accuracy import (
     apply_bin_constants,
     apply_calibrate_spec,
     apply_cond_dir_blend,
+    apply_cs_left_veto,
     apply_decile_reliability,
     apply_drift_veto,
     apply_readout,
     cond_abs_mask,
     fit_cond_dir_blend,
     fit_confidence_blend,
+    fit_cs_left_veto,
     fit_decile_reliability,
     fit_left_tail_l1,
     direction_hits,
@@ -245,6 +247,7 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert "left_tail_l1" in names
     assert "cond_dir_blend" in names
     assert "decile_reliability" in names
+    assert "cs_left_veto" in names
     promo = payload["promotion"]
     assert promo["cs_skip_unchanged"] is True
     # Promotion is VAL-only; test keys exist for the report but are not the gate.
@@ -461,6 +464,34 @@ def test_decile_reliability_is_train_only():
     )
     cal = apply_calibrate_spec(train_p, {"kind": "decile_reliability", **spec})
     assert np.allclose(hat, cal, equal_nan=True)
+
+
+def test_cs_left_veto_is_train_only_and_requires_cs_bottom():
+    rng = np.random.default_rng(7)
+    n_days, n_names = 40, 10
+    dates = np.repeat(np.arange(n_days), n_names)
+    pred = np.tile(np.linspace(-1.0, 1.0, n_names), n_days)
+    pred_r = pred * 0.01
+    # Bottom CS names are actually down; others drift up.
+    r_on = np.where(pred < np.quantile(pred, 0.20), -0.004, 0.003)
+    r_on = r_on + rng.normal(scale=0.0003, size=pred.size)
+    spec = fit_cs_left_veto(pred_r, r_on, pred, dates)
+    later_p = rng.normal(size=200)
+    later_y = -np.sign(later_p) * 0.01
+    later_d = np.repeat(np.arange(20), 10)
+    leaked = fit_cs_left_veto(later_p, later_y, later_p, later_d)
+    assert spec["q"] in (0.10, 0.15, 0.20, 0.30)
+    assert abs(float(spec["tau"]) - float(leaked["tau"])) > 1e-12 or spec["q"] != leaked["q"]
+    hat = apply_cs_left_veto(
+        pred_r, pred, dates, spec["tau"], spec["q"], spec["a_dn"], spec["b_dn"], spec["b_up"]
+    )
+    # Names that are not CS-bottom must stay the always-up constant.
+    import pandas as pd
+
+    pct = pd.Series(pred).groupby(pd.Series(dates)).rank(pct=True, method="average")
+    not_bottom = pct.to_numpy() > float(spec["q"])
+    if int(not_bottom.sum()) >= 4:
+        assert np.allclose(hat[not_bottom], spec["b_up"])
 
 
 def test_apply_calibrate_spec_affine_and_veto():

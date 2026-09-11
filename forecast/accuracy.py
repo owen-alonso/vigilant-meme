@@ -866,6 +866,9 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         dec_txt = format_decile_reliability_block(ablate, payload.get("promotion") or {})
         if dec_txt:
             lines.extend(["", dec_txt])
+        csv_txt = format_cs_left_veto_block(ablate, payload.get("promotion") or {})
+        if csv_txt:
+            lines.extend(["", csv_txt])
     conf = payload.get("confidence")
     if conf:
         lines.extend(["", format_confidence_block(conf)])
@@ -1344,6 +1347,109 @@ def apply_drift_veto(
     return out
 
 
+CS_LEFT_QS = (0.10, 0.15, 0.20, 0.30)
+CS_LEFT_TAUS = (0.05, 0.10, 0.15, 0.20, 0.30)
+
+
+def cs_bottom_mask(
+    scores: np.ndarray,
+    dates: np.ndarray,
+    q: float,
+) -> np.ndarray:
+    """Within-date bottom quantile of ``scores``. Causal (no labels)."""
+    s = pd.Series(np.asarray(scores, dtype=np.float64))
+    d = pd.Series(np.asarray(dates))
+    pct = s.groupby(d, sort=False).rank(pct=True, method="average")
+    return pct.to_numpy(dtype=np.float64) <= float(q)
+
+
+def apply_cs_left_veto(
+    pred_r: np.ndarray,
+    cs_score: np.ndarray,
+    dates: np.ndarray,
+    tau: float,
+    q: float,
+    a_dn: float,
+    b_dn: float,
+    b_up: float,
+) -> np.ndarray:
+    """Always-up except the intersection of CS-bottom and TS left tail."""
+    p = np.asarray(pred_r, dtype=np.float64)
+    bottom = cs_bottom_mask(cs_score, dates, q)
+    down = bottom & (p <= float(tau))
+    out = np.full(p.shape, float(b_up), dtype=np.float64)
+    out[down] = float(a_dn) * p[down] + float(b_dn)
+    return out
+
+
+def fit_cs_left_veto(
+    pred_r: np.ndarray,
+    r_on: np.ndarray,
+    cs_score: np.ndarray,
+    dates: np.ndarray,
+    *,
+    qs: Sequence[float] = CS_LEFT_QS,
+    tau_qs: Sequence[float] = CS_LEFT_TAUS,
+) -> dict[str, float]:
+    """TRAIN-only CS-bottom ∩ TS-left veto. No VAL/TEST rows."""
+    p = np.asarray(pred_r, dtype=np.float64)
+    y = np.asarray(r_on, dtype=np.float64)
+    c = np.asarray(cs_score, dtype=np.float64)
+    d = np.asarray(dates)
+    ok = np.isfinite(p) & np.isfinite(y) & np.isfinite(c)
+    p, y, c, d = p[ok], y[ok], c[ok], d[ok]
+    b_up = float(np.median(y) if y.size else 0.0)
+    fallback = {
+        "tau": float(np.quantile(p, 0.15) if p.size else 0.0),
+        "q": 0.20,
+        "a_dn": 0.0,
+        "b_dn": b_up,
+        "b_up": b_up,
+        "tau_q": 0.15,
+    }
+    if p.size < 64:
+        return fallback
+    best = dict(fallback)
+    best_key = (-1e9, 1e9)
+    for q in qs:
+        bottom = cs_bottom_mask(c, d, float(q))
+        if int(bottom.sum()) < 24:
+            continue
+        for tq in tau_qs:
+            tau = float(np.quantile(p, float(tq)))
+            down = bottom & (p <= tau)
+            n_dn = int(down.sum())
+            if n_dn < 16 or n_dn > 0.45 * p.size:
+                continue
+            b_dn_c = float(np.median(y[down]))
+            candidates = [
+                (0.0, b_dn_c),
+            ]
+            if n_dn >= 32:
+                a_dn, b_dn_a = fit_affine_l1(p[down], y[down])
+                candidates.append((float(a_dn), float(b_dn_a)))
+            for a_dn, b_dn in candidates:
+                hat = apply_cs_left_veto(p, c, d, tau, float(q), a_dn, b_dn, b_up)
+                if float(np.mean(hat < 0.0)) < 0.01:
+                    continue
+                excess = _direction_excess(hat, y)
+                mae = float(np.mean(np.abs(hat - y)))
+                if not np.isfinite(excess):
+                    continue
+                key = (excess, -mae)
+                if key > best_key:
+                    best_key = key
+                    best = {
+                        "tau": tau,
+                        "q": float(q),
+                        "a_dn": float(a_dn),
+                        "b_dn": float(b_dn),
+                        "b_up": b_up,
+                        "tau_q": float(tq),
+                    }
+    return best
+
+
 def fit_left_tail_l1(
     pred_r: np.ndarray,
     r_on: np.ndarray,
@@ -1606,6 +1712,21 @@ def apply_calibrate_spec(
         return apply_drift_veto(
             p,
             float(params.get("tau") or 0.0),
+            float(params.get("a_dn") or 0.0),
+            float(params.get("b_dn") or 0.0),
+            float(params.get("b_up") or 0.0),
+        )
+    if kind in ("cs_left_veto",):
+        if dates is None:
+            d = np.arange(p.shape[0], dtype=np.int64)
+        else:
+            d = np.asarray(dates)
+        return apply_cs_left_veto(
+            p,
+            p,
+            d,
+            float(params.get("tau") or 0.0),
+            float(params.get("q") or 0.20),
             float(params.get("a_dn") or 0.0),
             float(params.get("b_dn") or 0.0),
             float(params.get("b_up") or 0.0),
@@ -2223,6 +2344,45 @@ def format_decile_reliability_block(
     return "\n".join(lines)
 
 
+def format_cs_left_veto_block(
+    ablate: dict[str, Any], promotion: dict[str, Any]
+) -> str:
+    row = next(
+        (r for r in (ablate.get("rows") or []) if r.get("name") == "cs_left_veto"),
+        None,
+    )
+    if not row:
+        return ""
+    params = row.get("params") or {}
+    v = row.get("val") or {}
+    t = row.get("test") or {}
+    yes = bool(row.get("promote_dir"))
+    default = str(promotion.get("direction") or "") == "cs_left_veto"
+    return "\n".join(
+        [
+            f"PROMOTE CS-LEFT VETO? {'YES' if yes else 'NO'}"
+            + ("  (accuracy default)" if default else ""),
+            "  Always-up except CS-bottom ∩ TS left-tail of pred_r. "
+            "q and τ are TRAIN-only. VAL gate vs train-median +0.2pp AND "
+            "residual*σ +0.2pp. CS skip / live book unchanged.",
+            f"  TRAIN q={_as_float(params.get('q')):.2f}  "
+            f"τ_q={_as_float(params.get('tau_q')):.2f}  "
+            f"τ={_as_float(params.get('tau')):.6f}  "
+            f"a_dn={_as_float(params.get('a_dn')):.4f}  "
+            f"(fit_split=train)",
+            f"  VAL dir {_as_float(v.get('dir_pct')):.2f}%  "
+            f"xs {_as_float(v.get('excess_pp')):+.2f}pp  "
+            f"MAE {_as_float(v.get('mae_usd')):.4f}$ / "
+            f"{100.0 * _as_float(v.get('mae_pct')):.4f}%  "
+            f"promote_dir={yes}",
+            f"  TEST dir {_as_float(t.get('dir_pct')):.2f}%  "
+            f"xs {_as_float(t.get('excess_pp')):+.2f}pp  "
+            f"MAE {_as_float(t.get('mae_usd')):.4f}$ / "
+            f"{100.0 * _as_float(t.get('mae_pct')):.4f}%  (report-only)",
+        ]
+    )
+
+
 def format_confidence_block(conf: dict[str, Any]) -> str:
     lines = [
         "CONFIDENCE ( |pred_r| vs TRAIN quantiles; scored on locked TEST )",
@@ -2365,6 +2525,12 @@ def evaluate_overnight_accuracy(
     blend = fit_confidence_blend(train_pred_r, train_r, a_l1, b_l1, mu_med)
     cond_blend = fit_cond_dir_blend(train_pred_r, train_r, left_tail, blend, mu_med)
     decile_rel = fit_decile_reliability(train_pred_r, train_r)
+    cs_veto = fit_cs_left_veto(
+        train_pred_r,
+        train_r,
+        tr["pred"].to_numpy(dtype=np.float64),
+        tr["date"].to_numpy(dtype=np.int64),
+    )
     dow_table, dow_default = fit_group_median(
         train_r, weekday_of_dates(tr["date"].to_numpy(dtype=np.int64))
     )
@@ -2409,6 +2575,7 @@ def evaluate_overnight_accuracy(
     blend_spec = {"kind": "confidence_blend", **blend}
     cond_spec = {"kind": "cond_dir_blend", **cond_blend}
     decile_spec = {"kind": "decile_reliability", **decile_rel}
+    cs_veto_spec = {"kind": "cs_left_veto", **cs_veto}
     dow_spec = {
         "kind": "dow_gap",
         "by_dow": _table_to_jsonable(dow_table),
@@ -2668,6 +2835,31 @@ def evaluate_overnight_accuracy(
             ),
         ),
         (
+            "cs_left_veto",
+            "direction",
+            cs_veto_spec,
+            lambda d, x, spec=cs_veto: apply_cs_left_veto(
+                d["pred_r"].to_numpy(dtype=np.float64),
+                d["pred"].to_numpy(dtype=np.float64),
+                d["date"].to_numpy(dtype=np.int64),
+                spec["tau"],
+                spec["q"],
+                spec["a_dn"],
+                spec["b_dn"],
+                spec["b_up"],
+            ),
+            lambda d, x, spec=cs_veto: apply_cs_left_veto(
+                d["pred_r"].to_numpy(dtype=np.float64),
+                d["pred"].to_numpy(dtype=np.float64),
+                d["date"].to_numpy(dtype=np.int64),
+                spec["tau"],
+                spec["q"],
+                spec["a_dn"],
+                spec["b_dn"],
+                spec["b_up"],
+            ),
+        ),
+        (
             "dow_gap",
             "calendar",
             dow_spec,
@@ -2857,6 +3049,7 @@ def evaluate_overnight_accuracy(
             "confidence_blend": blend,
             "cond_dir_blend": cond_blend,
             "decile_reliability": decile_rel,
+            "cs_left_veto": cs_veto,
             "piecewise_l1": piecewise_spec,
             "bin_calibrate": bin_spec,
             "dow_gap": dow_spec,
@@ -2929,6 +3122,16 @@ def evaluate_overnight_accuracy(
             np.asarray(decile_rel["edges"], dtype=np.float64),
             np.asarray(decile_rel["keep"], dtype=np.bool_),
             float(decile_rel["b_up"]),
+        ),
+        "cs_left_veto": apply_cs_left_veto(
+            train_pred_r,
+            tr["pred"].to_numpy(dtype=np.float64),
+            tr["date"].to_numpy(dtype=np.int64),
+            cs_veto["tau"],
+            cs_veto["q"],
+            cs_veto["a_dn"],
+            cs_veto["b_dn"],
+            cs_veto["b_up"],
         ),
         "dow_gap": train_dow,
         "dow_plus_residual": train_dow + apply_affine(train_pred_r, a_dow, b_dow),

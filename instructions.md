@@ -71,6 +71,7 @@ python -m forecast.training --universe liquid --interval daily --skip-only \
 # fit on TRAIN, promote on locked VAL, report locked TEST. Not live P&L.
 # cond_dir_blend = high-|pred| mix of left_tail_l1 ⊕ confidence_blend (TRAIN q,λ)
 # decile_reliability = keep residual*sigma only in TRAIN-reliable pred_r bins
+# cs_left_veto = always-up except CS-bottom ∩ TS left tail (TRAIN q, τ)
 python scripts/overnight_accuracy.py --data-dir data --universe liquid \
     --json checkpoints/forecast_ridge_overnight/accuracy.json \
     --calibrate-json checkpoints/forecast_ridge_overnight/overnight_calibrate.json
