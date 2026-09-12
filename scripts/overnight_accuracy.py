@@ -31,6 +31,10 @@ LS vs long-only q20. Live q20 unchanged on hit-rate-only.
 IDEA K builds a symmetric long-E / short-J LS (paper zero-cost + live_locate)
 and promotes the live path only if VAL IR ≥ q20+0.05 and DD is not worse
 by >0.05.
+IDEA L is a two-stage TRAIN-only next-open MAE map (residual*sigma → gap,
+then gap → next-open $/% with close_t) plus a residual+DOW+vol ridge.
+Promote a new MAE default only if VAL % MAE beats residual×σ / zero-move /
+train-median by ≥0.5 bp and is not worse than the current default.
 """
 
 from __future__ import annotations

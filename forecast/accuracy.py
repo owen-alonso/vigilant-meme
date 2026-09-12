@@ -15,6 +15,7 @@ converts that to an implied overnight log-return ``pred * sigma`` (same as
 - short-sleeve overnight down-rate on the within-date bottom residual names
 - book-aligned short sleeve overnight-down (TRAIN bottom-q / |pred| grid, VAL-gated)
 - symmetric long-E / short-J LS (paper zero-cost + live_locate vs q20)
+- two-stage next-open MAE (residual→gap, then gap→price using close_t)
 
 Default recipe is the PR #5 overnight skip (rank-target ridge, ``no_long_ts``).
 PR #7 levers stay off unless a checkpoint documents them.
@@ -66,6 +67,14 @@ BOOK_ALIGN_COVER = 0.05
 # IDEA G: clear VAL % MAE margin vs residual×σ / zero-move / train-median (0.5 bp).
 MAE_LIFT = 5e-5
 SECTOR_MAE_MAPS = ("affine_l1", "piecewise_l1", "huber_affine", "bin_calibrate")
+# IDEA L: two-stage residual→gap→next-open, plus residual+DOW+vol ridge.
+TWO_STAGE_MAE_MAPS = (
+    "two_stage_l1_pct",
+    "two_stage_huber_pct",
+    "two_stage_piecewise_pct",
+    "two_stage_l1_usd",
+    "ridge_resid_dow_vol",
+)
 # IDEA H: within-date relative direction vs 50%, and long-half overnight-up.
 REL_DIR_LIFT_PP = 0.50
 REL_DIR_Z = 1.0
@@ -2286,6 +2295,9 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         mae_txt = format_sector_mae_block(payload)
         if mae_txt:
             lines.extend(["", mae_txt])
+        two_txt = format_two_stage_mae_block(payload)
+        if two_txt:
+            lines.extend(["", two_txt])
         rel_txt = format_relative_dir_block(payload)
         if rel_txt:
             lines.extend(["", rel_txt])
@@ -2686,6 +2698,342 @@ def decide_sector_mae_promote(
         )
     return {
         "promote_sector_mae": promote,
+        "gated_on": "val",
+        "reason": reason,
+        "name": best_name if promote else cur_name,
+        "best_name": best_name,
+        "spec": dict((maps or {}).get(best_name) or {}) if promote else {},
+        "val_best": best_row,
+        "val_residual": dict(val_residual or {}),
+        "val_zero": dict(val_zero or {}),
+        "val_median": dict(val_median or {}),
+        "val_current": dict(val_current or {}),
+        "current_name": cur_name,
+        "val_mae_pct": best_mae,
+        "val_floor_mae_pct": floor,
+        "val_margin_bp": 1e4 * margin if np.isfinite(margin) else float("nan"),
+        "val_vs_current_bp": 1e4 * vs_current if np.isfinite(vs_current) else float("nan"),
+        "mae_lift": MAE_LIFT,
+        "dir_report_only": (not dir_ok),
+        "dir_clears_gates": dir_ok,
+        "hedge": "sector_overnight",
+        "live_book_unchanged": True,
+    }
+
+
+def _price_mult_from_log(hat_r: np.ndarray) -> np.ndarray:
+    return np.exp(np.clip(np.asarray(hat_r, dtype=np.float64), -20.0, 20.0))
+
+
+def _log_from_mult(mult: np.ndarray) -> np.ndarray:
+    m = np.asarray(mult, dtype=np.float64)
+    out = np.full(m.shape, np.nan, dtype=np.float64)
+    ok = np.isfinite(m) & (m > 1e-12)
+    out[ok] = np.log(m[ok])
+    return out
+
+
+def _dow_dummies(weekdays: np.ndarray, n_days: int = 5) -> np.ndarray:
+    wd = np.asarray(weekdays, dtype=np.int64)
+    out = np.zeros((wd.size, int(n_days)), dtype=np.float64)
+    for i, day in enumerate(wd):
+        if 0 <= int(day) < int(n_days):
+            out[i, int(day)] = 1.0
+    return out
+
+
+def fit_resid_dow_vol_ridge(
+    pred_r: np.ndarray,
+    r_on: np.ndarray,
+    dates: np.ndarray,
+    vol_level: np.ndarray | None,
+    *,
+    ridge: float = 10.0,
+) -> dict[str, Any]:
+    """TRAIN-only ridge: sector residual*sigma + causal DOW + trailing vol → r_on."""
+    p = np.asarray(pred_r, dtype=np.float64)
+    y = np.asarray(r_on, dtype=np.float64)
+    if vol_level is None:
+        v = np.zeros_like(p)
+    else:
+        v = np.asarray(vol_level, dtype=np.float64)
+        if v.shape[0] != p.shape[0]:
+            v = np.zeros_like(p)
+    v = np.where(np.isfinite(v), v, 0.0)
+    wd = weekday_of_dates(np.asarray(dates, dtype=np.int64))
+    x = np.column_stack([p, v, _dow_dummies(wd)])
+    ok = np.isfinite(p) & np.isfinite(y) & np.isfinite(x).all(axis=1)
+    n_ok = int(ok.sum())
+    k = int(x.shape[1])
+    if n_ok < max(12, k + 4):
+        return {
+            "kind": "ridge_resid_dow_vol",
+            "weights": [0.0] * k,
+            "bias": float(np.median(y[ok]) if n_ok else 0.0),
+            "feat_mean": [0.0] * k,
+            "feat_std": [1.0] * k,
+            "ridge": float(ridge),
+        }
+    mu = x[ok].mean(axis=0)
+    sd = x[ok].std(axis=0)
+    sd = np.where(sd < 1e-8, 1.0, sd)
+    z = (x[ok] - mu) / sd
+    design = np.column_stack([z, np.ones(n_ok, dtype=np.float64)])
+    xtx = design.T @ design
+    xtx[:k, :k] = xtx[:k, :k] + float(ridge) * np.eye(k)
+    coef, *_ = np.linalg.lstsq(xtx, design.T @ y[ok], rcond=None)
+    return {
+        "kind": "ridge_resid_dow_vol",
+        "weights": [float(v) for v in coef[:k]],
+        "bias": float(coef[k]),
+        "feat_mean": [float(v) for v in mu],
+        "feat_std": [float(v) for v in sd],
+        "ridge": float(ridge),
+    }
+
+
+def apply_resid_dow_vol_ridge(
+    pred_r: np.ndarray,
+    spec: Mapping[str, Any],
+    *,
+    dates: np.ndarray | None,
+    vol_level: np.ndarray | None,
+) -> np.ndarray:
+    p = np.asarray(pred_r, dtype=np.float64)
+    if vol_level is None:
+        v = np.zeros_like(p)
+    else:
+        v = np.asarray(vol_level, dtype=np.float64)
+        if v.shape[0] != p.shape[0]:
+            v = np.zeros_like(p)
+    v = np.where(np.isfinite(v), v, 0.0)
+    if dates is None:
+        wd = np.zeros(p.shape[0], dtype=np.int64)
+    else:
+        wd = weekday_of_dates(np.asarray(dates, dtype=np.int64))
+    x = np.column_stack([p, v, _dow_dummies(wd)])
+    w = np.asarray(spec.get("weights") or [], dtype=np.float64)
+    mu = np.asarray(spec.get("feat_mean") or [], dtype=np.float64)
+    sd = np.asarray(spec.get("feat_std") or [], dtype=np.float64)
+    if w.size != x.shape[1] or mu.size != x.shape[1] or sd.size != x.shape[1]:
+        return np.full_like(p, float(spec.get("bias") or 0.0))
+    sd = np.where(np.abs(sd) < 1e-8, 1.0, sd)
+    z = (x - mu) / sd
+    return z @ w + float(spec.get("bias") or 0.0)
+
+
+def apply_two_stage_map(
+    pred_r: np.ndarray,
+    spec: Mapping[str, Any] | None,
+    *,
+    close: np.ndarray | None = None,
+    dates: np.ndarray | None = None,
+    vol_level: np.ndarray | None = None,
+) -> np.ndarray:
+    """Apply a TRAIN-only two-stage or residual+DOW+vol MAE readout.
+
+    Next open is never an input. ``close`` is the prior close known at t.
+    """
+    params = dict(spec or {})
+    kind = str(params.get("kind") or params.get("name") or "").strip().lower()
+    if kind in ("ridge_resid_dow_vol", "resid_dow_vol"):
+        return apply_resid_dow_vol_ridge(
+            pred_r, params, dates=dates, vol_level=vol_level
+        )
+    hat = apply_calibrate_spec(pred_r, params.get("stage1") or {})
+    a2 = 1.0 if params.get("a2") is None else float(params["a2"])
+    b2 = 0.0 if params.get("b2") is None else float(params["b2"])
+    g = _price_mult_from_log(hat)
+    space = str(params.get("stage2") or params.get("space") or "pct").lower()
+    if space in ("usd", "dollar", "$"):
+        if close is None:
+            return _log_from_mult(a2 * g + b2)
+        c = np.asarray(close, dtype=np.float64)
+        implied = a2 * c * g + b2
+        return _log_from_mult(implied / np.clip(c, 1e-12, None))
+    return _log_from_mult(a2 * g + b2)
+
+
+def fit_two_stage_mae_maps(df: pd.DataFrame) -> dict[str, Any]:
+    """TRAIN-only residual→gap then gap→next-open $/%, plus residual+DOW+vol ridge.
+
+    Stage 2 uses ``close_t`` (known) and ``next_open`` as the *label* only.
+    """
+    empty = {
+        "fit_split": "train",
+        "hedge": "sector_overnight",
+        "maps": {},
+        "note": (
+            "Two-stage next-open MAE. Stage 1 maps residual*sigma → overnight "
+            "gap. Stage 2 maps exp(gap) → next-open $ or % using close_t. "
+            "ridge_resid_dow_vol is pred_r + causal DOW + trailing vol → r_on. "
+            "Next open is never a feature."
+        ),
+    }
+    if df.empty or "pred_r" not in df.columns:
+        return empty
+    pred_r = df["pred_r"].to_numpy(dtype=np.float64)
+    r_on = df["r_on"].to_numpy(dtype=np.float64)
+    close = df["close"].to_numpy(dtype=np.float64)
+    nxt = df["next_open"].to_numpy(dtype=np.float64)
+    stage1 = (fit_residual_mae_maps(pred_r, r_on).get("maps") or {})
+    maps: dict[str, Any] = {}
+    pairs = (
+        ("affine_l1", "two_stage_l1_pct"),
+        ("huber_affine", "two_stage_huber_pct"),
+        ("piecewise_l1", "two_stage_piecewise_pct"),
+    )
+    y_pct = nxt / np.clip(close, 1e-12, None)
+    for s1_name, out_name in pairs:
+        s1 = dict(stage1.get(s1_name) or {})
+        hat = apply_calibrate_spec(pred_r, s1)
+        a2, b2 = fit_affine_l1(_price_mult_from_log(hat), y_pct)
+        maps[out_name] = {
+            "kind": out_name,
+            "stage1": s1,
+            "stage2": "pct",
+            "a2": float(a2),
+            "b2": float(b2),
+        }
+    s1_l1 = dict(stage1.get("affine_l1") or {})
+    hat_l1 = apply_calibrate_spec(pred_r, s1_l1)
+    a2u, b2u = fit_affine_l1(close * _price_mult_from_log(hat_l1), nxt)
+    maps["two_stage_l1_usd"] = {
+        "kind": "two_stage_l1_usd",
+        "stage1": s1_l1,
+        "stage2": "usd",
+        "a2": float(a2u),
+        "b2": float(b2u),
+    }
+    vol = (
+        df["vol_level"].to_numpy(dtype=np.float64)
+        if "vol_level" in df.columns
+        else None
+    )
+    maps["ridge_resid_dow_vol"] = fit_resid_dow_vol_ridge(
+        pred_r,
+        r_on,
+        df["date"].to_numpy(dtype=np.int64),
+        vol,
+        ridge=10.0,
+    )
+    empty["maps"] = maps
+    return empty
+
+
+def score_two_stage_mae_map(
+    df: pd.DataFrame,
+    spec: Mapping[str, Any],
+    *,
+    min_names: int,
+) -> dict[str, float]:
+    if df.empty:
+        return slim_accuracy({"empty": True})
+    vol = (
+        df["vol_level"].to_numpy(dtype=np.float64)
+        if "vol_level" in df.columns
+        else None
+    )
+    hat = apply_two_stage_map(
+        df["pred_r"].to_numpy(dtype=np.float64),
+        spec,
+        close=df["close"].to_numpy(dtype=np.float64),
+        dates=df["date"].to_numpy(dtype=np.int64),
+        vol_level=vol,
+    )
+    return slim_accuracy(_score_pred_r(df, hat, min_names))
+
+
+def decide_two_stage_mae_promote(
+    *,
+    val_maps: dict[str, dict[str, Any]],
+    val_residual: dict[str, Any],
+    val_zero: dict[str, Any],
+    val_median: dict[str, Any],
+    val_current: dict[str, Any] | None,
+    current_name: str,
+    maps: dict[str, Any],
+) -> dict[str, Any]:
+    """VAL-only. Promote a two-stage / ridge MAE map vs floors and current default."""
+    scored: list[tuple[str, dict[str, Any]]] = []
+    for name in TWO_STAGE_MAE_MAPS:
+        row = dict(val_maps.get(name) or {})
+        mae = _as_float(row.get("mae_pct"))
+        if np.isfinite(mae):
+            scored.append((name, row))
+    resid = _as_float((val_residual or {}).get("mae_pct"))
+    zero = _as_float((val_zero or {}).get("mae_pct"))
+    median = _as_float((val_median or {}).get("mae_pct"))
+    floor = min(
+        [x for x in (resid, zero, median) if np.isfinite(x)],
+        default=float("nan"),
+    )
+    best_name = ""
+    best_row: dict[str, Any] = {}
+    best_mae = float("nan")
+    for name, row in scored:
+        mae = _as_float(row.get("mae_pct"))
+        if not np.isfinite(best_mae) or mae < best_mae:
+            best_mae = mae
+            best_name = name
+            best_row = row
+    margin = (
+        float(floor - best_mae)
+        if np.isfinite(floor) and np.isfinite(best_mae)
+        else float("nan")
+    )
+    floors_ok = bool(np.isfinite(margin) and margin >= MAE_LIFT)
+    cur_name = str(current_name or "residual_sigma")
+    cur_mae = _as_float((val_current or {}).get("mae_pct"))
+    if not np.isfinite(cur_mae):
+        cur_mae = resid
+    vs_current = (
+        float(cur_mae - best_mae)
+        if np.isfinite(cur_mae) and np.isfinite(best_mae)
+        else float("nan")
+    )
+    current_ok = bool(np.isfinite(vs_current) and vs_current >= -1e-15)
+    same = bool(best_name and best_name == cur_name)
+    promote = bool(best_name and floors_ok and current_ok and not same)
+    dir_pct = _as_float(best_row.get("dir_pct"))
+    resid_dir = _as_float((val_residual or {}).get("dir_pct"))
+    med_dir = _as_float((val_median or {}).get("dir_pct"))
+    dir_ok = bool(
+        np.isfinite(dir_pct)
+        and np.isfinite(resid_dir)
+        and np.isfinite(med_dir)
+        and dir_pct >= resid_dir + 100.0 * DIR_LIFT
+        and dir_pct >= med_dir + 100.0 * DIR_LIFT
+    )
+    if not best_name:
+        reason = "NO PROMOTE: no finite VAL MAE among two-stage next-open maps."
+    elif same and floors_ok:
+        reason = (
+            f"NO NEW MAE DEFAULT: {best_name} is already the accuracy default "
+            f"(VAL MAE% {100.0 * best_mae:.4f}, margin vs floors {1e4 * margin:+.2f} bp)."
+        )
+    elif not floors_ok:
+        reason = (
+            f"NO PROMOTE: best {best_name} VAL MAE% {100.0 * best_mae:.4f} vs "
+            f"residual {100.0 * resid:.4f} / zero {100.0 * zero:.4f} / "
+            f"median {100.0 * median:.4f} (margin {1e4 * margin:+.2f} bp "
+            f"< +{1e4 * MAE_LIFT:.1f} bp). Keep {cur_name}."
+        )
+    elif not current_ok:
+        reason = (
+            f"NO PROMOTE: {best_name} VAL MAE% {100.0 * best_mae:.4f} is worse "
+            f"than current default {cur_name} {100.0 * cur_mae:.4f} "
+            f"(delta {1e4 * vs_current:+.2f} bp). Keep {cur_name}."
+        )
+    else:
+        reason = (
+            f"PROMOTE two-stage next-open MAE default {best_name}: VAL MAE% "
+            f"{100.0 * best_mae:.4f} beats residual/zero/median by "
+            f"{1e4 * margin:+.2f} bp and is not worse than {cur_name} "
+            f"({1e4 * vs_current:+.2f} bp). Live q20 book unchanged."
+        )
+    return {
+        "promote_two_stage_mae": promote,
         "gated_on": "val",
         "reason": reason,
         "name": best_name if promote else cur_name,
@@ -3332,6 +3680,7 @@ def apply_calibrate_spec(
     *,
     dates: np.ndarray | None = None,
     vol_level: np.ndarray | None = None,
+    close: np.ndarray | None = None,
 ) -> np.ndarray:
     """Apply a VAL-gated overnight readout spec to ``pred*sigma``.
 
@@ -3439,6 +3788,14 @@ def apply_calibrate_spec(
         keep = np.asarray([bool(v) for v in keep_raw], dtype=np.bool_)
         return apply_decile_reliability(
             p, edges, keep, float(params.get("b_up") or 0.0)
+        )
+    if kind in TWO_STAGE_MAE_MAPS or kind in (
+        "two_stage_pct",
+        "two_stage_usd",
+        "resid_dow_vol",
+    ):
+        return apply_two_stage_map(
+            p, params, close=close, dates=dates, vol_level=vol_level
         )
     if kind in ("dow_gap", "dow_plus_residual"):
         if dates is None:
@@ -4352,6 +4709,59 @@ def format_sector_mae_block(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_two_stage_mae_block(payload: dict[str, Any]) -> str:
+    promo = payload.get("two_stage_mae_promotion") or {}
+    cmp = payload.get("two_stage_mae_compare") or {}
+    fit = payload.get("two_stage_mae_fit") or {}
+    if not promo and not cmp:
+        return ""
+    yes = bool(promo.get("promote_two_stage_mae"))
+    val_maps = cmp.get("val") or {}
+    test_maps = cmp.get("test") or {}
+    lines = [
+        f"PROMOTE TWO-STAGE MAE? {'YES' if yes else 'NO'}",
+        "  TRAIN two-stage next-open MAE: residual*sigma → overnight gap "
+        "(affine_l1 / huber / piecewise), then gap → next-open $/% using "
+        "close_t. Also residual + causal DOW + trailing vol ridge. "
+        f"VAL % MAE must beat residual×σ AND zero-move AND train-median by "
+        f"≥{1e4 * MAE_LIFT:.1f} bp, and must not be worse than the current "
+        "MAE default. Dir report-only unless it also clears dir gates. "
+        "Live q20 book unchanged. Next open is never a feature.",
+        f"  hedge={fit.get('hedge') or promo.get('hedge')!r}  "
+        f"fit_split={fit.get('fit_split')!r}  "
+        f"current_default={promo.get('current_name')!r}",
+        "  VAL (gate):",
+        _fmt_mae_row("residual×σ", cmp.get("val_residual") or {}),
+        _fmt_mae_row("zero-move", cmp.get("val_zero") or {}),
+        _fmt_mae_row("train-median", cmp.get("val_median") or {}),
+    ]
+    for name in TWO_STAGE_MAE_MAPS:
+        mark = " *" if name == promo.get("best_name") else ""
+        lines.append(_fmt_mae_row(name + mark, val_maps.get(name) or {}))
+    if cmp.get("val_current") and str(promo.get("current_name") or "") not in TWO_STAGE_MAE_MAPS:
+        lines.append(
+            _fmt_mae_row(
+                f"current {promo.get('current_name')}",
+                cmp.get("val_current") or {},
+            )
+        )
+    lines.extend(
+        [
+            f"  VAL best={promo.get('best_name')!r}  "
+            f"margin vs floors {_as_float(promo.get('val_margin_bp')):+.2f} bp  "
+            f"vs current {_as_float(promo.get('val_vs_current_bp')):+.2f} bp  "
+            f"(floors need ≥+{1e4 * MAE_LIFT:.1f} bp; current must not be worse)  "
+            f"dir_clears_gates={bool(promo.get('dir_clears_gates'))}",
+            "  TEST (report-only):",
+            _fmt_mae_row("residual×σ", cmp.get("test_residual") or {}),
+        ]
+    )
+    for name in TWO_STAGE_MAE_MAPS:
+        lines.append(_fmt_mae_row(name, test_maps.get(name) or {}))
+    lines.append(f"  {promo.get('reason') or 'no decision'}")
+    return "\n".join(lines)
+
+
 def _fmt_rel_row(label: str, row: Mapping[str, Any] | None) -> str:
     r = dict(row or {})
     return (
@@ -5190,6 +5600,67 @@ def evaluate_overnight_accuracy(
         if default_pr_test is None:
             default_pr_test = te["pred_r"].to_numpy(dtype=np.float64)
 
+    two_stage_mae_fit = fit_two_stage_mae_maps(tr)
+    two_stage_maps = two_stage_mae_fit.get("maps") or {}
+    two_stage_mae_val = {
+        n: score_two_stage_mae_map(va, spec, min_names=min_names)
+        for n, spec in two_stage_maps.items()
+    }
+    two_stage_mae_test = {
+        n: score_two_stage_mae_map(te, spec, min_names=min_names)
+        for n, spec in two_stage_maps.items()
+    }
+    two_stage_mae_promotion = decide_two_stage_mae_promote(
+        val_maps=two_stage_mae_val,
+        val_residual=dict((by_ablate.get("residual_sigma") or {}).get("val") or {}),
+        val_zero=dict((by_ablate.get("zero_move") or {}).get("val") or {}),
+        val_median=dict((by_ablate.get("train_median_gap") or {}).get("val") or {}),
+        val_current=dict((by_ablate.get(default_name) or {}).get("val") or {}),
+        current_name=default_name,
+        maps=two_stage_maps,
+    )
+    if two_stage_mae_promotion.get("promote_two_stage_mae"):
+        winner = str(two_stage_mae_promotion.get("best_name") or default_name)
+        promotion["price"] = winner
+        promotion["accuracy_default"] = winner
+        default_name = winner
+        default_pr_test = apply_two_stage_map(
+            te["pred_r"].to_numpy(dtype=np.float64),
+            two_stage_maps.get(winner) or {},
+            close=te["close"].to_numpy(dtype=np.float64),
+            dates=te["date"].to_numpy(dtype=np.int64),
+            vol_level=(
+                te["vol_level"].to_numpy(dtype=np.float64)
+                if "vol_level" in te.columns
+                else None
+            ),
+        )
+        pred_r_by_name[winner] = {
+            "train": apply_two_stage_map(
+                train_pred_r,
+                two_stage_maps.get(winner) or {},
+                close=tr["close"].to_numpy(dtype=np.float64),
+                dates=tr["date"].to_numpy(dtype=np.int64),
+                vol_level=(
+                    tr["vol_level"].to_numpy(dtype=np.float64)
+                    if "vol_level" in tr.columns
+                    else None
+                ),
+            ),
+            "val": apply_two_stage_map(
+                va["pred_r"].to_numpy(dtype=np.float64),
+                two_stage_maps.get(winner) or {},
+                close=va["close"].to_numpy(dtype=np.float64),
+                dates=va["date"].to_numpy(dtype=np.int64),
+                vol_level=(
+                    va["vol_level"].to_numpy(dtype=np.float64)
+                    if "vol_level" in va.columns
+                    else None
+                ),
+            ),
+            "test": default_pr_test,
+        }
+
     payload["ablation"] = {
         "rows": rows,
         "calibrators": {
@@ -5213,6 +5684,11 @@ def evaluate_overnight_accuracy(
                 "hedge": "sector_overnight",
                 "fit_split": "train",
                 "maps": list(SECTOR_MAE_MAPS),
+            },
+            "two_stage_mae": {
+                "hedge": "sector_overnight",
+                "fit_split": "train",
+                "maps": list(TWO_STAGE_MAE_MAPS),
             },
             "book_aligned": {
                 "q": float((book_aligned_fit.get("chosen") or {}).get("q") or 0.80),
@@ -5275,6 +5751,8 @@ def evaluate_overnight_accuracy(
         "recency_affine_l1": (a_rec, b_rec),
     }.get(default_name)
     default_params = next((r["params"] for r in rows if r["name"] == default_name), {})
+    if default_name in two_stage_maps:
+        default_params = dict(two_stage_maps[default_name])
     payload["calibrate"] = {
         "name": default_name,
         "kind": str(default_params.get("kind") or default_name),
@@ -5350,6 +5828,20 @@ def evaluate_overnight_accuracy(
         "vol_regime_gap": apply_bin_constants(vol_tr, vol_edges, vol_vals),
         "recency_median": np.full_like(train_pred_r, rec_med),
         "recency_affine_l1": apply_affine(train_pred_r, a_rec, b_rec),
+        **{
+            n: apply_two_stage_map(
+                train_pred_r,
+                spec,
+                close=tr["close"].to_numpy(dtype=np.float64),
+                dates=tr["date"].to_numpy(dtype=np.int64),
+                vol_level=(
+                    tr["vol_level"].to_numpy(dtype=np.float64)
+                    if "vol_level" in tr.columns
+                    else None
+                ),
+            )
+            for n, spec in two_stage_maps.items()
+        },
     }.get(default_name, train_pred_r)
     payload["confidence"] = _confidence_block(
         te, default_pr_test, train_abs=train_default, min_names=min_names
@@ -5472,6 +5964,27 @@ def evaluate_overnight_accuracy(
         ),
     }
     payload["sector_mae_promotion"] = sector_mae_promotion
+    payload["two_stage_mae_fit"] = two_stage_mae_fit
+    payload["two_stage_mae_compare"] = {
+        "hedge": "sector_overnight",
+        "val": two_stage_mae_val,
+        "test": two_stage_mae_test,
+        "val_residual": dict((by_ablate.get("residual_sigma") or {}).get("val") or {}),
+        "val_zero": dict((by_ablate.get("zero_move") or {}).get("val") or {}),
+        "val_median": dict((by_ablate.get("train_median_gap") or {}).get("val") or {}),
+        "val_current": dict((by_ablate.get(str(two_stage_mae_promotion.get("current_name") or default_name)) or {}).get("val") or {}),
+        "test_residual": dict((by_ablate.get("residual_sigma") or {}).get("test") or {}),
+        "test_zero": dict((by_ablate.get("zero_move") or {}).get("test") or {}),
+        "test_median": dict((by_ablate.get("train_median_gap") or {}).get("test") or {}),
+        "current_name": str(two_stage_mae_promotion.get("current_name") or default_name),
+        "note": (
+            "Two-stage next-open MAE (residual→gap→price) and residual+DOW+vol "
+            "ridge. VAL % MAE vs residual×σ / zero-move / train-median / current "
+            "default. Dir report-only unless it clears dir gates. "
+            "Live q20 book unchanged. Next open is never a feature."
+        ),
+    }
+    payload["two_stage_mae_promotion"] = two_stage_mae_promotion
     from forecast.shorting import (
         compare_conviction_live,
         decide_conviction_live_promote,
@@ -5722,6 +6235,8 @@ def evaluate_overnight_accuracy(
             f"promote_short_live="
             f"{bool(short_aligned_promotion.get('promote_short_live'))}  "
             f"promote_ej_ls="
-            f"{bool(ej_ls_promotion.get('promote_ej_ls'))}"
+            f"{bool(ej_ls_promotion.get('promote_ej_ls'))}  "
+            f"promote_two_stage_mae="
+            f"{bool(two_stage_mae_promotion.get('promote_two_stage_mae'))}"
         )
     return payload

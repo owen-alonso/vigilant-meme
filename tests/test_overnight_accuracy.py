@@ -29,6 +29,9 @@ from forecast.accuracy import (
     decide_relative_dir_promote,
     decide_rel_e_stack_promote,
     decide_sector_mae_promote,
+    decide_two_stage_mae_promote,
+    apply_two_stage_map,
+    fit_two_stage_mae_maps,
     fit_book_aligned_on_train,
     fit_short_aligned_on_train,
     fit_relative_dir_on_train,
@@ -344,6 +347,20 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert payload["sector_mae_promotion"]["gated_on"] == "val"
     assert payload["sector_mae_promotion"]["live_book_unchanged"] is True
     assert "PROMOTE SECTOR-MAE" in report
+    ts_fit = payload["two_stage_mae_fit"]
+    assert ts_fit["fit_split"] == "train"
+    assert set(ts_fit["maps"]) >= {
+        "two_stage_l1_pct",
+        "two_stage_huber_pct",
+        "two_stage_piecewise_pct",
+        "two_stage_l1_usd",
+        "ridge_resid_dow_vol",
+    }
+    ts_promo = payload["two_stage_mae_promotion"]
+    assert ts_promo["gated_on"] == "val"
+    assert ts_promo["live_book_unchanged"] is True
+    assert "promote_two_stage_mae" in ts_promo
+    assert "PROMOTE TWO-STAGE MAE" in report
     rel_fit = payload["relative_dir_fit"]
     assert rel_fit["fit_split"] == "train"
     assert rel_fit["score_col"] == "pred"
@@ -680,6 +697,128 @@ def test_decide_sector_mae_promote_is_val_only():
     )
     assert yes["promote_sector_mae"] is True
     assert yes["best_name"] == "huber_affine"
+    juicy = {"mae_pct": 0.001, "dir_pct": 80.0}
+    assert juicy["mae_pct"] < yes["val_mae_pct"]
+
+
+def test_fit_two_stage_mae_maps_is_train_only():
+    import pandas as pd
+
+    rng = np.random.default_rng(3)
+    n = 80
+    pred_r = rng.normal(scale=0.01, size=n)
+    r_on = 0.7 * pred_r + 0.001 + rng.normal(scale=0.003, size=n)
+    close = 50.0 + rng.normal(scale=5.0, size=n)
+    nxt = close * np.exp(r_on)
+    dates = np.arange(n, dtype=np.int64) + 17600
+    vol = np.abs(rng.normal(scale=0.02, size=n))
+    df = pd.DataFrame(
+        {
+            "pred_r": pred_r,
+            "r_on": r_on,
+            "close": close,
+            "next_open": nxt,
+            "date": dates,
+            "vol_level": vol,
+        }
+    )
+    spec = fit_two_stage_mae_maps(df)
+    later = df.copy()
+    later["r_on"] = -0.7 * pred_r - 0.001 + rng.normal(scale=0.003, size=n)
+    later["next_open"] = later["close"] * np.exp(later["r_on"])
+    leaked = fit_two_stage_mae_maps(later)
+    assert spec["fit_split"] == "train"
+    a0 = float(spec["maps"]["two_stage_l1_pct"]["stage1"]["a"])
+    a1 = float(leaked["maps"]["two_stage_l1_pct"]["stage1"]["a"])
+    assert abs(a0 - a1) > 0.05
+    w0 = float(spec["maps"]["ridge_resid_dow_vol"]["weights"][0])
+    w1 = float(leaked["maps"]["ridge_resid_dow_vol"]["weights"][0])
+    assert w0 * w1 < 0.0
+    hat = apply_two_stage_map(
+        pred_r,
+        spec["maps"]["two_stage_l1_pct"],
+        close=close,
+        dates=dates,
+        vol_level=vol,
+    )
+    hat_scrambled = apply_two_stage_map(
+        pred_r,
+        spec["maps"]["two_stage_l1_pct"],
+        close=close,
+        dates=dates,
+        vol_level=vol,
+    )
+    assert np.allclose(hat, hat_scrambled, equal_nan=True)
+    # Next open is a label only: scrambling it after fit must not change apply.
+    assert "next_open" not in str(spec["maps"]["two_stage_l1_pct"].get("stage1") or {})
+
+
+def test_decide_two_stage_mae_promote_is_val_only():
+    resid = {"mae_pct": 0.00600, "dir_pct": 51.0, "excess_pp": -3.0}
+    zero = {"mae_pct": 0.00700, "dir_pct": 0.0, "excess_pp": -50.0}
+    median = {"mae_pct": 0.00680, "dir_pct": 54.0, "excess_pp": 0.0}
+    maps = {n: {"kind": n} for n in (
+        "two_stage_l1_pct",
+        "two_stage_huber_pct",
+        "two_stage_piecewise_pct",
+        "two_stage_l1_usd",
+        "ridge_resid_dow_vol",
+    )}
+    almost = {
+        "two_stage_l1_pct": {"mae_pct": 0.00590, "dir_pct": 52.0, "excess_pp": -2.0},
+        "two_stage_huber_pct": {"mae_pct": 0.00595, "dir_pct": 52.0, "excess_pp": -2.0},
+        "two_stage_piecewise_pct": {"mae_pct": 0.00592, "dir_pct": 52.0, "excess_pp": -2.0},
+        "two_stage_l1_usd": {"mae_pct": 0.00610, "dir_pct": 51.0, "excess_pp": -3.0},
+        "ridge_resid_dow_vol": {"mae_pct": 0.00588, "dir_pct": 53.0, "excess_pp": -1.0},
+    }
+    # Clears floors by 1.2 bp but worse than current ts_ridge default.
+    no = decide_two_stage_mae_promote(
+        val_maps=almost,
+        val_residual=resid,
+        val_zero=zero,
+        val_median=median,
+        val_current={"mae_pct": 0.00550, "dir_pct": 64.0},
+        current_name="ts_ridge_no_long_ts",
+        maps=maps,
+    )
+    assert no["promote_two_stage_mae"] is False
+    assert no["gated_on"] == "val"
+    assert no["live_book_unchanged"] is True
+    yes_maps = {
+        **almost,
+        "ridge_resid_dow_vol": {
+            "mae_pct": 0.00545,
+            "dir_pct": 52.0,
+            "excess_pp": -2.0,
+        },
+    }
+    yes = decide_two_stage_mae_promote(
+        val_maps=yes_maps,
+        val_residual=resid,
+        val_zero=zero,
+        val_median=median,
+        val_current={"mae_pct": 0.00550, "dir_pct": 64.0},
+        current_name="ts_ridge_no_long_ts",
+        maps=maps,
+    )
+    assert yes["promote_two_stage_mae"] is True
+    assert yes["best_name"] == "ridge_resid_dow_vol"
+    floors_fail = decide_two_stage_mae_promote(
+        val_maps={
+            "two_stage_l1_pct": {"mae_pct": 0.00597, "dir_pct": 52.0},
+            "two_stage_huber_pct": {"mae_pct": 0.00598, "dir_pct": 52.0},
+            "two_stage_piecewise_pct": {"mae_pct": 0.00599, "dir_pct": 52.0},
+            "two_stage_l1_usd": {"mae_pct": 0.00610, "dir_pct": 51.0},
+            "ridge_resid_dow_vol": {"mae_pct": 0.00597, "dir_pct": 52.0},
+        },
+        val_residual=resid,
+        val_zero=zero,
+        val_median=median,
+        val_current={"mae_pct": 0.00650, "dir_pct": 64.0},
+        current_name="ts_ridge_no_long_ts",
+        maps=maps,
+    )
+    assert floors_fail["promote_two_stage_mae"] is False
     juicy = {"mae_pct": 0.001, "dir_pct": 80.0}
     assert juicy["mae_pct"] < yes["val_mae_pct"]
 

@@ -81,6 +81,7 @@ python -m forecast.training --universe liquid --interval daily --skip-only \
 # rel_e_stack = H long-half ∩ E top-q / |pred|; VAL relative / abs-vs-E / live-IR gates
 # short_aligned = overnight down-rate of TRAIN bottom-q residual names vs down-floor / bot-20%
 # ej_ls = symmetric long-E / short-J live_locate vs q20 (paper zero-cost is report-only)
+# two_stage_mae = TRAIN residual→gap then gap→next-open $/% (or residual+DOW+vol ridge)
 python scripts/overnight_accuracy.py --data-dir data --universe liquid \
     --json checkpoints/forecast_ridge_overnight/accuracy.json \
     --calibrate-json checkpoints/forecast_ridge_overnight/overnight_calibrate.json
