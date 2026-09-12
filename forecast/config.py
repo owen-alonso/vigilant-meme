@@ -100,6 +100,11 @@ class DataConfig:
     # Drop *train* labels before this date. Empty = keep every train session.
     # Val/test calendar cuts are unchanged (locked test window).
     train_from: str = "1999-01-01"
+    # Exclusive YYYY-MM-DD cuts. Empty train_end/val_end keeps the fraction split.
+    # test_end empty = no upper bound (session >= val_end).
+    train_end: str = ""
+    val_end: str = ""
+    test_end: str = ""
     # y = r - b_mkt * SPY_fwd - b_sec * sector_fwd (two-factor, causal betas).
     double_residual: bool = False
     # Also residualize ret_* features vs same-bar hedges (not labels).
@@ -351,6 +356,15 @@ class ForecastTrainConfig:
     ridge_features: str = "no_long_ts"
     # Exponential recency weights on train dates (0 = uniform).
     ridge_date_halflife: float = 0.0
+    # Session-rank recency on train only (0 = off). Fine-tune cuts use 126.
+    # Does not rewrite residual labels. Preferred over calendar-day half-life
+    # when the clock is trading sessions, not days since epoch.
+    time_upweight_recent: bool = False
+    time_upweight_halflife_sessions: float = 0.0
+    # Which staged window this run used (``pretrain`` / ``finetune`` / empty).
+    forecast_phase: str = ""
+    # Optional encoder warm-start (skip-only overwrites the linear skip anyway).
+    init_checkpoint: str = ""
     # Winsorize raw y within date before the ridge (ignored when rank_target).
     ridge_y_winsor: float = 0.0
     # Winsorize features within date (in residual-std units). Val-selected 3.

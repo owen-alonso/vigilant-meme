@@ -137,6 +137,7 @@ def _prepare_cs_design(
     rank_target: bool,
     feature_mask_bool: np.ndarray | None,
     date_halflife: float,
+    session_halflife: float = 0.0,
     exclude_dates: set[int] | None = None,
     y_winsor: float = 0.0,
     feat_winsor: float = 0.0,
@@ -155,7 +156,11 @@ def _prepare_cs_design(
             mask = np.asarray(feature_mask_bool, dtype=bool)
             x[:, ~mask] = 0.0
         w = np.ones(x.shape[0], dtype=np.float64)
-        if date_halflife > 0 and dates_k.size:
+        if float(session_halflife) > 0 and dates_k.size:
+            from forecast.cuts import session_rank_weights
+
+            w = session_rank_weights(dates_k, session_halflife)
+        elif date_halflife > 0 and dates_k.size:
             d_max = int(dates_k.max())
             w = 0.5 ** (np.maximum(0, d_max - dates_k.astype(np.int64)) / float(date_halflife))
         return x, y, w, dates_k.astype(np.int64)
@@ -173,6 +178,14 @@ def _prepare_cs_design(
     used_keys: list[int] = []
     d_max = int(dates.max()) if dates.size else 0
     hl = float(date_halflife)
+    sess_hl = float(session_halflife)
+    session_w: dict[int, float] = {}
+    if sess_hl > 0 and dates.size:
+        from forecast.cuts import session_rank_weights
+
+        uniq = np.unique(dates.astype(np.int64))
+        for key, weight in zip(uniq, session_rank_weights(uniq, sess_hl)):
+            session_w[int(key)] = float(weight)
     blocked = exclude_dates or set()
     disp: dict[int, float] = {}
     if drop_disp_q > 0:
@@ -216,7 +229,9 @@ def _prepare_cs_design(
             std = np.where(std < 1e-8, 1.0, std)
             xd = xd / std
         w = np.ones(n, dtype=np.float64)
-        if hl > 0:
+        if session_w:
+            w *= session_w.get(int(key), 1.0)
+        elif hl > 0:
             w *= 0.5 ** (max(0, d_max - int(key)) / hl)
         xs.append(xd)
         ys.append(yd)
@@ -298,6 +313,7 @@ def fit_ridge_xy(
     rank_target: bool = False,
     feature_mask_bool: np.ndarray | None = None,
     date_halflife: float = 0.0,
+    session_halflife: float = 0.0,
     exclude_dates: set[int] | None = None,
     y_winsor: float = 0.0,
     feat_winsor: float = 0.0,
@@ -322,6 +338,7 @@ def fit_ridge_xy(
         rank_target=rank_target,
         feature_mask_bool=feature_mask_bool,
         date_halflife=date_halflife,
+        session_halflife=session_halflife,
         exclude_dates=blocked or None,
         y_winsor=y_winsor,
         feat_winsor=feat_winsor,
@@ -1435,6 +1452,7 @@ def fit_skip_xy(
         y,
         dates,
         date_halflife=kwargs["date_halflife"],
+        session_halflife=kwargs["session_halflife"],
         y_winsor=kwargs["y_winsor"],
         feat_winsor=kwargs["feat_winsor"],
         drop_disp_q=kwargs["drop_disp_q"],
@@ -1455,6 +1473,11 @@ def ridge_kwargs_from_train_cfg(train_cfg: Any, bundle: dict[str, Any]) -> dict[
         "rank_target": bool(getattr(train_cfg, "ridge_rank_target", False)),
         "feature_mask_bool": feature_mask(mask_mode),
         "date_halflife": float(getattr(train_cfg, "ridge_date_halflife", 0.0) or 0.0),
+        "session_halflife": (
+            float(getattr(train_cfg, "time_upweight_halflife_sessions", 0.0) or 0.0)
+            if bool(getattr(train_cfg, "time_upweight_recent", False))
+            else 0.0
+        ),
         "y_winsor": float(getattr(train_cfg, "ridge_y_winsor", 0.0) or 0.0),
         "feat_winsor": float(getattr(train_cfg, "ridge_feat_winsor", 0.0) or 0.0),
         "drop_disp_q": float(getattr(train_cfg, "ridge_drop_disp_q", 0.0) or 0.0),

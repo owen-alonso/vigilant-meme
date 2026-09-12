@@ -811,6 +811,12 @@ def _train(
     device = device or select_device()
     set_seed(train_cfg.seed)
     validate_loss_head(model_cfg, train_cfg)
+    if int(train_cfg.num_workers) > 0 and log_fn:
+        log_fn(
+            "WARNING: num_workers>0 pickles the CS panel per worker "
+            "(desktop Yahoo cache is multi-GB). Use --num-workers 0 "
+            "(Windows default) so data/_panel_cache/ is not cloned."
+        )
 
     bundle = build_datasets(data_cfg, log_fn=log_fn)
     datasets = bundle["datasets"]
@@ -829,7 +835,15 @@ def _train(
             f"ridge_skip={train_cfg.ridge_skip} "
             f"ridge_rank_target={train_cfg.ridge_rank_target} "
             f"ridge_objective={getattr(train_cfg, 'ridge_objective', 'ridge')} "
-            f"heteroscedastic={model_cfg.heteroscedastic}"
+            f"heteroscedastic={model_cfg.heteroscedastic} "
+            f"phase={getattr(train_cfg, 'forecast_phase', '') or 'none'} "
+            f"train_from={getattr(data_cfg, 'train_from', '') or 'all'} "
+            f"train_end={getattr(data_cfg, 'train_end', '') or 'frac'} "
+            f"val_end={getattr(data_cfg, 'val_end', '') or 'frac'} "
+            f"test_end={getattr(data_cfg, 'test_end', '') or 'open'} "
+            f"time_upweight={bool(getattr(train_cfg, 'time_upweight_recent', False))} "
+            f"session_hl={float(getattr(train_cfg, 'time_upweight_halflife_sessions', 0.0) or 0.0)} "
+            f"num_workers={train_cfg.num_workers}"
         )
         log_fn(formula_log_line(
             getattr(data_cfg, "label_return", "close"),
@@ -837,6 +851,19 @@ def _train(
             fill_minutes=int(getattr(data_cfg, "fill_minutes", 0) or 0),
         ))
         autocast_context(device, train_cfg.precision, log_fn=log_fn)
+
+    init_ckpt = str(getattr(train_cfg, "init_checkpoint", "") or "").strip()
+    if init_ckpt:
+        init_path = Path(init_ckpt)
+        if not init_path.is_file():
+            from mamba_lm.paths import resolve_path
+
+            init_path = resolve_path(init_ckpt)
+        if not init_path.is_file():
+            raise FileNotFoundError(f"init checkpoint not found: {init_ckpt}")
+        load_forecast_checkpoint(init_path, map_location=device, model=model)
+        if log_fn:
+            log_fn(f"warm-start encoder from {init_path}")
 
     skip_ic = apply_ridge_skip(model, bundle, train_cfg, device)
     if log_fn and np.isfinite(skip_ic):
@@ -895,6 +922,22 @@ def _train(
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     if log_fn:
         log_fn(f"checkpoints -> {ckpt_dir}")
+    phase_name = str(getattr(train_cfg, "forecast_phase", "") or "").strip()
+    if phase_name:
+        payload = {
+            "phase": phase_name,
+            "train_from": getattr(data_cfg, "train_from", ""),
+            "train_end": getattr(data_cfg, "train_end", ""),
+            "val_end": getattr(data_cfg, "val_end", ""),
+            "test_end": getattr(data_cfg, "test_end", ""),
+            "time_upweight_recent": bool(getattr(train_cfg, "time_upweight_recent", False)),
+            "time_upweight_halflife_sessions": float(
+                getattr(train_cfg, "time_upweight_halflife_sessions", 0.0) or 0.0
+            ),
+            "label_return": getattr(data_cfg, "label_return", "close"),
+            "rewrite_labels": False,
+        }
+        (ckpt_dir / "phase_cuts.json").write_text(json.dumps(payload, indent=2) + "\n")
 
     def save(path: Path, step: int, metrics: dict[str, float]) -> None:
         save_forecast_checkpoint(
@@ -1335,6 +1378,54 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="use every train-session label (no 1999 floor)",
     )
+    g.add_argument(
+        "--cuts-json",
+        default="",
+        help="pretrain/finetune cuts JSON (desktop: data/_panel_cache/"
+        "pretrain_finetune_cuts.json; default: in-repo schema)",
+    )
+    g.add_argument(
+        "--phase",
+        default="",
+        choices=("", "pretrain", "finetune", "both"),
+        help="apply a staged window from --cuts-json (both = sequential skip-only)",
+    )
+    g.add_argument(
+        "--train-end",
+        default="",
+        help="exclusive train cut YYYY-MM-DD (overrides fraction / cuts train_end)",
+    )
+    g.add_argument(
+        "--val-end",
+        default="",
+        help="exclusive val cut YYYY-MM-DD (early-stop / checkpoint window)",
+    )
+    g.add_argument(
+        "--test-end",
+        default="",
+        help="exclusive test cut YYYY-MM-DD",
+    )
+    g.add_argument(
+        "--test-through",
+        default="",
+        help="inclusive test last session YYYY-MM-DD (alternative to --test-end)",
+    )
+    g.add_argument(
+        "--time-upweight-recent",
+        action="store_true",
+        help="session-rank recency weights on train only (does not rewrite labels)",
+    )
+    g.add_argument(
+        "--time-upweight-halflife",
+        type=float,
+        default=None,
+        help="session half-life for --time-upweight-recent (cuts default 126)",
+    )
+    g.add_argument(
+        "--init-checkpoint",
+        default="",
+        help="warm-start encoder weights (skip-only still refits the linear skip)",
+    )
 
     g = p.add_argument_group("model")
     g.add_argument("--d-model", type=int, default=None)
@@ -1535,6 +1626,76 @@ def _cli_label_return(args: argparse.Namespace) -> str:
     return kind
 
 
+def _cli_test_end(args: argparse.Namespace) -> str:
+    from forecast.cuts import exclusive_end
+
+    end = str(getattr(args, "test_end", "") or "").strip()
+    through = str(getattr(args, "test_through", "") or "").strip()
+    if not end and not through:
+        return ""
+    return exclusive_end(test_end=end, test_through=through, field="cli")
+
+
+def _apply_cuts_to_configs(
+    args: argparse.Namespace,
+    data_cfg: DataConfig,
+    train_cfg: ForecastTrainConfig,
+    *,
+    phase_name: str | None = None,
+) -> tuple[DataConfig, ForecastTrainConfig]:
+    """Pin windows / recency from --cuts-json and explicit date flags."""
+    from dataclasses import replace
+
+    from forecast.cuts import (
+        apply_phase,
+        load_cuts,
+        resolve_cuts_path,
+    )
+
+    phase = str(phase_name or getattr(args, "phase", "") or "").strip().lower()
+    if phase == "both":
+        return data_cfg, train_cfg
+    cuts_arg = str(getattr(args, "cuts_json", "") or "").strip()
+    if cuts_arg or phase:
+        cuts = load_cuts(resolve_cuts_path(cuts_arg or None, data_dir=data_cfg.data_dir))
+        if phase:
+            data_cfg, train_cfg, _applied = apply_phase(data_cfg, train_cfg, cuts, phase)
+            if _cli_label_return(args) == DataConfig().label_return and cuts.label_return:
+                data_cfg = replace(data_cfg, label_return=cuts.label_return)
+        elif cuts_arg and not phase:
+            raise SystemExit("--cuts-json needs --phase pretrain|finetune|both")
+
+    train_end = str(getattr(args, "train_end", "") or "").strip()
+    val_end = str(getattr(args, "val_end", "") or "").strip()
+    test_end = _cli_test_end(args)
+    if train_end or val_end or test_end:
+        data_cfg = replace(
+            data_cfg,
+            train_end=train_end or data_cfg.train_end,
+            val_end=val_end or data_cfg.val_end,
+            test_end=test_end or data_cfg.test_end,
+        )
+    if bool(getattr(args, "time_upweight_recent", False)):
+        hl = getattr(args, "time_upweight_halflife", None)
+        train_cfg = replace(
+            train_cfg,
+            time_upweight_recent=True,
+            time_upweight_halflife_sessions=float(hl if hl not in (None, 0) else 126.0),
+        )
+    elif getattr(args, "time_upweight_halflife", None):
+        train_cfg = replace(
+            train_cfg,
+            time_upweight_recent=True,
+            time_upweight_halflife_sessions=float(args.time_upweight_halflife),
+        )
+    init_ckpt = str(getattr(args, "init_checkpoint", "") or "").strip()
+    if init_ckpt:
+        train_cfg = replace(train_cfg, init_checkpoint=init_ckpt)
+    if phase:
+        train_cfg = replace(train_cfg, forecast_phase=phase)
+    return data_cfg, train_cfg
+
+
 def _cli_fill_minutes(args: argparse.Namespace) -> int:
     from forecast.overnight import fill_minutes_for
 
@@ -1592,6 +1753,9 @@ def configs_from_cli(
         sector_residual=not args.no_sector_residual,
         equities_only=not args.no_equities_only,
         train_from="" if args.no_train_from else str(args.train_from or ""),
+        train_end=str(getattr(args, "train_end", "") or ""),
+        val_end=str(getattr(args, "val_end", "") or ""),
+        test_end=_cli_test_end(args),
         double_residual=args.double_residual,
         residualize_features=args.residualize_features,
         industry_residual=args.industry_residual,
@@ -1633,6 +1797,12 @@ def configs_from_cli(
         ridge_cs_zscore=args.ridge_cs_zscore,
         ridge_features=args.ridge_features,
         ridge_date_halflife=args.ridge_date_halflife,
+        time_upweight_recent=bool(getattr(args, "time_upweight_recent", False)),
+        time_upweight_halflife_sessions=float(
+            getattr(args, "time_upweight_halflife", None) or 0.0
+        ),
+        forecast_phase=str(getattr(args, "phase", "") or ""),
+        init_checkpoint=str(getattr(args, "init_checkpoint", "") or ""),
         ridge_objective=args.ridge_objective,
         ridge_y_winsor=args.ridge_y_winsor,
         ridge_feat_winsor=args.ridge_feat_winsor,
@@ -1658,17 +1828,99 @@ def configs_from_cli(
         lr_plateau_evals=args.lr_plateau_evals,
         lr_plateau_factor=args.lr_plateau_factor,
     )
+    data_cfg, train_cfg = _apply_cuts_to_configs(args, data_cfg, train_cfg)
     return data_cfg, model_cfg, train_cfg
+
+
+def _phase_checkpoint_dir(base: str, phase: str) -> str:
+    raw = str(base or "checkpoints/forecast").rstrip("/\\")
+    suffix = f"_{phase}"
+    if raw.endswith(suffix):
+        return raw
+    return f"{raw}{suffix}"
+
+
+def run_pretrain_finetune_schedule(
+    args: argparse.Namespace,
+    *,
+    device: torch.device | None = None,
+    log_fn: Any | None = print,
+) -> dict[str, Any]:
+    """Phase 1 historic pretrain, then phase 2 recent fine-tune from the cuts file."""
+    from dataclasses import replace
+
+    from forecast.cuts import load_cuts, resolve_cuts_path, val_gate_commands
+
+    summaries: dict[str, Any] = {}
+    data_cfg, model_cfg, train_cfg = configs_from_cli(args)
+    cuts = load_cuts(
+        resolve_cuts_path(
+            str(getattr(args, "cuts_json", "") or "") or None,
+            data_dir=data_cfg.data_dir,
+        )
+    )
+    base_dir = str(train_cfg.checkpoint_dir or "checkpoints/forecast_ridge_overnight")
+    if base_dir.rstrip("/\\").endswith("_pretrain") or base_dir.rstrip("/\\").endswith("_finetune"):
+        parent = str(Path(base_dir).parent / Path(base_dir).name.rsplit("_", 1)[0])
+        base_dir = parent
+    for phase in ("pretrain", "finetune"):
+        phase_args = argparse.Namespace(**vars(args))
+        phase_args.phase = phase
+        phase_data, phase_model, phase_train = configs_from_cli(phase_args)
+        if cuts.skip_only:
+            phase_train = replace(phase_train, skip_only=True)
+        phase_train = replace(
+            phase_train,
+            checkpoint_dir=_phase_checkpoint_dir(base_dir, phase),
+            num_workers=0 if cuts.num_workers == 0 else phase_train.num_workers,
+            forecast_phase=phase,
+        )
+        if phase == "finetune" and not phase_train.init_checkpoint and not phase_train.skip_only:
+            pre_best = Path(_phase_checkpoint_dir(base_dir, "pretrain")) / "best.pt"
+            if pre_best.is_file():
+                phase_train = replace(phase_train, init_checkpoint=str(pre_best))
+        if log_fn:
+            log_fn(f"=== {phase} start={phase_data.train_from} train<{phase_data.train_end} "
+                   f"val<{phase_data.val_end} test<{phase_data.test_end} "
+                   f"upweight={phase_train.time_upweight_recent} "
+                   f"hl={phase_train.time_upweight_halflife_sessions} ===")
+        summaries[phase] = train(
+            phase_data,
+            phase_model,
+            phase_train,
+            device=device,
+            log_fn=log_fn,
+        )
+    ft_dir = _phase_checkpoint_dir(base_dir, "finetune")
+    gate = val_gate_commands(
+        checkpoint_dir=ft_dir,
+        data_dir=str(data_cfg.data_dir),
+        universe=str(data_cfg.universe or cuts.universe or "liquid"),
+        baseline_ir=float((cuts.val_gate or {}).get("baseline_ir") or 5.58),
+    )
+    summaries["val_gate"] = {
+        "book": (cuts.val_gate or {}).get("book", "live_locate"),
+        "metric": (cuts.val_gate or {}).get("metric", "unlevered_net_ir"),
+        "baseline_ir": float((cuts.val_gate or {}).get("baseline_ir") or 5.58),
+        "commands": gate,
+    }
+    if log_fn:
+        log_fn(gate)
+    return summaries
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
+    device = torch.device("cpu") if args.cpu else None
+    if str(getattr(args, "phase", "") or "") == "both":
+        run_pretrain_finetune_schedule(args, device=device)
+        return
     data_cfg, model_cfg, train_cfg = configs_from_cli(args)
     train(
         data_cfg,
         model_cfg,
         train_cfg,
-        device=torch.device("cpu") if args.cpu else None,
+        device=device,
     )
 
 
