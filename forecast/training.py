@@ -1523,8 +1523,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "--pit-dir",
         default="",
-        help="PIT side-tape dir (default: <data-dir>/_pit). "
-        "next_split_days==1 drops overnight labels",
+        help="PIT root (default: <data-dir>/_pit). Factors tape is "
+        "<pit>/factors/{SYM}_daily_factors.parquet; next_split_days==1 "
+        "drops overnight labels. Optional <pit>/liquid_membership.json",
     )
     g.add_argument(
         "--pup-head",

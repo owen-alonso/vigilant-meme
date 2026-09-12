@@ -1231,24 +1231,42 @@ def _ts_to_day(value: Any) -> int | None:
     return int((ts.normalize() - pd.Timestamp("1970-01-01")) // pd.Timedelta("1D"))
 
 
-def _apply_pit_to_base(base: SymbolArrays, tape: dict[int, float] | None) -> SymbolArrays:
-    from forecast.pit import mask_overnight_pit, next_split_days_aligned
+def _apply_pit_to_base(
+    base: SymbolArrays,
+    tape: dict[int, float] | None,
+    membership: dict[str, Any] | None = None,
+) -> SymbolArrays:
+    from forecast.pit import (
+        mask_membership_asof,
+        mask_overnight_pit,
+        next_split_days_aligned,
+    )
 
     length = int(len(base.target))
     days = base.next_split_days
-    if days is None and tape:
+    # Live Data Manager factors tape wins over mmap-cached next_split_days.
+    if tape:
         days = next_split_days_aligned(base.dates, tape, length=length)
-    if days is None:
+    valid = np.asarray(base.valid, dtype=bool)
+    if days is not None:
+        valid = mask_overnight_pit(valid, days)
+    if membership is not None:
+        valid = mask_membership_asof(valid, base.dates, base.symbol, membership)
+    if (
+        days is None
+        and membership is None
+        and np.array_equal(valid, np.asarray(base.valid, dtype=bool))
+    ):
         return base
     return SymbolArrays(
         symbol=base.symbol,
         features=base.features,
         target=base.target,
         scale=base.scale,
-        valid=mask_overnight_pit(base.valid, days),
+        valid=valid,
         dates=base.dates,
         overnight_r=base.overnight_r,
-        next_split_days=np.asarray(days, dtype=np.int16),
+        next_split_days=(None if days is None else np.asarray(days, dtype=np.int16)),
     )
 
 
@@ -1512,6 +1530,13 @@ def _pit_tape_for_cfg(cfg: DataConfig, symbols: Sequence[str]) -> dict[str, dict
     return load_pit_side_tape(cfg.data_dir, pit_dir=pit_dir, symbols=symbols)
 
 
+def _pit_membership_for_cfg(cfg: DataConfig) -> dict[str, Any] | None:
+    from forecast.pit import load_liquid_membership
+
+    pit_dir = str(getattr(cfg, "pit_dir", "") or "").strip() or None
+    return load_liquid_membership(cfg.data_dir, pit_dir=pit_dir)
+
+
 def _build_datasets_from_mmap(
     cfg: DataConfig,
     manifest_path: Path,
@@ -1531,6 +1556,7 @@ def _build_datasets_from_mmap(
     allowed = allowed_symbols(cfg.universe)
     bench = str(cfg.benchmark_symbol or "").upper()
     tape = _pit_tape_for_cfg(cfg, list_mmap_symbols(payload))
+    membership = _pit_membership_for_cfg(cfg)
     bases: dict[str, SymbolArrays] = {}
     for symbol in list_mmap_symbols(payload):
         if allowed is not None and symbol not in allowed:
@@ -1545,7 +1571,7 @@ def _build_datasets_from_mmap(
         if packed.features.dtype != np.float32:
             raise RuntimeError(f"{symbol}: mmap features must be float32")
         base = symbol_arrays_from_mmap(packed)
-        bases[symbol] = _apply_pit_to_base(base, tape.get(symbol))
+        bases[symbol] = _apply_pit_to_base(base, tape.get(symbol), membership)
     if not bases:
         raise FileNotFoundError(
             f"mmap manifest {manifest_path} had no trading names "
@@ -1555,6 +1581,12 @@ def _build_datasets_from_mmap(
         log_fn(
             f"mmap feed {manifest_path}: {len(bases)} trading names "
             f"(no DataFrame rebuild, mmap_mode=r, num_workers=0)"
+            + (f" PIT factors={len(tape)} names" if tape else " PIT factors=none")
+            + (
+                f" membership={membership.get('_path')}"
+                if membership
+                else " membership=off"
+            )
         )
     train_syms, val_syms, test_syms, meta = _split_bases(bases, cfg, log_fn=log_fn)
     return _finalize_bundle(
@@ -1667,6 +1699,7 @@ def build_datasets(
     if raw_from:
         train_from_ts = pd.Timestamp(raw_from)
     tape = _pit_tape_for_cfg(cfg, list(trade_panels))
+    membership = _pit_membership_for_cfg(cfg)
     if not trade_panels:
         raise ValueError(
             f"no trading names after filters (benchmark={bench}, "
@@ -1682,6 +1715,16 @@ def build_datasets(
             f"train_from={raw_from or 'all'} "
             f"{formula_log_line(getattr(cfg, 'label_return', 'close'), horizon=int(cfg.horizon), fill_minutes=int(getattr(cfg, 'fill_minutes', 0) or 0))}"
             + (f" (held out of book: {','.join(sorted(dropped))})" if dropped else "")
+            + (
+                f" PIT factors={len(tape)} names"
+                if tape
+                else " PIT factors=none"
+            )
+            + (
+                f" membership={membership.get('_path')}"
+                if membership
+                else " membership=off"
+            )
         )
 
     pinned = explicit_calendar_cuts(cfg)
@@ -1717,7 +1760,9 @@ def build_datasets(
         is_test = (panel["session"] >= sym_val_end).to_numpy()
         if test_end is not None:
             is_test = is_test & (panel["session"] < test_end).to_numpy()
-        base = _apply_pit_to_base(panel_to_arrays(panel, symbol), tape.get(symbol))
+        base = _apply_pit_to_base(
+            panel_to_arrays(panel, symbol), tape.get(symbol), membership
+        )
         bases[symbol] = base
         base_valid = base.valid
         train_syms.append(

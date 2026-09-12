@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +14,11 @@ from forecast.config import DataConfig, ForecastModelConfig, ForecastTrainConfig
 from forecast.data import FEATURE_NAMES, build_datasets
 from forecast.model import ReturnForecaster
 from forecast.pit import (
+    factor_parquet_path,
+    is_member_asof,
+    load_liquid_membership,
     load_pit_side_tape,
+    mask_membership_asof,
     mask_overnight_pit,
     next_split_days_aligned,
     overnight_up_labels,
@@ -45,15 +50,15 @@ def test_overnight_up_labels_pit_mask():
 
 
 def test_pit_side_tape_next_split_days(tmp_path: Path):
-    pit = tmp_path / "_pit"
-    pit.mkdir()
     dates = pd.bdate_range("2020-01-02", periods=5)
+    dest = factor_parquet_path("AAA", data_dir=tmp_path)
+    dest.parent.mkdir(parents=True)
     pd.DataFrame(
         {
             "datetime": dates,
             "next_split_days": [3, 2, 1, 0, 4],
         }
-    ).to_parquet(pit / "AAA_pit.parquet")
+    ).to_parquet(dest)
     tape = load_pit_side_tape(tmp_path, symbols=["AAA"])
     assert "AAA" in tape
     keys = ((pd.to_datetime(dates) - pd.Timestamp("1970-01-01")) // pd.Timedelta("1D")).astype(
@@ -62,6 +67,42 @@ def test_pit_side_tape_next_split_days(tmp_path: Path):
     aligned = next_split_days_aligned(keys.to_numpy(), tape["AAA"], length=5)
     assert aligned[2] == 1
     assert int(mask_overnight_pit(np.ones(5, dtype=bool), aligned).sum()) == 4
+    assert dest == tmp_path / "_pit" / "factors" / "AAA_daily_factors.parquet"
+
+
+def _day(iso: str) -> int:
+    return int((pd.Timestamp(iso) - pd.Timestamp("1970-01-01")) // pd.Timedelta("1D"))
+
+
+def test_membership_asof_ranges_and_by_date(tmp_path: Path):
+    path = tmp_path / "liquid_membership.json"
+    path.write_text(
+        json.dumps(
+            {
+                "by_date": {
+                    "2020-01-01": ["AAA", "BBB"],
+                    "2020-06-01": ["BBB"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    book = load_liquid_membership(path=path)
+    assert is_member_asof("AAA", _day("2020-03-01"), book) is True
+    assert is_member_asof("AAA", _day("2020-07-01"), book) is False
+    assert is_member_asof("BBB", _day("2020-07-01"), book) is True
+    dates = np.array([_day("2020-03-01"), _day("2020-07-01")], dtype=np.int64)
+    out = mask_membership_asof(np.array([True, True]), dates, "AAA", book)
+    np.testing.assert_array_equal(out, np.array([True, False]))
+
+    ranges = {
+        "membership": {
+            "CCC": {"start": "2020-02-01", "end": "2020-02-28"},
+        }
+    }
+    assert is_member_asof("CCC", _day("2020-02-15"), ranges) is True
+    assert is_member_asof("CCC", _day("2020-03-01"), ranges) is False
+    assert is_member_asof("AAA", _day("2020-02-15"), ranges) is False
 
 
 def test_pup_logistic_recovers_planted_feature():
@@ -192,18 +233,106 @@ def test_pit_masks_overnight_on_dataset(tmp_path: Path):
     clean = build_datasets(cfg, log_fn=None)
     dates = clean["train_symbols"][0].dates
     assert dates is not None
-    pit = data / "_pit"
-    pit.mkdir()
-    # Mark every train date as a next-session split for S00.
+    dest = factor_parquet_path("S00", data_dir=data)
+    dest.parent.mkdir(parents=True)
+    # Data Manager contract: _pit/factors/{SYM}_daily_factors.parquet
     pd.DataFrame(
         {
             "datetime": pd.to_datetime(dates.astype("datetime64[D]")),
             "next_split_days": np.ones(len(dates), dtype=np.int16),
         }
-    ).to_parquet(pit / "S00_pit.parquet")
-    cfg.pit_dir = str(pit)
+    ).to_parquet(dest)
     masked = build_datasets(cfg, log_fn=None)
     s00 = next(s for s in masked["train_symbols"] if s.symbol == "S00")
     assert int(s00.valid.sum()) == 0
     y = overnight_up_labels(s00.overnight_r, valid=s00.valid, next_split_days=s00.next_split_days)
     assert not np.isfinite(y).any()
+
+
+def _overnight_cfg(data: Path, **extra) -> DataConfig:
+    kwargs = dict(
+        data_dir=str(data),
+        interval="daily",
+        horizon=1,
+        seq_len=12,
+        stride=1,
+        min_context=4,
+        warmup_bars=6,
+        vol_halflife=6,
+        z_window=12,
+        z_min_periods=4,
+        eval_last_bar=True,
+        global_calendar_split=True,
+        residual_target=True,
+        cross_section_min_names=5,
+        allow_mixed_prices=True,
+        universe="",
+        label_return="overnight",
+        use_mmap=False,
+    )
+    kwargs.update(extra)
+    return DataConfig(**kwargs)
+
+
+def test_membership_asof_masks_dataset(tmp_path: Path):
+    """Optional liquid_membership.json as-of drops a name from overnight labels."""
+    data = tmp_path / "data"
+    write_cs_overnight_universe(data, n_names=8, n_days=70, seed=5)
+    cfg = _overnight_cfg(data)
+    pit = data / "_pit"
+    pit.mkdir(parents=True)
+    members = [f"S{i:02d}" for i in range(1, 8)]
+    (pit / "liquid_membership.json").write_text(
+        json.dumps({"symbols": members}), encoding="utf-8"
+    )
+    masked = build_datasets(cfg, log_fn=None)
+    s00 = next(s for s in masked["train_symbols"] if s.symbol == "S00")
+    s01 = next(s for s in masked["train_symbols"] if s.symbol == "S01")
+    assert int(s00.valid.sum()) == 0
+    assert int(s01.valid.sum()) > 0
+    from forecast.pup import labelled_pup_rows
+
+    x, y, _dates = labelled_pup_rows(
+        masked["train_symbols"], masked["feature_mean"], masked["feature_std"]
+    )
+    assert x.shape[0] == y.shape[0]
+    assert x.shape[0] > 0
+
+
+def test_labelled_pup_rows_drop_factors_split_nights(tmp_path: Path):
+    """P(up) training rows omit next_split_days==1 from the factors tape."""
+    from forecast.pup import labelled_pup_rows
+
+    data = tmp_path / "data"
+    write_cs_overnight_universe(data, n_names=8, n_days=70, seed=5)
+    cfg = _overnight_cfg(data)
+    clean = build_datasets(cfg, log_fn=None)
+    x0, y0, _d0 = labelled_pup_rows(
+        clean["train_symbols"], clean["feature_mean"], clean["feature_std"]
+    )
+    s00_clean = next(s for s in clean["train_symbols"] if s.symbol == "S00")
+    x_s00, _y_s00, _d_s00 = labelled_pup_rows(
+        [s00_clean], clean["feature_mean"], clean["feature_std"]
+    )
+    n_s00 = int(x_s00.shape[0])
+    assert n_s00 > 0
+
+    dest = factor_parquet_path("S00", data_dir=data)
+    dest.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "datetime": pd.to_datetime(s00_clean.dates.astype("datetime64[D]")),
+            "next_split_days": np.ones(len(s00_clean.dates), dtype=np.int16),
+        }
+    ).to_parquet(dest)
+    masked = build_datasets(cfg, log_fn=None)
+    x1, y1, _d1 = labelled_pup_rows(
+        masked["train_symbols"], masked["feature_mean"], masked["feature_std"]
+    )
+    s00 = next(s for s in masked["train_symbols"] if s.symbol == "S00")
+    y_s00 = overnight_up_labels(
+        s00.overnight_r, valid=s00.valid, next_split_days=s00.next_split_days
+    )
+    assert not np.isfinite(y_s00).any()
+    assert x1.shape[0] == x0.shape[0] - n_s00
+    assert y1.shape[0] == x1.shape[0]

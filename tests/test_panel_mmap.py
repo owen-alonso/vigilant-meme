@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from forecast.config import DataConfig, interval_data_kwargs
@@ -130,3 +131,76 @@ def test_build_datasets_reads_mmap_without_rebuilding_frames(tmp_path: Path, mon
     assert int(mask.sum()) >= 1
     # Feature count matches the live FEATURE_NAMES contract.
     assert x.shape[-1] == len(FEATURE_NAMES)
+
+
+def test_mmap_load_applies_live_factors_tape(tmp_path: Path, monkeypatch):
+    """Live Data Manager factors tape wins over mmap-cached next_split_days."""
+    from forecast.pit import factor_parquet_path
+
+    data = tmp_path / "data"
+    write_cs_overnight_universe(data, n_names=8, n_days=70, seed=6)
+    preset = interval_data_kwargs("daily")
+    write_cfg = DataConfig(
+        data_dir=str(data),
+        interval="daily",
+        horizon=1,
+        seq_len=12,
+        stride=1,
+        min_context=4,
+        warmup_bars=6,
+        vol_halflife=preset["vol_halflife"],
+        z_window=12,
+        z_min_periods=4,
+        eval_last_bar=True,
+        global_calendar_split=True,
+        residual_target=True,
+        cross_section_min_names=5,
+        allow_mixed_prices=True,
+        universe="",
+        label_return="overnight",
+        use_mmap=False,
+        write_mmap=True,
+        mmap_cache_dir=str(data / "_panel_cache"),
+    )
+    first = build_datasets(write_cfg, log_fn=None)
+    s00 = next(s for s in first["train_symbols"] if s.symbol == "S00")
+    assert int(s00.valid.sum()) > 0
+    dest = factor_parquet_path("S00", data_dir=data)
+    dest.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "datetime": pd.to_datetime(s00.dates.astype("datetime64[D]")),
+            "next_split_days": np.ones(len(s00.dates), dtype=np.int16),
+        }
+    ).to_parquet(dest)
+
+    def _boom(*_a, **_k):
+        raise AssertionError("build_panel must not run on the mmap train path")
+
+    monkeypatch.setattr("forecast.data.build_panel", _boom)
+    read_cfg = DataConfig(
+        data_dir=str(data),
+        interval="daily",
+        horizon=1,
+        seq_len=12,
+        stride=1,
+        min_context=4,
+        warmup_bars=6,
+        vol_halflife=preset["vol_halflife"],
+        z_window=12,
+        z_min_periods=4,
+        eval_last_bar=True,
+        global_calendar_split=True,
+        residual_target=True,
+        cross_section_min_names=5,
+        allow_mixed_prices=True,
+        universe="",
+        label_return="overnight",
+        use_mmap=True,
+        write_mmap=False,
+        mmap_manifest=str(first["mmap_manifest"]),
+    )
+    second = build_datasets(read_cfg, log_fn=None)
+    s00_m = next(s for s in second["train_symbols"] if s.symbol == "S00")
+    assert int(s00_m.valid.sum()) == 0
+    assert int((np.asarray(s00_m.next_split_days) == 1).sum()) == len(s00_m.next_split_days)

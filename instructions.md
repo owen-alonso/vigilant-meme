@@ -219,7 +219,7 @@ Windows desktop: `--num-workers 0` (default). Do not pickle the 6.7GB CS / `data
 
 Cut (0) skip-only FT was Eval-NO (live_locate IR +0.723 / DD -1.127 vs +5.58 / -0.95). Do not promote that checkpoint. This cut wires the Data Manager mmap feed into CS batching and adds a **direct** overnight-up classifier — not a residual-skip rank grid (closed) and not a bigger Mamba.
 
-Manifest: `data/_panel_cache/mmap_manifest.json`. Load API: `load_manifest`, `load_symbol_mmap(..., mmap_mode="r")` → float32 features `[T, F]` memmap + labels. PIT side-tape: `data/_pit/` (`next_split_days==1` nulls overnight labels).
+Manifest: `data/_panel_cache/mmap_manifest.json`. Load API: `load_manifest`, `load_symbol_mmap(..., mmap_mode="r")` → float32 features `[T, F]` memmap + labels. PIT (Data Manager): drop overnight labels where `next_split_days == 1` on `data/_pit/factors/{SYM}_daily_factors.parquet`. Optional membership as-of: `data/_pit/liquid_membership.json` (missing file is a no-op). The P(up) head / CS train path applies this mask; the live factors tape wins over mmap-cached `next_split_days`.
 
 ```bash
 # write mmap once (Data Manager / parquet → memmap). num_workers=0
@@ -381,7 +381,7 @@ Not on `-h` but fixed in code (and stored in the checkpoint): vol EWM half-life 
 | `--mmap-manifest` | auto | `data/_panel_cache/mmap_manifest.json` when present. CS batches read memmaps. |
 | `--write-mmap` | off | After a parquet build, write the mmap cache and train from it. |
 | `--pup-head` | off | (2a) direct overnight-up P(up) logistic. Not a sleeve grid. |
-| `--pit-dir` | `data/_pit` | Side-tape; `next_split_days==1` drops overnight labels. |
+| `--pit-dir` | `data/_pit` | Factors: `<pit>/factors/{SYM}_daily_factors.parquet` (`next_split_days==1` drops overnight labels). Optional `<pit>/liquid_membership.json`. |
 | `--checkpoint-dir` | `checkpoints/forecast` | `best.pt`, `last.pt`, `summary.json`. Relative paths are under the **repo root**. |
 | `--early-stop-evals` | `8` | Stop if val IC does not improve for this many evals. |
 | `--cpu` | off | Force CPU even if CUDA is available. |

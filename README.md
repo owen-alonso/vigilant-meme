@@ -189,7 +189,9 @@ read the Data Manager mmap feed (`data/_panel_cache/mmap_manifest.json`)
 when present (`load_manifest` / `load_symbol_mmap(..., mmap_mode="r")`);
 never `cs_train_*.pt`. `--pup-head` is the (2a) direct overnight-up P(up)
 classifier (VAL overnight-up ≥60% at cover ≥5%; TEST report-only). PIT
-drops overnight labels where `data/_pit/` has `next_split_days==1`.
+drops overnight labels where `data/_pit/factors/{SYM}_daily_factors.parquet`
+has `next_split_days==1`. Optional membership as-of:
+`data/_pit/liquid_membership.json`.
 VAL-gate the *book* on cost-aware `live_locate` IR vs +5.58 (report-only
 on the P(up) cut). Backtest
 `--holding overnight` flattens every open (MOC→MOO).

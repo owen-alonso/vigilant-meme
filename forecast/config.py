@@ -127,7 +127,8 @@ class DataConfig:
     use_mmap: bool = True
     write_mmap: bool = False
     mmap_cache_dir: str = ""
-    # PIT side-tape (``data/_pit/``). Empty = default next to data_dir.
+    # PIT root (``data/_pit/``). Factors: ``_pit/factors/{SYM}_daily_factors.parquet``.
+    # Optional membership as-of: ``_pit/liquid_membership.json``. Empty = default.
     pit_dir: str = ""
 
     def is_daily(self) -> bool:
