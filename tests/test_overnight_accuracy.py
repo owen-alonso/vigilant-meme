@@ -25,6 +25,7 @@ from forecast.accuracy import (
     cs_top_abs_mask,
     decide_book_aligned_promote,
     decide_short_aligned_promote,
+    decide_ej_ls_promote,
     decide_relative_dir_promote,
     decide_rel_e_stack_promote,
     decide_sector_mae_promote,
@@ -388,6 +389,14 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert "q20" in payload["short_aligned_live"]["val"]
     assert "PROMOTE SHORT-ALIGNED" in report
     assert "PROMOTE SHORT LIVE LS" in report
+    ej_cmp = payload["ej_ls_compare"]
+    assert "live" in ej_cmp["val"] and "paper" in ej_cmp["val"]
+    assert "q20" in ej_cmp["val"] and "live" in ej_cmp["test"]
+    ej_promo = payload["ej_ls_promotion"]
+    assert ej_promo["gated_on"] == "val"
+    assert "promote_ej_ls" in ej_promo
+    assert ej_promo["default_book_unchanged"] is True
+    assert "PROMOTE E+J LIVE LS" in report
 
 
 def test_zero_move_direction_is_zero_not_nan():
@@ -1091,6 +1100,64 @@ def test_decide_short_aligned_promote_is_val_only():
     assert d3["promote_short_aligned"] is False
     assert d3["gated_on"] == "val"
     assert d3["default_book_unchanged"] is True
+
+
+def test_decide_ej_ls_promote_is_val_only():
+    e = {"q": 0.90, "abs_q": 0.70, "abs_tau": 0.3}
+    j = {"q": 0.10, "abs_q": 0.70, "abs_tau": 0.3}
+    q20 = {"unlevered_net_ir": 1.00, "unlevered_max_dd": -0.10, "coverage": 0.25}
+    ok_live = {"unlevered_net_ir": 1.10, "unlevered_max_dd": -0.11, "coverage": 0.20}
+    ok_paper = {"unlevered_net_ir": 1.40, "unlevered_max_dd": -0.08, "coverage": 0.20}
+    yes = decide_ej_ls_promote(
+        val_live=ok_live,
+        val_q20=q20,
+        val_paper=ok_paper,
+        e_chosen=e,
+        j_chosen=j,
+    )
+    assert yes["promote_ej_ls"] is True
+    assert yes["live_book_unchanged"] is False
+    assert yes["default_book_unchanged"] is True
+    assert yes["gated_on"] == "val"
+    assert abs(yes["val_ir_delta"] - 0.10) < 1e-9
+    assert abs(yes["val_dd_delta"] - (-0.01)) < 1e-9
+
+    weak_live = {"unlevered_net_ir": 0.80, "unlevered_max_dd": -0.20, "coverage": 0.20}
+    juicy_paper = {"unlevered_net_ir": 3.00, "unlevered_max_dd": -0.02, "coverage": 0.40}
+    no_from_val = decide_ej_ls_promote(
+        val_live=weak_live,
+        val_q20=q20,
+        val_paper=juicy_paper,
+        e_chosen=e,
+        j_chosen=j,
+    )
+    assert no_from_val["promote_ej_ls"] is False
+    assert no_from_val["live_book_unchanged"] is True
+
+    ir_fail = decide_ej_ls_promote(
+        val_live={"unlevered_net_ir": 1.04, "unlevered_max_dd": -0.10, "coverage": 0.20},
+        val_q20=q20,
+        val_paper=ok_paper,
+        e_chosen=e,
+        j_chosen=j,
+    )
+    assert ir_fail["promote_ej_ls"] is False
+    dd_fail = decide_ej_ls_promote(
+        val_live={"unlevered_net_ir": 1.20, "unlevered_max_dd": -0.16, "coverage": 0.20},
+        val_q20=q20,
+        val_paper=ok_paper,
+        e_chosen=e,
+        j_chosen=j,
+    )
+    assert dd_fail["promote_ej_ls"] is False
+    cover_fail = decide_ej_ls_promote(
+        val_live={"unlevered_net_ir": 1.20, "unlevered_max_dd": -0.10, "coverage": 0.04},
+        val_q20=q20,
+        val_paper=ok_paper,
+        e_chosen=e,
+        j_chosen=j,
+    )
+    assert cover_fail["promote_ej_ls"] is False
 
 
 def test_long_only_book_block_selects_within_date_top_pred():

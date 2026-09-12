@@ -72,6 +72,11 @@ _BOOK_COST_KEYS = (
     "locate_pctile",
     "ex_post_gap_k",
 )
+# IDEA K paper column: no costs (not the 10 bp flatten).
+PAPER_ZERO_BUNDLE: dict[str, Any] = {
+    "name": "paper_zero",
+    **{k: 0.0 for k in _BOOK_COST_KEYS},
+}
 
 _SERIES_KEYS = {
     "net",
@@ -734,6 +739,113 @@ def score_short_aligned_live_book(
         "quantile": float(quantile),
         "long_only": False,
         "cost_bundle": "live_locate",
+    }
+
+
+def score_ej_ls_book(
+    df: pd.DataFrame,
+    *,
+    min_names: int,
+    vol_target: float,
+    e_chosen: dict[str, Any],
+    j_chosen: dict[str, Any],
+    bundle: dict[str, Any],
+    name: str = "",
+) -> dict[str, Any]:
+    """Dollar-neutral LS: long E top-q ∩ |pred|, short J bottom-q ∩ |pred|."""
+    e_q = float((e_chosen or {}).get("q") or 0.80)
+    e_tau = float((e_chosen or {}).get("abs_tau") or 0.0)
+    e_aq = float((e_chosen or {}).get("abs_q") or 0.0)
+    j_q = float((j_chosen or {}).get("q") or 0.20)
+    j_tau = float((j_chosen or {}).get("abs_tau") or 0.0)
+    j_aq = float((j_chosen or {}).get("abs_q") or 0.0)
+    empty = {
+        "name": name or "empty",
+        "unlevered_net_ir": float("nan"),
+        "unlevered_max_dd": float("nan"),
+        "mean_turnover": float("nan"),
+        "mean_cost_unlev_bp": float("nan"),
+        "n_book_dates": float("nan"),
+        "coverage": float("nan"),
+        "long_coverage": float("nan"),
+        "short_coverage": float("nan"),
+        "date_coverage": float("nan"),
+        "n": 0.0,
+        "n_long": 0.0,
+        "n_short": 0.0,
+        "n_dates": 0.0,
+        "e_q": e_q,
+        "e_abs_tau": e_tau,
+        "j_q": j_q,
+        "j_abs_tau": j_tau,
+        "cost_bundle": str((bundle or {}).get("name") or ""),
+    }
+    if df.empty:
+        return empty
+    pred, y, r_on, tz, vol = _wide_from_frame(df)
+    if pred.empty or pred.shape[1] < 2:
+        return empty
+    stats = _run_overnight_book(
+        pred,
+        y,
+        bundle=bundle,
+        long_only=False,
+        min_names=min_names,
+        vol_target=vol_target,
+        overnight_r=r_on,
+        turnover_z=tz,
+        vol_level=vol,
+        quantile=0.2,
+        weighting="quantile",
+        long_size="equal",
+        conviction_q=e_q,
+        conf_abs=e_tau,
+        short_conviction_q=j_q,
+        short_conf_abs=j_tau,
+    )
+    long_mask = cs_top_abs_mask(
+        df, q=e_q, abs_tau=e_tau, score_col="pred", min_names=min_names
+    )
+    short_mask = cs_bottom_abs_mask(
+        df, q=j_q, abs_tau=j_tau, score_col="pred", min_names=min_names
+    )
+    union = long_mask | short_mask
+    cover = float(union.mean()) if union.size else float("nan")
+    n_dates = (
+        float(pd.Series(df["date"].to_numpy()[union]).nunique())
+        if int(union.sum()) and "date" in df.columns
+        else 0.0
+    )
+    n_all = (
+        float(df["date"].nunique()) if not df.empty and "date" in df.columns else 0.0
+    )
+    return {
+        "name": name
+        or (
+            f"ej_ls_e{e_q:.2f}a{e_aq:.2f}_j{j_q:.2f}a{j_aq:.2f}_"
+            f"{str((bundle or {}).get('name') or 'book')}"
+        ),
+        "unlevered_net_ir": stats.get("unlevered_net_ir"),
+        "unlevered_max_dd": stats.get("unlevered_max_dd"),
+        "mean_turnover": stats.get("mean_turnover"),
+        "mean_cost_unlev_bp": stats.get("mean_cost_unlev_bp"),
+        "n_book_dates": stats.get("n_dates"),
+        "coverage": cover,
+        "long_coverage": float(long_mask.mean()) if long_mask.size else float("nan"),
+        "short_coverage": float(short_mask.mean()) if short_mask.size else float("nan"),
+        "date_coverage": (float(n_dates / n_all) if n_all else float("nan")),
+        "n": float(int(union.sum())),
+        "n_long": float(int(long_mask.sum())),
+        "n_short": float(int(short_mask.sum())),
+        "n_dates": n_dates,
+        "e_q": e_q,
+        "e_abs_q": e_aq,
+        "e_abs_tau": e_tau,
+        "j_q": j_q,
+        "j_abs_q": j_aq,
+        "j_abs_tau": j_tau,
+        "long_only": False,
+        "cost_bundle": str((bundle or {}).get("name") or ""),
     }
 
 

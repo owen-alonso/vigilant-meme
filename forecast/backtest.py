@@ -402,6 +402,48 @@ def ls_short_aligned_weights(
     return w
 
 
+def ls_conviction_weights(
+    scores: pd.Series,
+    *,
+    long_q: float,
+    short_q: float,
+    long_abs_tau: float = 0.0,
+    short_abs_tau: float = 0.0,
+    min_names: int = 3,
+) -> pd.Series:
+    """Dollar-neutral LS: long IDEA E top-q ∩ |pred|, short IDEA J bottom-q ∩ |pred|.
+
+    ``long_q=0.90`` is the top 10%. ``short_q=0.10`` is the bottom 10%.
+    Default off in ``book_pnl``. Next open is never used.
+    """
+    s = pd.to_numeric(scores, errors="coerce")
+    w = pd.Series(0.0, index=s.index, dtype=np.float64)
+    finite = s.notna() & np.isfinite(s)
+    if int(finite.sum()) < int(min_names):
+        return w
+    arr = s.to_numpy(dtype=np.float64)
+    long_cut = float(np.nanquantile(arr, float(long_q)))
+    short_cut = float(np.nanquantile(arr, float(short_q)))
+    long_keep = finite & (s >= long_cut)
+    short_keep = finite & (s <= short_cut)
+    ltau = float(long_abs_tau)
+    stau = float(short_abs_tau)
+    if ltau > 0.0:
+        long_keep = long_keep & (s.abs() >= ltau)
+    if stau > 0.0:
+        short_keep = short_keep & (s.abs() >= stau)
+    overlap = long_keep & short_keep
+    long_keep = long_keep & ~overlap
+    short_keep = short_keep & ~overlap
+    n_long = int(long_keep.sum())
+    n_short = int(short_keep.sum())
+    if n_long <= 0 or n_short <= 0:
+        return w
+    w.loc[long_keep] = 0.5 / float(n_long)
+    w.loc[short_keep] = -0.5 / float(n_short)
+    return w
+
+
 def quantile_weights(
     scores: pd.Series,
     *,
@@ -963,6 +1005,19 @@ def book_pnl(
                 abs_tau=float(conf_abs or 0.0),
                 min_names=int(min_names),
                 require_above_median=bool(stack_long_half),
+            )
+        elif (
+            (not long_only)
+            and float(conviction_q or 0.0) > 0.0
+            and float(short_conviction_q or 0.0) > 0.0
+        ):
+            w = ls_conviction_weights(
+                pair_all["p"],
+                long_q=float(conviction_q),
+                short_q=float(short_conviction_q),
+                long_abs_tau=float(conf_abs or 0.0),
+                short_abs_tau=float(short_conf_abs or 0.0),
+                min_names=int(min_names),
             )
         elif (not long_only) and float(short_conviction_q or 0.0) > 0.0:
             q_lo = float(quantile)

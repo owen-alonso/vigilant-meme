@@ -14,6 +14,7 @@ converts that to an implied overnight log-return ``pred * sigma`` (same as
 - H∩E stack (long-half ∩ TRAIN top-q) relative / absolute / live-IR gates
 - short-sleeve overnight down-rate on the within-date bottom residual names
 - book-aligned short sleeve overnight-down (TRAIN bottom-q / |pred| grid, VAL-gated)
+- symmetric long-E / short-J LS (paper zero-cost + live_locate vs q20)
 
 Default recipe is the PR #5 overnight skip (rank-target ridge, ``no_long_ts``).
 PR #7 levers stay off unless a checkpoint documents them.
@@ -79,6 +80,10 @@ STACK_DD_TOL = 0.05
 SHORT_ALIGN_QS = (0.10, 0.20, 0.30)  # bottom 10/20/30%
 SHORT_ALIGN_ABS_QS = BOOK_ALIGN_ABS_QS
 SHORT_IR_LIFT = 0.05
+# IDEA K: symmetric long-E / short-J live_locate vs q20.
+EJ_IR_LIFT = 0.05
+EJ_DD_TOL = 0.05
+EJ_COVER = 0.05
 TURNOVER_COL = FEATURE_NAMES.index("turnover_z") if "turnover_z" in FEATURE_NAMES else None
 VOL_LEVEL_COL = FEATURE_NAMES.index("vol_level") if "vol_level" in FEATURE_NAMES else None
 # PR #8 locked-TEST residual*sigma print (do not retarget; compare on the same window).
@@ -1152,6 +1157,90 @@ def decide_short_aligned_promote(
     }
 
 
+def decide_ej_ls_promote(
+    *,
+    val_live: dict[str, Any],
+    val_q20: dict[str, Any],
+    val_paper: dict[str, Any] | None = None,
+    e_chosen: dict[str, Any] | None = None,
+    j_chosen: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """VAL-only live_locate E+J LS vs long-only q20. Paper is report-only."""
+    live = dict(val_live or {})
+    q20 = dict(val_q20 or {})
+    paper = dict(val_paper or {})
+    e = dict(e_chosen or {})
+    j = dict(j_chosen or {})
+    ir = _as_float(live.get("unlevered_net_ir"))
+    ir20 = _as_float(q20.get("unlevered_net_ir"))
+    dd = _as_float(live.get("unlevered_max_dd"))
+    dd20 = _as_float(q20.get("unlevered_max_dd"))
+    cover = _as_float(live.get("coverage"))
+    ir_delta = (
+        float(ir - ir20) if np.isfinite(ir) and np.isfinite(ir20) else float("nan")
+    )
+    dd_delta = (
+        float(dd - dd20) if np.isfinite(dd) and np.isfinite(dd20) else float("nan")
+    )
+    ir_ok = bool(np.isfinite(ir_delta) and ir_delta >= EJ_IR_LIFT)
+    dd_ok = bool(not np.isfinite(dd_delta) or dd_delta >= -EJ_DD_TOL)
+    cover_ok = bool(np.isfinite(cover) and cover >= EJ_COVER)
+    promote = bool(ir_ok and dd_ok and cover_ok)
+    e_q = _as_float(e.get("q"), default=0.80)
+    e_aq = _as_float(e.get("abs_q"), default=0.0)
+    j_q = _as_float(j.get("q"), default=0.20)
+    j_aq = _as_float(j.get("abs_q"), default=0.0)
+    if not cover_ok:
+        reason = (
+            f"NO PROMOTE E+J live LS: VAL cover {100.0 * cover:.1f}% "
+            f"< {100.0 * EJ_COVER:.0f}%. Keep q20 default. E+J remain hit-rate-only."
+        )
+    elif not ir_ok:
+        reason = (
+            f"NO PROMOTE E+J live LS: VAL live_locate IR {ir:+.3f} vs q20 "
+            f"{ir20:+.3f} (delta {ir_delta:+.3f} < +{EJ_IR_LIFT:.2f}). "
+            "Keep q20 default. E+J remain hit-rate-only."
+        )
+    elif not dd_ok:
+        reason = (
+            f"NO PROMOTE E+J live LS: VAL max DD {dd:+.3f} vs q20 {dd20:+.3f} "
+            f"(delta {dd_delta:+.3f} < -{EJ_DD_TOL:.2f}). Keep q20 default. "
+            "E+J remain hit-rate-only."
+        )
+    else:
+        reason = (
+            f"PROMOTE E+J live LS e_q={e_q:.2f} j_q={j_q:.2f}: VAL live_locate "
+            f"IR {ir:+.3f} vs q20 {ir20:+.3f} (delta {ir_delta:+.3f}) and max DD "
+            f"{dd:+.3f} vs {dd20:+.3f} (delta {dd_delta:+.3f}). "
+            "Default CLI stays q20 until liquid."
+        )
+    return {
+        "promote_ej_ls": promote,
+        "gated_on": "val",
+        "reason": reason,
+        "e_q": float(e_q),
+        "e_abs_q": float(e_aq),
+        "e_abs_tau": _as_float(e.get("abs_tau"), default=0.0),
+        "j_q": float(j_q),
+        "j_abs_q": float(j_aq),
+        "j_abs_tau": _as_float(j.get("abs_tau"), default=0.0),
+        "val_ir": ir,
+        "val_ir_q20": ir20,
+        "val_ir_delta": ir_delta,
+        "val_dd": dd,
+        "val_dd_q20": dd20,
+        "val_dd_delta": dd_delta,
+        "val_coverage": cover,
+        "val_paper_ir": _as_float(paper.get("unlevered_net_ir")),
+        "val_paper_dd": _as_float(paper.get("unlevered_max_dd")),
+        "ir_lift": EJ_IR_LIFT,
+        "dd_tol": EJ_DD_TOL,
+        "cover_floor": EJ_COVER,
+        "live_book_unchanged": (not promote),
+        "default_book_unchanged": True,
+    }
+
+
 def cs_relative_blocks(
     df: pd.DataFrame,
     *,
@@ -2206,6 +2295,9 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         short_txt = format_short_aligned_block(payload)
         if short_txt:
             lines.extend(["", short_txt])
+        ej_txt = format_ej_ls_block(payload)
+        if ej_txt:
+            lines.extend(["", ej_txt])
     conf = payload.get("confidence")
     if conf:
         lines.extend(["", format_confidence_block(conf)])
@@ -4149,6 +4241,45 @@ def format_short_aligned_block(payload: dict[str, Any]) -> str:
     )
 
 
+def format_ej_ls_block(payload: dict[str, Any]) -> str:
+    promo = payload.get("ej_ls_promotion") or {}
+    cmp = payload.get("ej_ls_compare") or {}
+    if not promo and not cmp:
+        return ""
+    yes = bool(promo.get("promote_ej_ls"))
+    va = cmp.get("val") or {}
+    te = cmp.get("test") or {}
+    return "\n".join(
+        [
+            f"PROMOTE E+J LIVE LS? {'YES' if yes else 'NO'}",
+            "  Symmetric LS: long IDEA E TRAIN top-q ∩ |pred|, short IDEA J "
+            "TRAIN bottom-q ∩ |pred|. Paper is zero-cost. live_locate is the "
+            "gate vs long-only q20 (IR ≥ q20+0.05, DD not worse by >0.05, "
+            "cover ≥ 5%). TEST report-only. Live q20 unchanged unless the "
+            "IR/DD gate clears. E+J hit-rate promotes stay hit-rate-only "
+            "if live does not clear.",
+            f"  TRAIN E q={_as_float(promo.get('e_q')):.2f} abs_q="
+            f"{_as_float(promo.get('e_abs_q')):.2f}  "
+            f"J q={_as_float(promo.get('j_q')):.2f} abs_q="
+            f"{_as_float(promo.get('j_abs_q')):.2f}  gated_on={promo.get('gated_on')!r}",
+            "  VAL (gate):",
+            _fmt_stack_live("q20", va.get("q20")),
+            _fmt_stack_live("paper 0c", va.get("paper")),
+            _fmt_stack_live("live_locate", va.get("live")),
+            f"  VAL IR delta {_as_float(promo.get('val_ir_delta')):+.3f}  "
+            f"(need ≥+{EJ_IR_LIFT:.2f})  DD delta "
+            f"{_as_float(promo.get('val_dd_delta')):+.3f}  "
+            f"(need ≥-{EJ_DD_TOL:.2f})  cover "
+            f"{100.0 * _as_float(promo.get('val_coverage')):.1f}%",
+            "  TEST (report-only):",
+            _fmt_stack_live("q20", te.get("q20")),
+            _fmt_stack_live("paper 0c", te.get("paper")),
+            _fmt_stack_live("live_locate", te.get("live")),
+            f"  {promo.get('reason') or 'no E+J live decision'}",
+        ]
+    )
+
+
 def format_conviction_live_block(payload: dict[str, Any]) -> str:
     """IDEA F live-cost IR gate; implemented in forecast.shorting."""
     if not payload.get("conviction_live_promotion") and not payload.get("conviction_live"):
@@ -5346,6 +5477,9 @@ def evaluate_overnight_accuracy(
         decide_conviction_live_promote,
         score_conviction_live_book,
         score_short_aligned_live_book,
+        score_ej_ls_book,
+        PAPER_ZERO_BUNDLE,
+        LIVE_LOCATE_BUNDLE,
     )
 
     conviction_live = compare_conviction_live(
@@ -5503,6 +5637,65 @@ def evaluate_overnight_accuracy(
     }
     payload["short_aligned_live"] = short_aligned_live
     payload["short_aligned_promotion"] = short_aligned_promotion
+    chosen_e = book_aligned_fit.get("chosen") or chosen_ba
+    chosen_j = short_aligned_fit.get("chosen") or chosen_sh
+    ej_ls_compare: dict[str, Any] = {}
+    for split_name, split_df in (("train", tr), ("val", va), ("test", te)):
+        q20_row = (conviction_live.get(split_name) or {}).get("q20") or {}
+        if not q20_row:
+            q20_row = score_conviction_live_book(
+                split_df,
+                min_names=min_names,
+                vol_target=0.15,
+                name="q20_equal",
+            )
+        ej_ls_compare[split_name] = {
+            "q20": q20_row,
+            "paper": score_ej_ls_book(
+                split_df,
+                min_names=min_names,
+                vol_target=0.15,
+                e_chosen=chosen_e,
+                j_chosen=chosen_j,
+                bundle=PAPER_ZERO_BUNDLE,
+                name="ej_ls_paper",
+            ),
+            "live": score_ej_ls_book(
+                split_df,
+                min_names=min_names,
+                vol_target=0.15,
+                e_chosen=chosen_e,
+                j_chosen=chosen_j,
+                bundle=LIVE_LOCATE_BUNDLE,
+                name="ej_ls_live_locate",
+            ),
+        }
+    ej_ls_promotion = decide_ej_ls_promote(
+        val_live=(ej_ls_compare.get("val") or {}).get("live") or {},
+        val_q20=(ej_ls_compare.get("val") or {}).get("q20") or {},
+        val_paper=(ej_ls_compare.get("val") or {}).get("paper") or {},
+        e_chosen=chosen_e,
+        j_chosen=chosen_j,
+    )
+    payload["ej_ls_compare"] = {
+        **ej_ls_compare,
+        "e_chosen": {
+            "q": float(chosen_e.get("q") or 0.80),
+            "abs_q": float(chosen_e.get("abs_q") or 0.0),
+            "abs_tau": float(chosen_e.get("abs_tau") or 0.0),
+        },
+        "j_chosen": {
+            "q": float(chosen_j.get("q") or 0.20),
+            "abs_q": float(chosen_j.get("abs_q") or 0.0),
+            "abs_tau": float(chosen_j.get("abs_tau") or 0.0),
+        },
+        "note": (
+            "Symmetric long-E / short-J LS. Paper is zero-cost. "
+            "live_locate vs long-only q20 is the VAL gate. TEST report-only. "
+            "Live q20 unchanged unless the IR/DD gate clears."
+        ),
+    }
+    payload["ej_ls_promotion"] = ej_ls_promotion
     if log_fn:
         log_fn(
             f"accuracy default={default_name!r}  "
@@ -5527,6 +5720,8 @@ def evaluate_overnight_accuracy(
             f"promote_short_aligned="
             f"{bool(short_aligned_promotion.get('promote_short_aligned'))}  "
             f"promote_short_live="
-            f"{bool(short_aligned_promotion.get('promote_short_live'))}"
+            f"{bool(short_aligned_promotion.get('promote_short_live'))}  "
+            f"promote_ej_ls="
+            f"{bool(ej_ls_promotion.get('promote_ej_ls'))}"
         )
     return payload

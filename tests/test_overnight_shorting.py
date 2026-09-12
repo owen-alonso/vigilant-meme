@@ -12,6 +12,7 @@ from forecast.accuracy import sleeve_book_block
 from forecast.backtest import (
     book_pnl,
     conviction_long_weights,
+    ls_conviction_weights,
     ls_short_aligned_weights,
     sleeve_direction_from_weights,
 )
@@ -201,6 +202,37 @@ def test_ls_short_aligned_weights_longs_top_and_shorts_bottom():
     assert w[["b", "c"]].sum() == pytest.approx(0.0)
     w2 = ls_short_aligned_weights(s, short_q=0.25, abs_tau=2.5, long_q=0.75, min_names=3)
     assert w2.sum() == pytest.approx(0.0)
+
+
+def test_ls_conviction_weights_long_e_short_j_drop_overlap():
+    s = pd.Series([-2.0, -1.0, 1.0, 2.0], index=list("abcd"))
+    w = ls_conviction_weights(s, long_q=0.75, short_q=0.25)
+    assert w["a"] == pytest.approx(-0.5)
+    assert w["d"] == pytest.approx(0.5)
+    assert w[["b", "c"]].sum() == pytest.approx(0.0)
+    assert w.sum() == pytest.approx(0.0)
+    assert w.abs().sum() == pytest.approx(1.0)
+
+    overlap = pd.Series([1.0, 0.5, -0.5, -1.0], index=list("abcd"))
+    w_ov = ls_conviction_weights(
+        overlap, long_q=0.0, short_q=1.0, long_abs_tau=0.0, short_abs_tau=0.0
+    )
+    assert w_ov.abs().sum() == pytest.approx(0.0)
+
+
+def test_ls_conviction_weights_respects_abs_floors():
+    s = pd.Series([2.0, 1.5, 0.2, -0.2, -1.5, -2.0], index=list("abcdef"))
+    w = ls_conviction_weights(
+        s, long_q=0.70, short_q=0.30, long_abs_tau=1.0, short_abs_tau=1.0
+    )
+    assert w["a"] > 0.0 and w["b"] > 0.0
+    assert w["e"] < 0.0 and w["f"] < 0.0
+    assert w[["c", "d"]].sum() == pytest.approx(0.0)
+    thin = pd.Series([0.3, 0.2, 0.1, -0.1, -0.2, -0.3], index=list("abcdef"))
+    w_thin = ls_conviction_weights(
+        thin, long_q=0.70, short_q=0.30, long_abs_tau=1.0, short_abs_tau=1.0
+    )
+    assert w_thin.abs().sum() == pytest.approx(0.0)
 
 
 def test_decide_conviction_live_promote_is_val_only():

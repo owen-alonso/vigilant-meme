@@ -28,6 +28,9 @@ re-grid on TRAIN relative hit). Absolute up vs E; live IR vs q20 (F gate).
 IDEA J mirrors E on the short side: overnight down-rate of TRAIN bottom-q
 / |pred| names vs the down-floor and vs bottom-20%. Optional live_locate
 LS vs long-only q20. Live q20 unchanged on hit-rate-only.
+IDEA K builds a symmetric long-E / short-J LS (paper zero-cost + live_locate)
+and promotes the live path only if VAL IR ≥ q20+0.05 and DD is not worse
+by >0.05.
 """
 
 from __future__ import annotations
