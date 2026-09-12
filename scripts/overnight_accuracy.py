@@ -40,9 +40,11 @@ IDEA M is sparse MAE: TRAIN affine_l1/huber on residual*sigma->r_on, then a
 TRAIN |pred| tau so small gaps predict 0 (zero-move). Same VAL % MAE gate.
 --try-dynamic-a trains a tiny Dynamic A encoder (VAL-gated residual blend;
 steps 0 = auto one-epoch cap 400 on liquid-scale panels).
-IDEA N enumerates rank sleeves on TRAIN then selects on locked VAL
-(pred_r / ridged P(up) / gap-filter / CS z). Aimed at VAL 60% with
-cover >= 5%. TEST never picks. Dynamic A alpha-blend is not the 60% path.
+IDEA N/O enumerates rank sleeves on TRAIN then selects on locked VAL
+(pred_r / ridged P(up) / gap-filter / CS z / vote-z / logit4 /
+gap*turnover / k-of-M vote / high-dispersion dates). Aimed at VAL 60%
+with cover >= 5%. TEST never picks. Dynamic A alpha-blend is not the
+60% path. If n_hit_60=0 the report prints a STOP 60% autopsy.
 """
 
 from __future__ import annotations

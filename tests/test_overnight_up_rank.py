@@ -15,12 +15,17 @@ from forecast.overnight_up_rank import (
     evaluate_overnight_up_rank,
     fit_logit2_up,
     apply_logit2_up,
+    fit_logit4_up,
+    apply_logit4_up,
     fit_overnight_up_rank_on_train,
     format_overnight_up_rank_block,
+    high_disp_threshold,
     high_drift_weekdays,
     pick_up_rank_on_val,
     rank_score,
+    score_boolean_sleeve,
     spec_id,
+    vote_mask,
 )
 
 
@@ -131,7 +136,11 @@ def test_fit_up_rank_is_train_only_and_respects_cover():
         "pred_pos_gap",
         "pred_r_pos",
         "logit2",
+        "logit4",
+        "vote_z",
+        "gap_turn",
         "cs_blend",
+        "vote_k",
     }
 
 
@@ -369,4 +378,125 @@ def test_evaluate_val_select_does_not_use_test_labels():
     text = format_overnight_up_rank_block({"overnight_up_rank": payload})
     assert "VAL-select" in text or "VAL pick" in text
     assert "not used" in text
+    _ascii_ok(text)
+
+
+def test_logit4_and_vote_z_and_gap_turn_are_finite():
+    rng = np.random.default_rng(3)
+    pred = rng.normal(size=200)
+    pred_r = 0.01 * pred + rng.normal(scale=0.004, size=200)
+    turn = rng.normal(size=200)
+    r_on = pred_r + 0.002 * turn + rng.normal(scale=0.01, size=200)
+    spec = fit_logit4_up(pred, pred_r, r_on, turn)
+    p = apply_logit4_up(pred, pred_r, turn, spec)
+    assert p.shape == pred.shape
+    assert np.isfinite(p).all()
+    df = pd.DataFrame(
+        {
+            "pred": pred[:12],
+            "pred_r": pred_r[:12],
+            "turnover_z": turn[:12],
+            "date": np.repeat([1, 2, 3], 4),
+        }
+    )
+    vz = rank_score(df, "vote_z")
+    gt = rank_score(df, "gap_turn")
+    assert vz.shape == (12,) and gt.shape == (12,)
+    assert np.isfinite(vz).all()
+
+
+def test_high_disp_threshold_keeps_wide_days():
+    rows = []
+    for d in range(10):
+        sd = 0.02 if d >= 5 else 0.002
+        for i in range(8):
+            rows.append({"date": d, "pred_r": float((i - 3) * sd), "pred": 0.0})
+    df = pd.DataFrame(rows)
+    tau = high_disp_threshold(df, q=0.50)
+    assert tau > 0.002
+    from forecast.overnight_up_rank import _apply_disp_filter
+
+    sub = _apply_disp_filter(df, tau)
+    assert set(sub["date"].unique()) <= set(range(5, 10))
+
+
+def test_vote_mask_requires_k_members():
+    rng = np.random.default_rng(5)
+    rows = []
+    for d in range(8):
+        for i in range(10):
+            pred = float(rng.normal())
+            rows.append(
+                {
+                    "symbol": f"S{i:02d}",
+                    "date": d,
+                    "pred": pred,
+                    "pred_r": 0.01 * pred,
+                    "r_on": 0.01 * pred,
+                    "turnover_z": 0.0,
+                }
+            )
+    df = pd.DataFrame(rows)
+    a = {"kind": "pred", "q": 0.80, "abs_tau": 0.0, "blend_alpha": 0.5}
+    b = {"kind": "pred_r", "q": 0.80, "abs_tau": 0.0, "blend_alpha": 0.5}
+    m2 = vote_mask(df, [a, b], 2, min_names=3)
+    m1 = vote_mask(df, [a, b], 1, min_names=3)
+    assert int(m2.sum()) <= int(m1.sum())
+    assert int(m1.sum()) > 0
+    scored = score_boolean_sleeve(df, m2, n_full=len(df))
+    assert scored["cover_full"] == float(m2.mean())
+    if int(m2.sum()) > 0:
+        assert np.isfinite(scored["up_pct"])
+
+
+def test_stop_60_line_is_ascii_when_no_hit():
+    miss = decide_overnight_up_rank_promote(
+        val_chosen={
+            "up_pct": 59.07,
+            "cover_full": 0.067,
+            "uncond_up_pct": 53.6,
+            "excess_pp": 5.48,
+        },
+        val_e={"up_pct": 58.14},
+        chosen={"kind": "pred_pos_gap", "q": 0.70, "abs_q": 0.80},
+    )
+    assert miss["reached_60"] is False
+    assert miss["promote_up_rank"] is True
+    text = format_overnight_up_rank_block(
+        {
+            "overnight_up_rank": {
+                "fit": {
+                    "chosen": {
+                        "kind": "pred_pos_gap",
+                        "q": 0.70,
+                        "abs_q": 0.80,
+                        "blend_alpha": 0.5,
+                        "dow_mode": "all",
+                        "disp_mode": "all",
+                    },
+                    "fit_split": "train",
+                    "select_split": "val",
+                    "n_candidates": 243,
+                    "train_greedy": {"kind": "pred", "q": 0.90, "abs_q": 0.80, "up_pct": 61.98},
+                },
+                "compare": {
+                    "val": {"up_pct": 59.07, "excess_pp": 5.48, "cover_full": 0.067, "n": 100},
+                    "test": {"up_pct": 57.07, "cover_full": 0.078},
+                    "val_e": {"up_pct": 58.14, "coverage": 0.069},
+                    "test_e": {"up_pct": 56.72},
+                    "train_greedy_val": {"up_pct": 58.60},
+                },
+                "autopsy": {
+                    "n_val_ok": 223,
+                    "n_hit_60": 0,
+                    "best_val_up": 59.07,
+                    "train_greedy_cliff_pp": 3.37,
+                },
+                "promotion": miss,
+            }
+        }
+    )
+    assert "REACHED 60%? NO" in text
+    assert "STOP 60%" in text
+    assert "best_val_up=59.07%" in text
     _ascii_ok(text)
