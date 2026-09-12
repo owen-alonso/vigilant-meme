@@ -24,7 +24,12 @@ from forecast.cuts import (
 )
 from forecast.data import build_datasets
 from forecast.ridge import _prepare_cs_design, fit_ridge_xy, ridge_kwargs_from_train_cfg
-from forecast.training import build_arg_parser, configs_from_cli
+from forecast.training import (
+    _fmt,
+    _split_has_metrics,
+    build_arg_parser,
+    configs_from_cli,
+)
 
 
 def _write_daily_parquet(path: Path, symbol: str, n: int, start: str, drift: float = 0.01) -> None:
@@ -409,6 +414,78 @@ def test_skip_only_train_uses_phase_val_window_and_writes_cuts(tmp_path: Path):
     assert "skip_only_val" in summary
     ends = {m["val_end"] for m in summary["symbols"]}
     assert ends == {"2020-10-01"}
+
+
+def test_fmt_tolerates_empty_and_partial_metrics():
+    assert _fmt({}) == "(empty split)"
+    assert _fmt(None) == "(empty split)"
+    partial = {"ic": float("nan"), "n": 0.0, "loss": float("nan")}
+    text = _fmt(partial)
+    assert "r2=" in text
+    assert "n=0" in text
+    assert _split_has_metrics({}) is False
+    assert _split_has_metrics(partial) is False
+    assert _split_has_metrics({"n": 12.0, "r2": 0.1}) is True
+
+
+def test_skip_only_empty_test_still_writes_best_pt(tmp_path: Path):
+    """Pretrain test windows=0 must not KeyError in _fmt before save."""
+    from forecast.config import ForecastModelConfig
+    from forecast.training import train
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    for i, name in enumerate(("AAPL", "MSFT", "GOOGL", "JPM", "XOM", "JNJ", "PG", "HD")):
+        _write_daily_parquet(
+            data_dir / f"{name}_daily.parquet",
+            name,
+            180,
+            "2020-01-02",
+            0.01 + 0.001 * i,
+        )
+    ckpt_dir = tmp_path / "ckpt_pretrain"
+    logs: list[str] = []
+    data_cfg = DataConfig(
+        data_dir=str(data_dir),
+        interval="daily",
+        horizon=1,
+        seq_len=8,
+        stride=1,
+        min_context=2,
+        warmup_bars=4,
+        vol_halflife=5,
+        z_window=8,
+        z_min_periods=4,
+        residual_target=False,
+        eval_last_bar=True,
+        cross_section_min_names=8,
+        allow_mixed_prices=True,
+        equities_only=True,
+        sector_residual=False,
+        train_from="2020-01-02",
+        train_end="2020-07-01",
+        val_end="2020-10-01",
+        test_end="2020-10-01",
+    )
+    summary = train(
+        data_cfg,
+        ForecastModelConfig(d_model=16, n_layer=1, d_state=8),
+        ForecastTrainConfig(
+            skip_only=True,
+            checkpoint_dir=str(ckpt_dir),
+            forecast_phase="pretrain",
+            num_workers=0,
+            precision="fp32",
+            eval_train_split=False,
+        ),
+        device=__import__("torch").device("cpu"),
+        log_fn=logs.append,
+    )
+    assert (ckpt_dir / "best.pt").is_file()
+    assert (ckpt_dir / "last.pt").is_file()
+    assert any("skip-only test: (empty split)" in line for line in logs)
+    assert not any("KeyError" in line for line in logs)
+    assert float(summary["skip_only_test"].get("n", 0.0) or 0.0) == 0.0
 
 
 def test_val_gate_commands_point_at_ft_live_locate():

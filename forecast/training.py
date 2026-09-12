@@ -761,20 +761,37 @@ def apply_ridge_skip(
     return ic
 
 
-def _fmt(metrics: dict[str, float]) -> str:
-    spearman = metrics.get("ic_spearman", float("nan"))
-    raw = metrics.get("ic_raw", metrics.get("ic", float("nan")))
-    cs_sp = metrics.get("cs_ic_spearman", float("nan"))
-    cs_t = metrics.get("cs_ic_tstat", float("nan"))
-    cs_n = metrics.get("cs_n_dates", float("nan"))
+def _fmt(metrics: dict[str, float] | None) -> str:
+    """Pretty-print eval metrics. Empty / partial dicts must not raise."""
+    if not metrics:
+        return "(empty split)"
+    nan = float("nan")
+    spearman = metrics.get("ic_spearman", nan)
+    raw = metrics.get("ic_raw", metrics.get("ic", nan))
+    cs_sp = metrics.get("cs_ic_spearman", nan)
+    cs_t = metrics.get("cs_ic_tstat", nan)
+    cs_n = metrics.get("cs_n_dates", nan)
+    n = metrics.get("n", 0.0)
+    n_int = int(n) if isinstance(n, (int, float)) and np.isfinite(n) else 0
     return (
-        f"loss={metrics['loss']:.5f} ic={metrics['ic']:+.4f} "
+        f"loss={metrics.get('loss', nan):.5f} ic={metrics.get('ic', nan):+.4f} "
         f"spearman={spearman:+.4f} raw={raw:+.4f} "
-        f"cs_ic={metrics.get('cs_ic', float('nan')):+.4f} "
+        f"cs_ic={metrics.get('cs_ic', nan):+.4f} "
         f"cs_sp={cs_sp:+.4f} cs_t={cs_t:+.2f} cs_dates={int(cs_n) if np.isfinite(cs_n) else 0} "
-        f"r2={metrics['r2']:+.5f} dir={metrics['direction']:.4f} "
-        f"pred_std={metrics['pred_std_bps']:.2f}bps n={int(metrics['n'])}"
+        f"r2={metrics.get('r2', nan):+.5f} dir={metrics.get('direction', nan):.4f} "
+        f"pred_std={metrics.get('pred_std_bps', nan):.2f}bps n={n_int}"
     )
+
+
+def _split_has_metrics(metrics: dict[str, float] | None) -> bool:
+    """True when a split produced labelled bars (``n > 0``)."""
+    if not metrics:
+        return False
+    n = metrics.get("n", 0.0)
+    try:
+        return float(n) > 0.0
+    except (TypeError, ValueError):
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -962,11 +979,19 @@ def _train(
         skip_only_train = evaluate(model, train_eval_loader, device, train_cfg, **cs_eval)
     skip_only_val = evaluate(model, val_loader, device, train_cfg, **cs_eval)
     skip_only_test = evaluate(model, test_loader, device, train_cfg, **cs_eval)
+    # Write skip-only checkpoints before test logs. Pretrain has no locked
+    # test window; an empty-test KeyError in ``_fmt`` must not block best.pt.
+    if train_cfg.skip_only:
+        save(ckpt_dir / "best.pt", 0, skip_only_val)
+        save(ckpt_dir / "last.pt", 0, skip_only_val)
     if log_fn:
         if skip_only_train:
             log_fn(f"  skip-only train: {_fmt(skip_only_train)}")
         log_fn(f"  skip-only val: {_fmt(skip_only_val)}")
-        log_fn(f"  skip-only test: {_fmt(skip_only_test)}")
+        if _split_has_metrics(skip_only_test):
+            log_fn(f"  skip-only test: {_fmt(skip_only_test)}")
+        else:
+            log_fn("  skip-only test: (empty split)")
     walk_forward: dict[str, Any] = {}
     if train_cfg.skip_only:
         walk_forward = walk_forward_split_metrics(bundle, train_cfg)
@@ -1010,8 +1035,6 @@ def _train(
                         )
 
     if train_cfg.skip_only:
-        save(ckpt_dir / "best.pt", 0, skip_only_val)
-        save(ckpt_dir / "last.pt", 0, skip_only_val)
         summary = {
             "best_val_ic": selection_score(skip_only_val),
             "best_val_cs_ic": skip_only_val.get("cs_ic", float("nan")),
@@ -1219,7 +1242,10 @@ def _train(
                 log_fn(f"TEST (last checkpoint; no best.pt was saved): {_fmt(test)}")
             else:
                 log_fn(f"TEST (in-memory weights; no checkpoint saved): {_fmt(test)}")
-            log_fn(f"TEST skip-only (ridge, frozen): {_fmt(skip_only_test)}")
+            if _split_has_metrics(skip_only_test):
+                log_fn(f"TEST skip-only (ridge, frozen): {_fmt(skip_only_test)}")
+            else:
+                log_fn("TEST skip-only (ridge, frozen): (empty split)")
 
     summary = {
         "best_val_ic": best_ic,
