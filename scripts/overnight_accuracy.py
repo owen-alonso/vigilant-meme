@@ -1,6 +1,7 @@
 """Locked-TEST overnight skip: direction accuracy and next-open price error.
 
     python scripts/overnight_accuracy.py --synthetic
+    python scripts/overnight_accuracy.py --synthetic --try-dynamic-a
     python scripts/overnight_accuracy.py --data-dir data --universe liquid
     python scripts/overnight_accuracy.py --data-dir data --universe liquid \\
         --json checkpoints/forecast_ridge_overnight/accuracy.json \\
@@ -35,8 +36,9 @@ IDEA L is a two-stage TRAIN-only next-open MAE map (residual*sigma → gap,
 then gap → next-open $/% with close_t) plus a residual+DOW+vol ridge.
 Promote a new MAE default only if VAL % MAE beats residual×σ / zero-move /
 train-median by ≥0.5 bp and is not worse than the current default.
-IDEA M is sparse MAE: TRAIN affine_l1/huber on residual*sigma→r_on, then a
-TRAIN |pred| τ so small gaps predict 0 (zero-move). Same VAL % MAE gate.
+IDEA M is sparse MAE: TRAIN affine_l1/huber on residual*sigma->r_on, then a
+TRAIN |pred| tau so small gaps predict 0 (zero-move). Same VAL % MAE gate.
+--try-dynamic-a trains a tiny Dynamic A encoder (VAL-gated residual blend).
 """
 
 from __future__ import annotations
@@ -98,6 +100,22 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="PR #8 residual*sigma TEST only (skip train/val readouts)",
     )
+    p.add_argument(
+        "--try-dynamic-a",
+        action="store_true",
+        help="train tiny Dynamic A encoder; VAL-gate overnight residual blend",
+    )
+    p.add_argument(
+        "--dynamic-a-steps",
+        type=int,
+        default=80,
+        help="AdamW steps for the tiny Dynamic A / off-ablation encoders",
+    )
+    p.add_argument(
+        "--dynamic-a-ckpt",
+        default="",
+        help="checkpoint dir for the tiny Dynamic A encoders",
+    )
     args = p.parse_args(argv)
     if args.synthetic:
         args.universe = "synthetic"
@@ -115,6 +133,9 @@ def main(argv: list[str] | None = None) -> int:
         args.universe,
         log_fn=print,
         ablate=not args.no_ablate,
+        try_dynamic_a=bool(args.try_dynamic_a),
+        dynamic_a_steps=int(args.dynamic_a_steps),
+        dynamic_a_ckpt=str(args.dynamic_a_ckpt or ""),
     )
     print(format_accuracy_report(payload), flush=True)
     if args.json:

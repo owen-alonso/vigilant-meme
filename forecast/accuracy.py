@@ -15,13 +15,13 @@ converts that to an implied overnight log-return ``pred * sigma`` (same as
 - short-sleeve overnight down-rate on the within-date bottom residual names
 - book-aligned short sleeve overnight-down (TRAIN bottom-q / |pred| grid, VAL-gated)
 - symmetric long-E / short-J LS (paper zero-cost + live_locate vs q20)
-- two-stage next-open MAE (residual→gap, then gap→price using close_t)
+- two-stage next-open MAE (residual->gap, then gap->price using close_t)
 - sparse MAE (calibrate only when |pred*sigma| is large; else zero-move)
 
 Default recipe is the PR #5 overnight skip (rank-target ridge, ``no_long_ts``).
 PR #7 levers stay off unless a checkpoint documents them.
 
-Train-only accuracy readouts (affine residual→raw overnight, drift-veto,
+Train-only accuracy readouts (affine residual->raw overnight, drift-veto,
 piecewise/bin calibration, weekday intercepts, TS overnight ridge, sign ridge,
 ADV sleeve, confidence slices, conditional high-|pred| left-tail/confidence
 blend) are fit on TRAIN and gated on locked VAL. They do not replace the
@@ -65,10 +65,10 @@ BOOK_ALIGN_ABS_QS = (0.0, 0.50, 0.70)  # 0 = no |pred| floor
 BOOK_UP_FLOOR_PP = 0.50
 BOOK_UP_BASE_PP = 0.20
 BOOK_ALIGN_COVER = 0.05
-# IDEA G: clear VAL % MAE margin vs residual×σ / zero-move / train-median (0.5 bp).
+# IDEA G: clear VAL % MAE margin vs residual×sigma / zero-move / train-median (0.5 bp).
 MAE_LIFT = 5e-5
 SECTOR_MAE_MAPS = ("affine_l1", "piecewise_l1", "huber_affine", "bin_calibrate")
-# IDEA L: two-stage residual→gap→next-open, plus residual+DOW+vol ridge.
+# IDEA L: two-stage residual->gap->next-open, plus residual+DOW+vol ridge.
 TWO_STAGE_MAE_MAPS = (
     "two_stage_l1_pct",
     "two_stage_huber_pct",
@@ -1733,7 +1733,7 @@ def fit_rel_e_stack_on_train(
         "note": (
             "H∩E stack: pred > CS median and within-date top-q residual "
             "(optional TRAIN |pred| floor). TRAIN picks max relative hit vs 50% "
-            "with cover ≥ 5%. Absolute up vs E's sleeve. Live IR vs q20. "
+            "with cover >= 5%. Absolute up vs E's sleeve. Live IR vs q20. "
             "Live q20 unchanged unless the F IR gate clears."
         ),
     }
@@ -2318,6 +2318,12 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         ej_txt = format_ej_ls_block(payload)
         if ej_txt:
             lines.extend(["", ej_txt])
+    if payload.get("dynamic_a"):
+        from forecast.overnight_dynamic import format_dynamic_a_block
+
+        dyn_txt = format_dynamic_a_block(payload)
+        if dyn_txt:
+            lines.extend(["", dyn_txt])
     conf = payload.get("confidence")
     if conf:
         lines.extend(["", format_confidence_block(conf)])
@@ -2516,7 +2522,7 @@ def fit_bin_constants(
     *,
     n_bins: int = 7,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Train-only quantile bins of ``x`` → median ``y``. Edges do not use val/test."""
+    """Train-only quantile bins of ``x`` -> median ``y``. Edges do not use val/test."""
     xv = np.asarray(x, dtype=np.float64)
     yv = np.asarray(y, dtype=np.float64)
     ok = np.isfinite(xv) & np.isfinite(yv)
@@ -2565,7 +2571,7 @@ def fit_residual_mae_maps(
     pred_r: np.ndarray,
     r_on: np.ndarray,
 ) -> dict[str, Any]:
-    """TRAIN-only residual→overnight maps on sector-overnight skip pred*sigma."""
+    """TRAIN-only residual->overnight maps on sector-overnight skip pred*sigma."""
     a_l1, b_l1 = fit_affine_l1(pred_r, r_on)
     a_h, b_h = fit_affine_huber(pred_r, r_on)
     a_pos, b_pos, a_neg, b_neg = fit_piecewise_l1(pred_r, r_on)
@@ -2590,7 +2596,7 @@ def fit_residual_mae_maps(
             },
         },
         "note": (
-            "Maps residual*sigma → raw overnight gap. Fit on sector-overnight "
+            "Maps residual*sigma -> raw overnight gap. Fit on sector-overnight "
             "skip preds (IDEA 3), not SPY-only residual. Next open is never a feature."
         ),
     }
@@ -2758,7 +2764,7 @@ def fit_resid_dow_vol_ridge(
     *,
     ridge: float = 10.0,
 ) -> dict[str, Any]:
-    """TRAIN-only ridge: sector residual*sigma + causal DOW + trailing vol → r_on."""
+    """TRAIN-only ridge: sector residual*sigma + causal DOW + trailing vol -> r_on."""
     p = np.asarray(pred_r, dtype=np.float64)
     y = np.asarray(r_on, dtype=np.float64)
     if vol_level is None:
@@ -2863,7 +2869,7 @@ def apply_two_stage_map(
 
 
 def fit_two_stage_mae_maps(df: pd.DataFrame) -> dict[str, Any]:
-    """TRAIN-only residual→gap then gap→next-open $/%, plus residual+DOW+vol ridge.
+    """TRAIN-only residual->gap then gap->next-open $/%, plus residual+DOW+vol ridge.
 
     Stage 2 uses ``close_t`` (known) and ``next_open`` as the *label* only.
     """
@@ -2872,9 +2878,9 @@ def fit_two_stage_mae_maps(df: pd.DataFrame) -> dict[str, Any]:
         "hedge": "sector_overnight",
         "maps": {},
         "note": (
-            "Two-stage next-open MAE. Stage 1 maps residual*sigma → overnight "
-            "gap. Stage 2 maps exp(gap) → next-open $ or % using close_t. "
-            "ridge_resid_dow_vol is pred_r + causal DOW + trailing vol → r_on. "
+            "Two-stage next-open MAE. Stage 1 maps residual*sigma -> overnight "
+            "gap. Stage 2 maps exp(gap) -> next-open $ or % using close_t. "
+            "ridge_resid_dow_vol is pred_r + causal DOW + trailing vol -> r_on. "
             "Next open is never a feature."
         ),
     }
@@ -3092,7 +3098,7 @@ def fit_sparse_mae_maps(
         "maps": {},
         "grid": [],
         "note": (
-            "Fit residual*sigma → overnight gap on TRAIN (affine_l1 / huber). "
+            "Fit residual*sigma -> overnight gap on TRAIN (affine_l1 / huber). "
             "Choose |pred| τ on TRAIN % MAE. Below τ predict 0 (zero-move). "
             "Next open is never a feature."
         ),
@@ -3336,7 +3342,7 @@ def fit_decile_reliability(
 ) -> dict[str, Any]:
     """TRAIN-only: keep residual sign only in pred_r bins that beat always-up.
 
-    A bin is reliable if residual-sign hit rate ≥ TRAIN overnight-up + DIR_LIFT
+    A bin is reliable if residual-sign hit rate >= TRAIN overnight-up + DIR_LIFT
     and it has at least ``min_n`` rows. Unreliable bins become the train-median
     gap (always-up). ``n_bins`` is chosen on TRAIN direction excess, then MAE.
     """
@@ -3655,7 +3661,7 @@ def fit_logistic_up(
 ) -> dict[str, float]:
     """TRAIN-only logistic P(up | pred_r) with a direction threshold τ.
 
-    ``hat = +mag`` if P≥τ else ``-mag``. ``mag`` is the train mean |r_on|.
+    ``hat = +mag`` if P>=τ else ``-mag``. ``mag`` is the train mean |r_on|.
     ``(a,b,τ)`` never see VAL/TEST.
     """
     p = np.asarray(pred_r, dtype=np.float64)
@@ -4171,7 +4177,7 @@ def fit_date_level_overnight(
     *,
     ridge: float = 10.0,
 ) -> tuple[np.ndarray, float]:
-    """Date-mean features → date-mean overnight (common/hedge component)."""
+    """Date-mean features -> date-mean overnight (common/hedge component)."""
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(r_on, dtype=np.float64)
     d = np.asarray(dates, dtype=np.int64)
@@ -4518,13 +4524,13 @@ def format_ablation_table(ablate: dict[str, Any], promotion: dict[str, Any]) -> 
     )
     lines.append(
         "  Honest drift baseline is train_median_gap (~54.3% on liquid TEST). "
-        "Promote dir only if VAL beats that by ≥0.2 pp."
+        "Promote dir only if VAL beats that by >=0.2 pp."
     )
     return "\n".join(lines)
 
 
 def format_cond_dir_block(ablate: dict[str, Any], promotion: dict[str, Any]) -> str:
-    """IDEA A: high-|pred| left-tail / confidence blend vs always-up + residual*σ."""
+    """IDEA A: high-|pred| left-tail / confidence blend vs always-up + residual*sigma."""
     row = next(
         (r for r in (ablate.get("rows") or []) if r.get("name") == "cond_dir_blend"),
         None,
@@ -4555,7 +4561,7 @@ def format_cond_dir_block(ablate: dict[str, Any], promotion: dict[str, Any]) -> 
         + ("  (accuracy default)" if default else ""),
         "  high-|pred_r| mix of train left_tail_l1 and confidence_blend; "
         "else train-median always-up. Fit (q, λ) on TRAIN. "
-        "VAL gate: slice dir ≥ train-median floor +0.2pp AND ≥ residual*σ "
+        "VAL gate: slice dir >= train-median floor +0.2pp AND >= residual*sigma "
         "on the same slice +0.2pp. CS skip / live book unchanged.",
         f"  TRAIN q={_as_float(params.get('q')):.2f}  "
         f"λ={_as_float(params.get('lam')):.2f}  "
@@ -4605,8 +4611,8 @@ def format_decile_reliability_block(
         f"PROMOTE DECILE RELIABILITY? {'YES' if yes else 'NO'}"
         + ("  (accuracy default)" if default else ""),
         "  Keep residual*sigma only in TRAIN pred_r bins whose sign-hit "
-        "≥ TRAIN always-up + 0.2pp; else train-median. n_bins TRAIN-chosen. "
-        "VAL gate: full-frame dir ≥ train-median +0.2pp AND ≥ residual*σ +0.2pp. "
+        ">= TRAIN always-up + 0.2pp; else train-median. n_bins TRAIN-chosen. "
+        "VAL gate: full-frame dir >= train-median +0.2pp AND >= residual*sigma +0.2pp. "
         "CS skip / live book unchanged.",
         f"  TRAIN n_bins={n_bins}  keep {n_keep}/{n_bins}  "
         f"floor={100.0 * _as_float(params.get('floor')):.2f}%  "
@@ -4644,7 +4650,7 @@ def format_cs_left_veto_block(
             + ("  (accuracy default)" if default else ""),
             "  Always-up except CS-bottom ∩ TS left-tail of pred_r. "
             "q and τ are TRAIN-only. VAL gate vs train-median +0.2pp AND "
-            "residual*σ +0.2pp. CS skip / live book unchanged.",
+            "residual*sigma +0.2pp. CS skip / live book unchanged.",
             f"  TRAIN q={_as_float(params.get('q')):.2f}  "
             f"τ_q={_as_float(params.get('tau_q')):.2f}  "
             f"τ={_as_float(params.get('tau')):.6f}  "
@@ -4681,9 +4687,9 @@ def format_logistic_up_block(
         [
             f"PROMOTE LOGISTIC P(up)? {'YES' if yes else 'NO'}"
             + ("  (accuracy default)" if default else ""),
-            "  TRAIN logistic P(up|pred_r); predict up iff P≥τ. "
+            "  TRAIN logistic P(up|pred_r); predict up iff P>=τ. "
             "τ grid on TRAIN direction excess. VAL vs train-median +0.2pp "
-            "AND residual*σ +0.2pp. CS skip / live book unchanged.",
+            "AND residual*sigma +0.2pp. CS skip / live book unchanged.",
             f"  TRAIN a={_as_float(params.get('a')):+.3f}  "
             f"b={_as_float(params.get('b')):+.3f}  "
             f"τ={_as_float(params.get('tau')):.2f}  "
@@ -4758,9 +4764,9 @@ def format_book_aligned_block(payload: dict[str, Any]) -> str:
             f"  VAL   chosen  {_fmt_book_sleeve(va)}",
             f"  VAL   top-20% {_fmt_book_sleeve(va20)}",
             f"  VAL   vs floor {_as_float(promo.get('val_excess_pp')):+.2f}pp  "
-            f"(need ≥+{BOOK_UP_FLOOR_PP:.1f}pp)  vs top-20% "
+            f"(need >=+{BOOK_UP_FLOOR_PP:.1f}pp)  vs top-20% "
             f"{_as_float(promo.get('val_vs_top20_pp')):+.2f}pp  "
-            f"(need ≥+{BOOK_UP_BASE_PP:.1f}pp)",
+            f"(need >=+{BOOK_UP_BASE_PP:.1f}pp)",
             f"  TEST  chosen  {_fmt_book_sleeve(te)}  (report-only)",
             f"  TEST  top-20% {_fmt_book_sleeve(te20)}  (report-only)",
             f"  {promo.get('reason') or 'no decision'}",
@@ -4831,9 +4837,9 @@ def format_short_aligned_block(payload: dict[str, Any]) -> str:
             f"  VAL   chosen  {_fmt_short_sleeve(va)}",
             f"  VAL   bot-20% {_fmt_short_sleeve(va20)}",
             f"  VAL   vs floor {_as_float(promo.get('val_excess_pp')):+.2f}pp  "
-            f"(need ≥+{BOOK_UP_FLOOR_PP:.1f}pp)  vs bottom-20% "
+            f"(need >=+{BOOK_UP_FLOOR_PP:.1f}pp)  vs bottom-20% "
             f"{_as_float(promo.get('val_vs_bot20_pp')):+.2f}pp  "
-            f"(need ≥+{BOOK_UP_BASE_PP:.1f}pp)",
+            f"(need >=+{BOOK_UP_BASE_PP:.1f}pp)",
             f"  TEST  chosen  {_fmt_short_sleeve(te)}  (report-only)",
             f"  TEST  bot-20% {_fmt_short_sleeve(te20)}  (report-only)",
             _fmt_stack_live("VAL q20", va_live.get("q20")),
@@ -4861,8 +4867,8 @@ def format_ej_ls_block(payload: dict[str, Any]) -> str:
             f"PROMOTE E+J LIVE LS? {'YES' if yes else 'NO'}",
             "  Symmetric LS: long IDEA E TRAIN top-q ∩ |pred|, short IDEA J "
             "TRAIN bottom-q ∩ |pred|. Paper is zero-cost. live_locate is the "
-            "gate vs long-only q20 (IR ≥ q20+0.05, DD not worse by >0.05, "
-            "cover ≥ 5%). TEST report-only. Live q20 unchanged unless the "
+            "gate vs long-only q20 (IR >= q20+0.05, DD not worse by >0.05, "
+            "cover >= 5%). TEST report-only. Live q20 unchanged unless the "
             "IR/DD gate clears. E+J hit-rate promotes stay hit-rate-only "
             "if live does not clear.",
             f"  TRAIN E q={_as_float(promo.get('e_q')):.2f} abs_q="
@@ -4874,9 +4880,9 @@ def format_ej_ls_block(payload: dict[str, Any]) -> str:
             _fmt_stack_live("paper 0c", va.get("paper")),
             _fmt_stack_live("live_locate", va.get("live")),
             f"  VAL IR delta {_as_float(promo.get('val_ir_delta')):+.3f}  "
-            f"(need ≥+{EJ_IR_LIFT:.2f})  DD delta "
+            f"(need >=+{EJ_IR_LIFT:.2f})  DD delta "
             f"{_as_float(promo.get('val_dd_delta')):+.3f}  "
-            f"(need ≥-{EJ_DD_TOL:.2f})  cover "
+            f"(need >=-{EJ_DD_TOL:.2f})  cover "
             f"{100.0 * _as_float(promo.get('val_coverage')):.1f}%",
             "  TEST (report-only):",
             _fmt_stack_live("q20", te.get("q20")),
@@ -4918,17 +4924,17 @@ def format_sector_mae_block(payload: dict[str, Any]) -> str:
     test_maps = cmp.get("test") or {}
     lines = [
         f"PROMOTE SECTOR-MAE? {'YES' if yes else 'NO'}",
-        "  TRAIN residual→overnight maps on sector-overnight skip pred*sigma "
+        "  TRAIN residual->overnight maps on sector-overnight skip pred*sigma "
         "(affine_l1 / piecewise_l1 / huber_affine / bin_calibrate). "
-        "VAL % MAE must beat residual×σ AND zero-move AND train-median by "
-        f"≥{1e4 * MAE_LIFT:.1f} bp, and must not lose to the current MAE default. "
+        "VAL % MAE must beat residual×sigma AND zero-move AND train-median by "
+        f">={1e4 * MAE_LIFT:.1f} bp, and must not lose to the current MAE default. "
         "Dir excess is report-only unless it also clears dir gates. "
         "Live q20 book unchanged.",
         f"  hedge={fit.get('hedge') or promo.get('hedge')!r}  "
         f"fit_split={fit.get('fit_split')!r}  "
         f"current_default={promo.get('current_name')!r}",
         "  VAL (gate):",
-        _fmt_mae_row("residual×σ", cmp.get("val_residual") or {}),
+        _fmt_mae_row("residual×sigma", cmp.get("val_residual") or {}),
         _fmt_mae_row("zero-move", cmp.get("val_zero") or {}),
         _fmt_mae_row("train-median", cmp.get("val_median") or {}),
     ]
@@ -4947,10 +4953,10 @@ def format_sector_mae_block(payload: dict[str, Any]) -> str:
             f"  VAL best={promo.get('best_name')!r}  "
             f"margin vs floors {_as_float(promo.get('val_margin_bp')):+.2f} bp  "
             f"vs current {_as_float(promo.get('val_vs_current_bp')):+.2f} bp  "
-            f"(need ≥+{1e4 * MAE_LIFT:.1f} bp)  "
+            f"(need >=+{1e4 * MAE_LIFT:.1f} bp)  "
             f"dir_clears_gates={bool(promo.get('dir_clears_gates'))}",
             "  TEST (report-only):",
-            _fmt_mae_row("residual×σ", cmp.get("test_residual") or {}),
+            _fmt_mae_row("residual×sigma", cmp.get("test_residual") or {}),
         ]
     )
     for name in SECTOR_MAE_MAPS:
@@ -4970,18 +4976,18 @@ def format_two_stage_mae_block(payload: dict[str, Any]) -> str:
     test_maps = cmp.get("test") or {}
     lines = [
         f"PROMOTE TWO-STAGE MAE? {'YES' if yes else 'NO'}",
-        "  TRAIN two-stage next-open MAE: residual*sigma → overnight gap "
-        "(affine_l1 / huber / piecewise), then gap → next-open $/% using "
+        "  TRAIN two-stage next-open MAE: residual*sigma -> overnight gap "
+        "(affine_l1 / huber / piecewise), then gap -> next-open $/% using "
         "close_t. Also residual + causal DOW + trailing vol ridge. "
-        f"VAL % MAE must beat residual×σ AND zero-move AND train-median by "
-        f"≥{1e4 * MAE_LIFT:.1f} bp, and must not be worse than the current "
+        f"VAL % MAE must beat residual×sigma AND zero-move AND train-median by "
+        f">={1e4 * MAE_LIFT:.1f} bp, and must not be worse than the current "
         "MAE default. Dir report-only unless it also clears dir gates. "
         "Live q20 book unchanged. Next open is never a feature.",
         f"  hedge={fit.get('hedge') or promo.get('hedge')!r}  "
         f"fit_split={fit.get('fit_split')!r}  "
         f"current_default={promo.get('current_name')!r}",
         "  VAL (gate):",
-        _fmt_mae_row("residual×σ", cmp.get("val_residual") or {}),
+        _fmt_mae_row("residual×sigma", cmp.get("val_residual") or {}),
         _fmt_mae_row("zero-move", cmp.get("val_zero") or {}),
         _fmt_mae_row("train-median", cmp.get("val_median") or {}),
     ]
@@ -5000,10 +5006,10 @@ def format_two_stage_mae_block(payload: dict[str, Any]) -> str:
             f"  VAL best={promo.get('best_name')!r}  "
             f"margin vs floors {_as_float(promo.get('val_margin_bp')):+.2f} bp  "
             f"vs current {_as_float(promo.get('val_vs_current_bp')):+.2f} bp  "
-            f"(floors need ≥+{1e4 * MAE_LIFT:.1f} bp; current must not be worse)  "
+            f"(floors need >=+{1e4 * MAE_LIFT:.1f} bp; current must not be worse)  "
             f"dir_clears_gates={bool(promo.get('dir_clears_gates'))}",
             "  TEST (report-only):",
-            _fmt_mae_row("residual×σ", cmp.get("test_residual") or {}),
+            _fmt_mae_row("residual×sigma", cmp.get("test_residual") or {}),
         ]
     )
     for name in TWO_STAGE_MAE_MAPS:
@@ -5023,17 +5029,17 @@ def format_sparse_mae_block(payload: dict[str, Any]) -> str:
     test_maps = cmp.get("test") or {}
     lines = [
         f"PROMOTE SPARSE MAE? {'YES' if yes else 'NO'}",
-        "  TRAIN affine_l1 / huber on residual*sigma → overnight gap. "
+        "  TRAIN affine_l1 / huber on residual*sigma -> overnight gap. "
         "TRAIN |pred| τ: below τ predict 0 (zero-move), else use the map. "
-        f"VAL % MAE must beat residual×σ AND zero-move AND train-median by "
-        f"≥{1e4 * MAE_LIFT:.1f} bp, and must not be worse than the current "
+        f"VAL % MAE must beat residual×sigma AND zero-move AND train-median by "
+        f">={1e4 * MAE_LIFT:.1f} bp, and must not be worse than the current "
         "MAE default. Dir report-only unless it also clears dir gates. "
         "Live q20 book unchanged. Next open is never a feature.",
         f"  hedge={fit.get('hedge') or promo.get('hedge')!r}  "
         f"fit_split={fit.get('fit_split')!r}  "
         f"current_default={promo.get('current_name')!r}",
         "  VAL (gate):",
-        _fmt_mae_row("residual×σ", cmp.get("val_residual") or {}),
+        _fmt_mae_row("residual×sigma", cmp.get("val_residual") or {}),
         _fmt_mae_row("zero-move", cmp.get("val_zero") or {}),
         _fmt_mae_row("train-median", cmp.get("val_median") or {}),
     ]
@@ -5059,10 +5065,10 @@ def format_sparse_mae_block(payload: dict[str, Any]) -> str:
             f"  VAL best={promo.get('best_name')!r}  "
             f"margin vs floors {_as_float(promo.get('val_margin_bp')):+.2f} bp  "
             f"vs current {_as_float(promo.get('val_vs_current_bp')):+.2f} bp  "
-            f"(floors need ≥+{1e4 * MAE_LIFT:.1f} bp; current must not be worse)  "
+            f"(floors need >=+{1e4 * MAE_LIFT:.1f} bp; current must not be worse)  "
             f"dir_clears_gates={bool(promo.get('dir_clears_gates'))}",
             "  TEST (report-only):",
-            _fmt_mae_row("residual×σ", cmp.get("test_residual") or {}),
+            _fmt_mae_row("residual×sigma", cmp.get("test_residual") or {}),
         ]
     )
     for name in SPARSE_MAE_MAPS:
@@ -5121,7 +5127,7 @@ def format_relative_dir_block(payload: dict[str, Any]) -> str:
             f"xs {_as_float(va20.get('excess_pp')):+.2f}pp",
             f"  VAL rel vs 50% {_as_float(promo.get('val_rel_hit')):.2f}%  "
             f"z={_as_float(promo.get('val_rel_z')):.2f}  "
-            f"(need ≥{50.0 + REL_DIR_LIFT_PP:.1f}% and z≥{REL_DIR_Z:.1f})  "
+            f"(need >={50.0 + REL_DIR_LIFT_PP:.1f}% and z>={REL_DIR_Z:.1f})  "
             f"long-half vs floor {_as_float(promo.get('val_long_excess_pp')):+.2f}pp  "
             f"vs top-20% {_as_float(promo.get('val_vs_top20_pp')):+.2f}pp",
             "  TEST (report-only):",
@@ -5172,7 +5178,7 @@ def format_rel_e_stack_block(payload: dict[str, Any]) -> str:
             f"PROMOTE STACK ABSOLUTE-UP? {'YES' if yes_abs else 'NO'}  "
             f"PROMOTE STACK LIVE IR? {'YES' if yes_live else 'NO'}",
             "  H∩E stack: pred > CS median and TRAIN top-q / |pred| floor "
-            "on sector-overnight skip pred. Relative hit vs 50% (cover ≥ 5%). "
+            "on sector-overnight skip pred. Relative hit vs 50% (cover >= 5%). "
             "Absolute overnight-up vs E's sleeve (+0.2pp) and the up-floor. "
             "Live IR vs q20 (F gate +0.05). TEST report-only. "
             "Live q20 unchanged unless the IR gate clears.",
@@ -5189,9 +5195,9 @@ def format_rel_e_stack_block(payload: dict[str, Any]) -> str:
             f"z={_as_float(va_h.get('rel_z')):.2f}",
             f"  VAL rel vs 50% {_as_float(promo.get('val_rel_hit')):.2f}%  "
             f"z={_as_float(promo.get('val_rel_z')):.2f}  "
-            f"(need ≥{50.0 + REL_DIR_LIFT_PP:.1f}% and z≥{REL_DIR_Z:.1f})  "
+            f"(need >={50.0 + REL_DIR_LIFT_PP:.1f}% and z>={REL_DIR_Z:.1f})  "
             f"abs vs E {_as_float(promo.get('val_vs_e_pp')):+.2f}pp  "
-            f"(need ≥+{BOOK_UP_BASE_PP:.1f}pp)",
+            f"(need >=+{BOOK_UP_BASE_PP:.1f}pp)",
             _fmt_stack_live("q20", va_live.get("q20")),
             _fmt_stack_live("H∩E live", va_live.get("stack")),
             _fmt_stack_live("E live", va_live.get("e")),
@@ -5249,8 +5255,15 @@ def evaluate_overnight_accuracy(
     *,
     log_fn: Any | None = print,
     ablate: bool = True,
+    try_dynamic_a: bool = False,
+    dynamic_a_steps: int = 80,
+    dynamic_a_ckpt: str = "",
 ) -> dict[str, Any]:
-    """PR #8 locked-TEST baseline plus train-only readouts gated on locked VAL."""
+    """PR #8 locked-TEST baseline plus train-only readouts gated on locked VAL.
+
+    ``try_dynamic_a`` trains a tiny Dynamic A encoder (opt-in; not the default
+    ridge path) and VAL-gates an overnight residual blend. TEST is report-only.
+    """
     cfg = overnight_skip_data_config(data_dir, universe)
     if log_fn:
         log_fn(formula_log_line("overnight"))
@@ -6328,7 +6341,7 @@ def evaluate_overnight_accuracy(
         "test_median": dict((by_ablate.get("train_median_gap") or {}).get("test") or {}),
         "current_name": str(promotion.get("accuracy_default") or default_name),
         "note": (
-            "VAL % MAE vs residual×σ / zero-move / train-median. "
+            "VAL % MAE vs residual×sigma / zero-move / train-median. "
             "Promote new MAE default only with a clear margin. "
             "Dir excess is report-only unless it also clears dir gates. "
             "Live q20 book unchanged."
@@ -6349,8 +6362,8 @@ def evaluate_overnight_accuracy(
         "test_median": dict((by_ablate.get("train_median_gap") or {}).get("test") or {}),
         "current_name": str(two_stage_mae_promotion.get("current_name") or default_name),
         "note": (
-            "Two-stage next-open MAE (residual→gap→price) and residual+DOW+vol "
-            "ridge. VAL % MAE vs residual×σ / zero-move / train-median / current "
+            "Two-stage next-open MAE (residual->gap->price) and residual+DOW+vol "
+            "ridge. VAL % MAE vs residual×sigma / zero-move / train-median / current "
             "default. Dir report-only unless it clears dir gates. "
             "Live q20 book unchanged. Next open is never a feature."
         ),
@@ -6371,7 +6384,7 @@ def evaluate_overnight_accuracy(
         "current_name": str(sparse_mae_promotion.get("current_name") or default_name),
         "note": (
             "Sparse MAE: TRAIN affine_l1/huber, TRAIN |pred| τ, else zero-move. "
-            "VAL % MAE vs residual×σ / zero-move / train-median / current default. "
+            "VAL % MAE vs residual×sigma / zero-move / train-median / current default. "
             "Dir report-only unless it clears dir gates. Live q20 unchanged."
         ),
     }
@@ -6632,4 +6645,23 @@ def evaluate_overnight_accuracy(
             f"promote_sparse_mae="
             f"{bool(sparse_mae_promotion.get('promote_sparse_mae'))}"
         )
+    if try_dynamic_a:
+        from forecast.overnight_dynamic import evaluate_overnight_dynamic_a
+
+        payload["dynamic_a"] = evaluate_overnight_dynamic_a(
+            frames,
+            data_dir,
+            universe,
+            min_names=min_names,
+            book_aligned_fit=book_aligned_fit,
+            max_steps=int(dynamic_a_steps),
+            ckpt_dir=dynamic_a_ckpt or None,
+            log_fn=log_fn,
+        )
+        if log_fn:
+            promo_d = (payload["dynamic_a"] or {}).get("promotion") or {}
+            log_fn(
+                f"promote_dynamic_a={bool(promo_d.get('promote_dynamic_a'))}  "
+                f"reached_60={bool(promo_d.get('reached_60'))}"
+            )
     return payload

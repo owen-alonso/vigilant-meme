@@ -48,7 +48,10 @@ from forecast.data import FEATURE_NAMES, build_datasets, collate_forecast
 from forecast.model import ReturnForecaster
 from forecast.overnight import formula_log_line, parse_label_spec
 from forecast.ridge import feature_mask, labelled_rows, walk_forward_predict, cs_stats
-from mamba_lm.model import format_dynamic_diagnostics
+from forecast.dynamic_health import (
+    controller_param_grad_norm,
+    format_dynamic_health_ascii,
+)
 from mamba_lm.paths import anchor_to_repo
 from mamba_lm.reporting import clip_grad_norm_unique
 from mamba_lm.training_utils import (
@@ -1062,8 +1065,11 @@ def _train(
                         f"grad={grad_norm:.3f}  lr={lr:.2e}  "
                         f"{(step + 1) / elapsed:.2f} it/s"
                     )
-                    diag = model.collect_dynamic_diagnostics()
-                    extra_diag = format_dynamic_diagnostics(diag)
+                    extra_diag = format_dynamic_health_ascii(
+                        model.collect_dynamic_health(
+                            controller_grad_norm=controller_param_grad_norm(model)
+                        )
+                    )
                     if extra_diag:
                         msg += f"  {extra_diag}"
                     log_fn(msg)
@@ -1190,6 +1196,11 @@ def _train(
         "cross_section": bundle.get("cross_section", False),
         "skip_only": False,
     }
+    if model_cfg.dynamic_weights:
+        dyn_health = model.collect_dynamic_health(after_training=True)
+        summary["dynamic_health"] = dyn_health
+        if log_fn:
+            log_fn(f"Dynamic A health: {format_dynamic_health_ascii(dyn_health)}")
     (ckpt_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
     return summary
 
@@ -1333,6 +1344,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--dropout", type=float, default=m.dropout)
     g.add_argument("--dynamic-weights", action="store_true")
     g.add_argument("--dynamic-strength", type=float, default=m.dynamic_strength)
+    g.add_argument(
+        "--dynamic-controller-dim",
+        type=int,
+        default=None,
+        help="Dynamic A hypernet hidden size (default: Mamba resolved_controller_dim)",
+    )
     g.add_argument(
         "--no-linear-skip",
         action="store_true",
@@ -1594,6 +1611,7 @@ def configs_from_cli(
         dt_max=ssm["dt_max"],
         dynamic_weights=args.dynamic_weights,
         dynamic_strength=args.dynamic_strength,
+        dynamic_controller_dim=args.dynamic_controller_dim,
     )
     train_cfg = ForecastTrainConfig(
         batch_size=args.batch_size,

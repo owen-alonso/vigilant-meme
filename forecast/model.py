@@ -4,8 +4,9 @@ The language model embeds discrete tokens and produces a distribution over the
 vocabulary. Here the input is a continuous feature vector per minute bar and the
 output is a scalar per bar: the expected next-hour return, in volatility units.
 
-The backbone (``MambaLayer``) is reused unchanged, so the Dynamic A ablation
-carries over to this task.
+The backbone (``MambaLayer``) is reused unchanged. Forecast-only init wakes
+Dynamic A (small Xavier on head / mixer ``out_proj``) when
+``dynamic_weights`` is on; the LM path is not touched.
 """
 
 from __future__ import annotations
@@ -47,14 +48,21 @@ class ReturnForecaster(nn.Module):
 
         n_out = 2 if config.heteroscedastic else 1
         self.head = nn.Linear(config.d_model, n_out)
-        # Start at "no edge": predicting zero excess return is the right prior
-        # for a return series, and it keeps early gradients small.
-        nn.init.zeros_(self.head.weight)
+        # Default: head and mixer out_proj are zero so each block starts as
+        # identity and the skip *is* the lagged-return baseline at step 0.
+        # That also blocks d(loss)/d(SSM) until those matrices move -- so
+        # when Dynamic A is on we use a small Xavier gain instead. The LM
+        # path (mamba_lm/) is unchanged; this is forecast-only.
+        if config.dynamic_weights:
+            nn.init.xavier_uniform_(self.head.weight, gain=0.05)
+        else:
+            nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
-        # Mixer out_proj is zero so each Mamba block starts as identity.
-        # The skip then *is* the lagged-return baseline at step 0.
         for layer in self.layers:
-            nn.init.zeros_(layer.mixer.out_proj.weight)
+            if config.dynamic_weights:
+                nn.init.xavier_uniform_(layer.mixer.out_proj.weight, gain=0.1)
+            else:
+                nn.init.zeros_(layer.mixer.out_proj.weight)
             if layer.mixer.out_proj.bias is not None:
                 nn.init.zeros_(layer.mixer.out_proj.bias)
         self.skip = nn.Linear(config.n_features, 1)
@@ -154,3 +162,16 @@ class ReturnForecaster(nn.Module):
     def collect_dynamic_diagnostics(self) -> list[dict[str, Any]]:
         """Per-layer Dynamic A scale stats from the most recent forward pass."""
         return collect_mixer_diagnostics(self.layers)
+
+    def collect_dynamic_health(
+        self, controller_grad_norm: float | None = None, *, after_training: bool = False
+    ) -> dict[str, Any]:
+        """ASCII-oriented health dict for the Dynamic A controller."""
+        from forecast.dynamic_health import interpret_scale_reports
+
+        return interpret_scale_reports(
+            self.collect_dynamic_diagnostics(),
+            strength=float(self.config.dynamic_strength),
+            controller_grad_norm=controller_grad_norm,
+            after_training=after_training,
+        )
