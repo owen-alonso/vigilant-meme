@@ -9,8 +9,10 @@ Fits the PR #5 overnight skip on TRAIN. Locked VAL decides whether honest
 ``live_locate`` LS beats ``live_long_only``. Default live_locate knobs are
 the liquid VAL-promoted spec (q=0.20 / haircut=0.50 / short=0.50); TEST
 preferring long-only must not flip CLI. Locked TEST is printed and never
-used as a gate. Cloud VM has no Yahoo liquid tape -- use --synthetic here;
-run the liquid command on desktop.
+used as a gate. IC / disp / weekday / sticky / ic_scale are VAL-gated on
+the live_locate book (long-only is a compare column). Reported IR is
+provisional pending a data/label audit. Cloud VM has no Yahoo liquid tape
+-- use --synthetic here; run the liquid command on desktop.
 """
 
 from __future__ import annotations

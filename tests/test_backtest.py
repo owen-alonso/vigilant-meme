@@ -10,12 +10,14 @@ from forecast.backtest import (
     book_pnl,
     causal_cc_dispersion,
     causal_disp_series,
+    last_sticky_held_ls,
     name_membership_churn,
     quantile_weights,
     soft_ic_gross_scale,
     rank_weights,
     resize_long_only,
     sticky_long_step,
+    sticky_ls_step,
     trailing_mean_cs_ic,
     trailing_on_resid_dispersion,
     weekday_mask_is_flat,
@@ -456,6 +458,95 @@ def test_sticky_book_churns_less_than_q20_rebuild_when_ranks_persist():
     assert sticky["n_dates"] == q20["n_dates"]
     # Overnight flatten still charges ~1.0 one-way; name churn is the diagnostic.
     assert q20["mean_turnover"] == pytest.approx(1.0, abs=0.05)
+
+
+def test_sticky_ls_step_keeps_mid_rank_on_both_sleeves():
+    names = [f"S{i}" for i in range(10)]
+    scores = pd.Series(np.linspace(-1.0, 1.0, 10), index=names)
+    w0, longs0, shorts0 = sticky_ls_step(
+        scores, set(), set(), q_enter=0.20, q_exit=0.40, min_names=8
+    )
+    assert set(longs0) == {"S8", "S9"}
+    assert set(shorts0) == {"S0", "S1"}
+    assert w0[w0 > 0].sum() == pytest.approx(0.5)
+    assert w0[w0 < 0].sum() == pytest.approx(-0.5)
+
+    w1, longs1, shorts1 = sticky_ls_step(
+        scores, {"S7"}, {"S2"}, q_enter=0.20, q_exit=0.40, min_names=8
+    )
+    assert "S7" in longs1 and "S8" in longs1 and "S9" in longs1
+    assert "S2" in shorts1 and "S0" in shorts1 and "S1" in shorts1
+    assert "S5" not in longs1
+    assert float(w1.get("S5", 0.0)) == pytest.approx(0.0)
+
+    w2, longs2, shorts2 = sticky_ls_step(
+        scores, {"S5"}, {"S4"}, q_enter=0.20, q_exit=0.40, min_names=8
+    )
+    assert "S5" not in longs2
+    assert "S4" not in shorts2
+    assert set(longs2) == {"S8", "S9"}
+    assert set(shorts2) == {"S0", "S1"}
+
+
+def test_sticky_ls_book_churns_less_than_q20_rebuild():
+    dates = pd.bdate_range("2022-01-03", periods=40)
+    names = [f"S{i}" for i in range(10)]
+    base = np.linspace(-1.0, 1.0, 10)
+    pred = pd.DataFrame(
+        [base + 0.05 * np.sin(i / 4.0 + np.linspace(0, 0.4, 10)) for i in range(40)],
+        index=dates,
+        columns=names,
+    )
+    realized = pred * 0.02
+    q20 = book_pnl(
+        pred,
+        realized,
+        holding="overnight",
+        hold_halflife=0.0,
+        vol_target=0.0,
+        causal_vol=False,
+        long_only=False,
+        min_names=8,
+        round_trip_bps=10.0,
+    )
+    sticky = book_pnl(
+        pred,
+        realized,
+        holding="overnight",
+        hold_halflife=0.0,
+        vol_target=0.0,
+        causal_vol=False,
+        long_only=False,
+        min_names=8,
+        round_trip_bps=10.0,
+        sticky_q_enter=0.15,
+        sticky_q_exit=0.40,
+    )
+    assert sticky["sticky_q_enter"] == pytest.approx(0.15)
+    assert sticky["long_only"] is False
+    assert sticky["mean_short_nav"] > 0
+    assert sticky["mean_name_churn"] < q20["mean_name_churn"]
+    assert sticky["sticky_coverage"] >= 0.30
+    assert sticky["n_dates"] == q20["n_dates"]
+    warmed = last_sticky_held_ls(
+        pred.iloc[:10], q_enter=0.15, q_exit=0.40, min_names=8
+    )
+    assert warmed["long"]
+    assert warmed["short"]
+    assert warmed["long"].isdisjoint(warmed["short"])
+
+
+def test_name_membership_churn_counts_shorts():
+    dates = pd.bdate_range("2022-01-03", periods=5)
+    w = pd.DataFrame(
+        [[0.5, 0.0, 0.0, -0.5]] * 5,
+        index=dates,
+        columns=["A", "B", "C", "D"],
+    )
+    out = name_membership_churn(w)
+    assert out["mean_n_held"] == pytest.approx(2.0)
+    assert out["sticky_coverage"] == pytest.approx(1.0)
+    assert out["mean_name_churn"] == pytest.approx((0.5 + 0 + 0 + 0 + 0) / 5)
 
 
 def test_name_membership_churn_is_zero_when_holdings_never_change():

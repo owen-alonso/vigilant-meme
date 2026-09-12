@@ -35,6 +35,7 @@ from forecast.backtest import (
     book_pnl,
     causal_disp_series,
     last_sticky_held,
+    last_sticky_held_ls,
     trailing_mean_cs_ic,
 )
 from forecast.data import build_datasets
@@ -65,6 +66,16 @@ LS_DEFAULT_HAIRCUT = LS_LIVE_HAIRCUT
 LS_DEFAULT_SHORT = LS_LIVE_SHORT
 # TEST veto only: promoted VAL spec may not fall this far below q20 TEST IR.
 TEST_COLLAPSE = 0.05
+# Date gates (IC / disp / weekday / sticky / ic_scale) now VAL-score the
+# honest live_locate book. Long-only stays as a compare column, not the
+# live default. IR figures are provisional until a label audit.
+COST_BOOK_LS = "live_locate"
+COST_BOOK_LO = "live_long_only"
+IR_PROVISIONAL_NOTE = (
+    "Reported unlev net IR / DD / CS residual figures are provisional "
+    "until a separate data/label audit. Do not treat them as final "
+    "production IR."
+)
 
 _BOOK_COST_KEYS = (
     "round_trip_bps",
@@ -156,16 +167,19 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/be
 # VAL-gated LS haircut experiment (NOT default): HTB shorts at half size, short NAV 0.30
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --ls-haircut-experiment
-# causal trailing CS-IC trade gate (TRAIN-fit W,tau; default off until VAL promote)
+# causal trailing CS-IC trade gate (TRAIN-fit W,tau; VAL-gated on live_locate)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
+  --holding overnight --live-costs --ic-gate-window 60 --ic-gate-tau 0.0
+# long-only compare (same gate; not the live default book)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only --ic-gate-window 60 --ic-gate-tau 0.0
-# causal Friday / weekend weekday mask (VAL-gated; default always-on)
+# causal Friday / weekend weekday mask (VAL-gated on live_locate; default always-on)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
-  --holding overnight --live-costs --long-only --weekday-mask flat_friday
+  --holding overnight --live-costs --weekday-mask flat_friday
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
-  --holding overnight --live-costs --long-only --weekday-mask weekend_only
+  --holding overnight --live-costs --weekday-mask weekend_only
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
-  --holding overnight --live-costs --long-only --weekday-mask flat_monday
+  --holding overnight --live-costs --weekday-mask flat_monday
 # IDEA 3: SPY-only overnight residual (A) vs default sector-overnight residual (B)
 python -m forecast.training --universe liquid --interval daily --skip-only \\
   --label-return overnight --no-sector-residual \\
@@ -174,11 +188,11 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight_sp
   --holding overnight --live-costs --long-only
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only
-# causal CS-dispersion stress gate (TRAIN-fit kind/W/tau; default off until VAL promote)
+# causal CS-dispersion stress gate (TRAIN-fit kind/W/tau; VAL-gated on live_locate)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
-  --holding overnight --live-costs --long-only --disp-gate-kind cc --disp-gate-window 1 --disp-gate-tau 0.02
+  --holding overnight --live-costs --disp-gate-kind cc --disp-gate-window 1 --disp-gate-tau 0.02
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
-  --holding overnight --live-costs --long-only --disp-gate-kind on_trail --disp-gate-window 20 --disp-gate-tau 1.0
+  --holding overnight --live-costs --disp-gate-kind on_trail --disp-gate-window 20 --disp-gate-tau 1.0
 # IDEA 5: overnight + close-to-close rank ensemble (TRAIN-chosen alpha; default alpha=1)
 # A = overnight sector residual (current). B = close-to-close residual skip.
 # alpha grid {0.5, 0.6, 0.7, 0.8, 1.0}; alpha=1 is overnight-only. VAL gate, TEST report-only.
@@ -190,12 +204,12 @@ python scripts/overnight_shorting.py --data-dir data --universe liquid \\
 # Compare vs fixed alpha=0.70 and alpha=1. VAL gate, TEST report-only. Default off.
 python scripts/overnight_shorting.py --data-dir data --universe liquid \\
     --json checkpoints/forecast_ridge_overnight/shorting.json
-# IDEA 6: sticky long-only enter/exit (TRAIN-chosen; default off / always-rebuild q20)
+# IDEA 6: sticky enter/exit (TRAIN-chosen; VAL-gated on live_locate; default off)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
-  --holding overnight --live-costs --long-only --sticky-q-enter 0.15 --sticky-q-exit 0.40
-# IDEA 7: soft trailing CS-IC gross scale (TRAIN-chosen; default off)
+  --holding overnight --live-costs --sticky-q-enter 0.15 --sticky-q-exit 0.40
+# IDEA 7: soft trailing CS-IC gross scale (TRAIN-chosen; VAL-gated on live_locate)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
-  --holding overnight --live-costs --long-only --ic-scale-window 20 --ic-scale-tau 0.04 --ic-scale-smax 1.25
+  --holding overnight --live-costs --ic-scale-window 20 --ic-scale-tau 0.04 --ic-scale-smax 1.25
 # IDEA F: optional thin high-conviction sleeve (off unless VAL IR gate; default stays q20)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only --conviction-q 0.90 --conf-abs 0.335
@@ -1196,7 +1210,28 @@ def _wide_from_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
     return pred, y, r_on, tz, vol
 
 
-def _lo_q20_book(
+def _normalize_cost_book(cost_book: str | None) -> str:
+    raw = str(cost_book or COST_BOOK_LS).strip().lower()
+    if raw in ("lo", "long_only", "live_long_only", "long-only"):
+        return COST_BOOK_LO
+    return COST_BOOK_LS
+
+
+def _cost_book_spec(cost_book: str | None) -> tuple[str, bool, dict[str, Any]]:
+    kind = _normalize_cost_book(cost_book)
+    if kind == COST_BOOK_LO:
+        return kind, True, LIVE_LONG_ONLY_BUNDLE
+    return kind, False, LIVE_LOCATE_BUNDLE
+
+
+def _book_q20_label(cost_book: str | None) -> str:
+    kind = _normalize_cost_book(cost_book)
+    if kind == COST_BOOK_LO:
+        return "live_long_only q20"
+    return "live_locate q20"
+
+
+def _q20_book(
     pred: pd.DataFrame,
     y: pd.DataFrame,
     *,
@@ -1205,6 +1240,7 @@ def _lo_q20_book(
     overnight_r: pd.DataFrame | None,
     turnover_z: pd.DataFrame | None,
     vol_level: pd.DataFrame | None,
+    cost_book: str = COST_BOOK_LS,
     ic_gate_window: int = 0,
     ic_gate_tau: float = 0.0,
     ic_gate_trail: pd.Series | None = None,
@@ -1220,19 +1256,23 @@ def _lo_q20_book(
     close_px: pd.DataFrame | None = None,
     sticky_q_enter: float = 0.0,
     sticky_q_exit: float = 0.0,
-    sticky_held0: set | frozenset | None = None,
+    sticky_held0: set | frozenset | dict | tuple | None = None,
 ) -> dict[str, Any]:
-    return _run_overnight_book(
+    """Vanilla q20 overnight book on ``live_locate`` or ``live_long_only``."""
+    kind, long_only, bundle = _cost_book_spec(cost_book)
+    stats = _run_overnight_book(
         pred,
         y,
-        bundle=LIVE_LONG_ONLY_BUNDLE,
-        long_only=True,
+        bundle=bundle,
+        long_only=bool(long_only),
         min_names=min_names,
         vol_target=vol_target,
         overnight_r=overnight_r,
         turnover_z=turnover_z,
         vol_level=vol_level,
-        quantile=0.2,
+        quantile=LS_DEFAULT_Q,
+        locate_haircut=LS_DEFAULT_HAIRCUT,
+        max_short_gross=LS_DEFAULT_SHORT,
         weighting="quantile",
         ic_gate_window=int(ic_gate_window),
         ic_gate_tau=float(ic_gate_tau),
@@ -1251,6 +1291,18 @@ def _lo_q20_book(
         sticky_q_exit=float(sticky_q_exit or 0.0),
         sticky_held0=sticky_held0,
     )
+    stats["cost_book"] = kind
+    return stats
+
+
+def _lo_q20_book(
+    pred: pd.DataFrame,
+    y: pd.DataFrame,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Long-only q20 wrapper. Date gates should prefer ``_q20_book``."""
+    kwargs.pop("cost_book", None)
+    return _q20_book(pred, y, cost_book=COST_BOOK_LO, **kwargs)
 
 
 def fit_ic_gate_on_train(
@@ -1258,26 +1310,34 @@ def fit_ic_gate_on_train(
     *,
     min_names: int,
     vol_target: float = 0.15,
+    cost_book: str = COST_BOOK_LS,
 ) -> dict[str, Any]:
     """Select (W, τ) on TRAIN only. VAL/TEST must never enter."""
-    empty = {"rows": [], "chosen": {}, "baseline": {}, "fit_split": "train"}
+    book = _normalize_cost_book(cost_book)
+    empty = {
+        "rows": [],
+        "chosen": {},
+        "baseline": {},
+        "fit_split": "train",
+        "cost_book": book,
+    }
     if df.empty:
         return empty
     pred, y, r_on, tz, vol = _wide_from_frame(df)
     if pred.empty or pred.shape[1] < 2:
         return empty
-    base = _lo_q20_book(
+    base = _q20_book(
         pred, y, min_names=min_names, vol_target=vol_target,
-        overnight_r=r_on, turnover_z=tz, vol_level=vol,
+        overnight_r=r_on, turnover_z=tz, vol_level=vol, cost_book=book,
     )
     rows: list[dict[str, Any]] = []
     chosen: dict[str, Any] = {}
     best_ir = -1e18
     for window in IC_GATE_WINDOWS:
         for tau in IC_GATE_TAUS:
-            stats = _lo_q20_book(
+            stats = _q20_book(
                 pred, y, min_names=min_names, vol_target=vol_target,
-                overnight_r=r_on, turnover_z=tz, vol_level=vol,
+                overnight_r=r_on, turnover_z=tz, vol_level=vol, cost_book=book,
                 ic_gate_window=window, ic_gate_tau=tau,
             )
             cover = _as_float(stats.get("ic_gate_coverage"))
@@ -1305,13 +1365,15 @@ def fit_ic_gate_on_train(
         "rows": rows,
         "chosen": chosen,
         "baseline": {
-            "name": "live_long_only_q20",
+            "name": f"{book}_q20",
+            "cost_book": book,
             "unlevered_net_ir": base.get("unlevered_net_ir"),
             "unlevered_max_dd": base.get("unlevered_max_dd"),
             "mean_cost_unlev_bp": base.get("mean_cost_unlev_bp"),
             "ic_gate_coverage": 1.0,
         },
         "fit_split": "train",
+        "cost_book": book,
         "cover_min_train": IC_GATE_COVER_TRAIN,
     }
 
@@ -1321,8 +1383,11 @@ def decide_ic_gate_promote(
     val_always: dict[str, Any],
     val_gated: dict[str, Any],
     chosen: dict[str, Any],
+    cost_book: str = COST_BOOK_LS,
 ) -> dict[str, Any]:
-    """VAL-only vs always-on q20. TEST never enters."""
+    """VAL-only vs always-on q20 on ``cost_book``. TEST never enters."""
+    book = _normalize_cost_book(cost_book)
+    keep = f"Keep always-on {_book_q20_label(book)}."
     ir_on = _as_float(val_always.get("unlevered_net_ir"))
     ir_g = _as_float(val_gated.get("unlevered_net_ir"))
     dd_on = _as_float(val_always.get("unlevered_max_dd"))
@@ -1342,36 +1407,38 @@ def decide_ic_gate_promote(
     if not have_spec:
         reason = (
             "NO PROMOTE: TRAIN did not select a (W, τ) with coverage "
-            f">= {IC_GATE_COVER_TRAIN:.0%}. Keep always-on q20."
+            f">= {IC_GATE_COVER_TRAIN:.0%}. {keep}"
         )
     elif not cover_ok:
         reason = (
             f"NO PROMOTE: TRAIN chose W={chosen.get('window')} τ={chosen.get('tau'):+.2f} "
             f"but VAL coverage {100 * cover:.0f}% < {100 * IC_GATE_COVER_VAL:.0f}% "
-            "(catastrophic flatten). Keep always-on q20."
+            f"(catastrophic flatten). {keep}"
         )
     elif not ir_ok:
         reason = (
             f"NO PROMOTE: IC gate W={chosen.get('window')} τ={chosen.get('tau'):+.2f} "
             f"VAL unlev net IR {ir_g:+.3f} vs always-on {ir_on:+.3f} "
-            f"(delta {ir_delta:+.3f} < {LO_IR_LIFT:.2f}). Keep always-on q20."
+            f"(delta {ir_delta:+.3f} < {LO_IR_LIFT:.2f}). {keep}"
         )
     elif not dd_ok:
         reason = (
             f"NO PROMOTE: IC gate IR lift {ir_delta:+.3f} but VAL max DD "
             f"{dd_g:+.3f} vs always-on {dd_on:+.3f} exceeds {LO_DD_TOL:.2f}. "
-            "Keep always-on q20."
+            f"{keep}"
         )
     else:
         reason = (
-            f"PROMOTE IC gate W={chosen.get('window')} τ={chosen.get('tau'):+.2f}: "
-            f"VAL IR {ir_g:+.3f} vs {ir_on:+.3f} (delta {ir_delta:+.3f}), "
-            f"max DD {dd_g:+.3f} vs {dd_on:+.3f}, coverage {100 * cover:.0f}%."
+            f"PROMOTE IC gate W={chosen.get('window')} τ={chosen.get('tau'):+.2f} "
+            f"on {book}: VAL IR {ir_g:+.3f} vs {ir_on:+.3f} "
+            f"(delta {ir_delta:+.3f}), max DD {dd_g:+.3f} vs {dd_on:+.3f}, "
+            f"coverage {100 * cover:.0f}%."
         )
     return {
         "promote_ic_gate": promote,
         "gated_on": "val",
         "fit_split": "train",
+        "cost_book": book,
         "reason": reason,
         "spec": {
             "window": chosen.get("window", 0),
@@ -1449,17 +1516,25 @@ def fit_ic_scale_on_train(
     *,
     min_names: int,
     vol_target: float = 0.15,
+    cost_book: str = COST_BOOK_LS,
 ) -> dict[str, Any]:
     """Select soft-scale (W, τ, s_max) on TRAIN only. VAL/TEST must never enter."""
-    empty = {"rows": [], "chosen": {}, "baseline": {}, "fit_split": "train"}
+    book = _normalize_cost_book(cost_book)
+    empty = {
+        "rows": [],
+        "chosen": {},
+        "baseline": {},
+        "fit_split": "train",
+        "cost_book": book,
+    }
     if df.empty:
         return empty
     pred, y, r_on, tz, vol = _wide_from_frame(df)
     if pred.empty or pred.shape[1] < 2:
         return empty
-    base = _lo_q20_book(
+    base = _q20_book(
         pred, y, min_names=min_names, vol_target=vol_target,
-        overnight_r=r_on, turnover_z=tz, vol_level=vol,
+        overnight_r=r_on, turnover_z=tz, vol_level=vol, cost_book=book,
     )
     rows: list[dict[str, Any]] = []
     chosen: dict[str, Any] = {}
@@ -1468,9 +1543,9 @@ def fit_ic_scale_on_train(
         taus = _train_ic_scale_taus(pred, y, window=window, min_names=min_names)
         for tau in taus:
             for s_max in IC_SCALE_SMAX:
-                stats = _lo_q20_book(
+                stats = _q20_book(
                     pred, y, min_names=min_names, vol_target=vol_target,
-                    overnight_r=r_on, turnover_z=tz, vol_level=vol,
+                    overnight_r=r_on, turnover_z=tz, vol_level=vol, cost_book=book,
                     ic_scale_window=window, ic_scale_tau=tau, ic_scale_smax=s_max,
                 )
                 ir = _as_float(stats.get("unlevered_net_ir"))
@@ -1491,7 +1566,8 @@ def fit_ic_scale_on_train(
         "rows": rows,
         "chosen": chosen,
         "baseline": {
-            "name": "live_long_only_q20",
+            "name": f"{book}_q20",
+            "cost_book": book,
             "unlevered_net_ir": base.get("unlevered_net_ir"),
             "unlevered_max_dd": base.get("unlevered_max_dd"),
             "mean_cost_unlev_bp": base.get("mean_cost_unlev_bp"),
@@ -1501,6 +1577,7 @@ def fit_ic_scale_on_train(
             "coverage": 1.0,
         },
         "fit_split": "train",
+        "cost_book": book,
         "note": (
             "s_t = clip(trail_IC_{t-}/τ, 0, s_max); s_max in {1.00, 1.25}; "
             "trade every night; NaN warmup = full gross. Causal dates < t only. "
@@ -1514,8 +1591,11 @@ def decide_ic_scale_promote(
     val_always: dict[str, Any],
     val_scaled: dict[str, Any],
     chosen: dict[str, Any],
+    cost_book: str = COST_BOOK_LS,
 ) -> dict[str, Any]:
-    """VAL-only vs ungated q20. TEST never enters."""
+    """VAL-only vs ungated q20 on ``cost_book``. TEST never enters."""
+    book = _normalize_cost_book(cost_book)
+    keep = f"Keep ungated {_book_q20_label(book)}."
     ir_on = _as_float(val_always.get("unlevered_net_ir"))
     ir_g = _as_float(val_scaled.get("unlevered_net_ir"))
     dd_on = _as_float(val_always.get("unlevered_max_dd"))
@@ -1534,24 +1614,24 @@ def decide_ic_scale_promote(
     if not have_spec:
         reason = (
             "NO PROMOTE: TRAIN did not select a soft-scale (W, τ, s_max). "
-            "Keep ungated q20."
+            f"{keep}"
         )
     elif not ir_ok:
         reason = (
             f"NO PROMOTE: IC scale W={chosen.get('window')} τ={chosen.get('tau'):.3f} "
             f"s_max={s_max:.2f} VAL unlev net IR {ir_g:+.3f} vs ungated {ir_on:+.3f} "
-            f"(delta {ir_delta:+.3f} < {LO_IR_LIFT:.2f}). Keep ungated q20."
+            f"(delta {ir_delta:+.3f} < {LO_IR_LIFT:.2f}). {keep}"
         )
     elif not dd_ok:
         reason = (
             f"NO PROMOTE: IC scale IR lift {ir_delta:+.3f} but VAL max DD "
             f"{dd_g:+.3f} vs ungated {dd_on:+.3f} exceeds {LO_DD_TOL:.2f}. "
-            "Keep ungated q20."
+            f"{keep}"
         )
     else:
         reason = (
             f"PROMOTE IC scale W={chosen.get('window')} τ={chosen.get('tau'):.3f} "
-            f"s_max={s_max:.2f}: VAL IR {ir_g:+.3f} vs {ir_on:+.3f} "
+            f"s_max={s_max:.2f} on {book}: VAL IR {ir_g:+.3f} vs {ir_on:+.3f} "
             f"(delta {ir_delta:+.3f}), max DD {dd_g:+.3f} vs {dd_on:+.3f}, "
             f"mean_s {_as_float(val_scaled.get('mean_ic_scale')):.2f}."
         )
@@ -1559,6 +1639,7 @@ def decide_ic_scale_promote(
         "promote_ic_scale": promote,
         "gated_on": "val",
         "fit_split": "train",
+        "cost_book": book,
         "reason": reason,
         "spec": (
             {
@@ -1629,18 +1710,26 @@ def fit_disp_gate_on_train(
     *,
     min_names: int,
     vol_target: float = 0.15,
+    cost_book: str = COST_BOOK_LS,
 ) -> dict[str, Any]:
     """Select (kind, W, τ) on TRAIN only. VAL/TEST must never enter."""
-    empty = {"rows": [], "chosen": {}, "baseline": {}, "fit_split": "train"}
+    book = _normalize_cost_book(cost_book)
+    empty = {
+        "rows": [],
+        "chosen": {},
+        "baseline": {},
+        "fit_split": "train",
+        "cost_book": book,
+    }
     if df.empty:
         return empty
     pred, y, r_on, tz, vol = _wide_from_frame(df)
     if pred.empty or pred.shape[1] < 2:
         return empty
     close = _close_wide(df)
-    base = _lo_q20_book(
+    base = _q20_book(
         pred, y, min_names=min_names, vol_target=vol_target,
-        overnight_r=r_on, turnover_z=tz, vol_level=vol,
+        overnight_r=r_on, turnover_z=tz, vol_level=vol, cost_book=book,
     )
     rows: list[dict[str, Any]] = []
     chosen: dict[str, Any] = {}
@@ -1655,9 +1744,9 @@ def fit_disp_gate_on_train(
             continue
         for q in DISP_QS:
             tau = float(np.quantile(finite, q))
-            stats = _lo_q20_book(
+            stats = _q20_book(
                 pred, y, min_names=min_names, vol_target=vol_target,
-                overnight_r=r_on, turnover_z=tz, vol_level=vol,
+                overnight_r=r_on, turnover_z=tz, vol_level=vol, cost_book=book,
                 disp_gate_trail=series, disp_gate_tau=tau,
                 disp_gate_kind=kind, disp_gate_window=window,
             )
@@ -1693,13 +1782,15 @@ def fit_disp_gate_on_train(
         "rows": rows,
         "chosen": chosen,
         "baseline": {
-            "name": "live_long_only_q20",
+            "name": f"{book}_q20",
+            "cost_book": book,
             "unlevered_net_ir": base.get("unlevered_net_ir"),
             "unlevered_max_dd": base.get("unlevered_max_dd"),
             "mean_cost_unlev_bp": base.get("mean_cost_unlev_bp"),
             "disp_gate_coverage": 1.0,
         },
         "fit_split": "train",
+        "cost_book": book,
         "cover_min_train": DISP_COVER_TRAIN,
         "note": (
             "cc = same-day close-to-close CS std (dates ≤ t); "
@@ -1713,8 +1804,11 @@ def decide_disp_gate_promote(
     val_always: dict[str, Any],
     val_gated: dict[str, Any],
     chosen: dict[str, Any],
+    cost_book: str = COST_BOOK_LS,
 ) -> dict[str, Any]:
-    """VAL-only vs ungated q20. TEST never enters."""
+    """VAL-only vs ungated q20 on ``cost_book``. TEST never enters."""
+    book = _normalize_cost_book(cost_book)
+    keep = f"Keep ungated {_book_q20_label(book)}."
     ir_on = _as_float(val_always.get("unlevered_net_ir"))
     ir_g = _as_float(val_gated.get("unlevered_net_ir"))
     dd_on = _as_float(val_always.get("unlevered_max_dd"))
@@ -1737,29 +1831,29 @@ def decide_disp_gate_promote(
     if not have_spec:
         reason = (
             "NO PROMOTE: TRAIN did not select a dispersion (kind, W, τ) with "
-            f"coverage >= {DISP_COVER_TRAIN:.0%}. Keep ungated q20."
+            f"coverage >= {DISP_COVER_TRAIN:.0%}. {keep}"
         )
     elif not cover_ok:
         reason = (
             f"NO PROMOTE: TRAIN chose {kind} W={window} τ={tau} "
             f"but VAL coverage {100 * cover:.0f}% < {100 * DISP_COVER_VAL:.0f}% "
-            "(catastrophic flatten). Keep ungated q20."
+            f"(catastrophic flatten). {keep}"
         )
     elif not ir_ok:
         reason = (
             f"NO PROMOTE: disp gate {kind} W={window} τ={_fmt(tau, '.4f')} "
             f"VAL unlev net IR {ir_g:+.3f} vs ungated {ir_on:+.3f} "
-            f"(delta {ir_delta:+.3f} < {LO_IR_LIFT:.2f}). Keep ungated q20."
+            f"(delta {ir_delta:+.3f} < {LO_IR_LIFT:.2f}). {keep}"
         )
     elif not dd_ok:
         reason = (
             f"NO PROMOTE: disp gate IR lift {ir_delta:+.3f} but VAL max DD "
             f"{dd_g:+.3f} vs ungated {dd_on:+.3f} exceeds {LO_DD_TOL:.2f}. "
-            "Keep ungated q20."
+            f"{keep}"
         )
     else:
         reason = (
-            f"PROMOTE disp gate {kind} W={window} τ={_fmt(tau, '.4f')}: "
+            f"PROMOTE disp gate {kind} W={window} τ={_fmt(tau, '.4f')} on {book}: "
             f"VAL IR {ir_g:+.3f} vs {ir_on:+.3f} (delta {ir_delta:+.3f}), "
             f"max DD {dd_g:+.3f} vs {dd_on:+.3f}, coverage {100 * cover:.0f}%."
         )
@@ -1767,6 +1861,7 @@ def decide_disp_gate_promote(
         "promote_disp_gate": promote,
         "gated_on": "val",
         "fit_split": "train",
+        "cost_book": book,
         "reason": reason,
         "spec": {
             "kind": kind,
@@ -1798,9 +1893,17 @@ def weekday_mask_grid(
     *,
     min_names: int,
     vol_target: float = 0.15,
+    cost_book: str = COST_BOOK_LS,
 ) -> dict[str, Any]:
     """Score causal weekday masks on one split. Caller decides VAL vs TEST."""
-    empty = {"rows": [], "best": {}, "baseline": {}, "eligible": []}
+    book = _normalize_cost_book(cost_book)
+    empty = {
+        "rows": [],
+        "best": {},
+        "baseline": {},
+        "eligible": [],
+        "cost_book": book,
+    }
     if df.empty:
         return empty
     pred, y, r_on, tz, vol = _wide_from_frame(df)
@@ -1809,7 +1912,7 @@ def weekday_mask_grid(
     rows: list[dict[str, Any]] = []
     baseline: dict[str, Any] = {}
     for mask in WEEKDAY_MASKS:
-        stats = _lo_q20_book(
+        stats = _q20_book(
             pred,
             y,
             min_names=min_names,
@@ -1817,6 +1920,7 @@ def weekday_mask_grid(
             overnight_r=r_on,
             turnover_z=tz,
             vol_level=vol,
+            cost_book=book,
             weekday_mask=mask,
         )
         cover = _as_float(stats.get("weekday_coverage"))
@@ -1861,6 +1965,7 @@ def weekday_mask_grid(
         "baseline": baseline,
         "eligible": eligible,
         "cover_min": WEEKDAY_COVER_VAL,
+        "cost_book": book,
         "note": (
             "weekday(t) at close t only; Friday=weekend gap; "
             "Monday=Mon close→Tue open; next open never a feature"
@@ -1868,10 +1973,18 @@ def weekday_mask_grid(
     }
 
 
-def decide_weekday_promote(grid: dict[str, Any]) -> dict[str, Any]:
-    """VAL-only vs always-on q20. TEST never enters."""
+def decide_weekday_promote(
+    grid: dict[str, Any],
+    *,
+    cost_book: str | None = None,
+) -> dict[str, Any]:
+    """VAL-only vs always-on q20 on ``cost_book``. TEST never enters."""
     baseline = dict(grid.get("baseline") or {})
     best = dict(grid.get("best") or {})
+    book = _normalize_cost_book(
+        cost_book or grid.get("cost_book") or COST_BOOK_LS
+    )
+    keep = f"Keep always-on {_book_q20_label(book)}."
     ir_on = _as_float(baseline.get("unlevered_net_ir"))
     ir_g = _as_float(best.get("unlevered_net_ir"))
     dd_on = _as_float(baseline.get("unlevered_max_dd"))
@@ -1894,35 +2007,36 @@ def decide_weekday_promote(grid: dict[str, Any]) -> dict[str, Any]:
     if not best:
         reason = (
             "NO PROMOTE: no weekday mask met VAL coverage "
-            f">= {WEEKDAY_COVER_VAL:.0%}. Keep always-on q20."
+            f">= {WEEKDAY_COVER_VAL:.0%}. {keep}"
         )
     elif same or not ir_ok:
         reason = (
             f"NO PROMOTE: no weekday mask beats always-on by {LO_IR_LIFT:.2f} "
             f"unlev net IR (best {best.get('name')} {ir_g:+.3f} vs always-on "
-            f"{ir_on:+.3f}, delta {ir_delta:+.3f}). Keep always-on q20."
+            f"{ir_on:+.3f}, delta {ir_delta:+.3f}). {keep}"
         )
     elif not cover_ok:
         reason = (
             f"NO PROMOTE: {best.get('name')} VAL coverage "
             f"{100 * cover:.0f}% < {100 * WEEKDAY_COVER_VAL:.0f}% "
-            "(catastrophic flatten). Keep always-on q20."
+            f"(catastrophic flatten). {keep}"
         )
     elif not dd_ok:
         reason = (
             f"NO PROMOTE: weekday {mask} IR lift {ir_delta:+.3f} but VAL max DD "
             f"{dd_g:+.3f} vs always-on {dd_on:+.3f} exceeds {LO_DD_TOL:.2f}. "
-            "Keep always-on q20."
+            f"{keep}"
         )
     else:
         reason = (
-            f"PROMOTE weekday mask {mask}: VAL IR {ir_g:+.3f} vs {ir_on:+.3f} "
-            f"(delta {ir_delta:+.3f}), max DD {dd_g:+.3f} vs {dd_on:+.3f}, "
-            f"coverage {100 * cover:.0f}%."
+            f"PROMOTE weekday mask {mask} on {book}: VAL IR {ir_g:+.3f} vs "
+            f"{ir_on:+.3f} (delta {ir_delta:+.3f}), max DD {dd_g:+.3f} vs "
+            f"{dd_on:+.3f}, coverage {100 * cover:.0f}%."
         )
     return {
         "promote_weekday": promote,
         "gated_on": "val",
+        "cost_book": book,
         "reason": reason,
         "spec": {"weekday_mask": mask} if promote else {"weekday_mask": "always"},
         "chosen": best,
@@ -2772,13 +2886,16 @@ def score_sticky_book(
     q_exit: float,
     min_names: int,
     vol_target: float = 0.15,
-    held0: set | frozenset | None = None,
+    held0: set | frozenset | dict | tuple | None = None,
+    cost_book: str = COST_BOOK_LS,
 ) -> dict[str, Any]:
-    """Overnight live long-only sticky vs flatten-every-night q20 costs."""
+    """Overnight sticky hysteresis vs flatten-every-night q20 on ``cost_book``."""
+    book = _normalize_cost_book(cost_book)
     empty = {
         "name": f"sticky_e{int(round(100 * float(q_enter)))}_x{int(round(100 * float(q_exit)))}",
         "q_enter": float(q_enter),
         "q_exit": float(q_exit),
+        "cost_book": book,
         "unlevered_net_ir": float("nan"),
         "net_ir": float("nan"),
         "unlevered_max_dd": float("nan"),
@@ -2795,7 +2912,7 @@ def score_sticky_book(
     pred, y, r_on, tz, vol = _wide_from_frame(frame)
     if pred.empty or pred.shape[1] < 2:
         return empty
-    stats = _lo_q20_book(
+    stats = _q20_book(
         pred,
         y,
         min_names=min_names,
@@ -2803,6 +2920,7 @@ def score_sticky_book(
         overnight_r=r_on,
         turnover_z=tz,
         vol_level=vol,
+        cost_book=book,
         sticky_q_enter=float(q_enter),
         sticky_q_exit=float(q_exit),
         sticky_held0=held0,
@@ -2821,6 +2939,7 @@ def score_sticky_book(
         "name": empty["name"],
         "q_enter": float(q_enter),
         "q_exit": float(q_exit),
+        "cost_book": book,
         "unlevered_net_ir": stats.get("unlevered_net_ir"),
         "net_ir": stats.get("net_ir"),
         "unlevered_max_dd": stats.get("unlevered_max_dd"),
@@ -2839,14 +2958,17 @@ def score_q20_rebuild(
     *,
     min_names: int,
     vol_target: float = 0.15,
+    cost_book: str = COST_BOOK_LS,
 ) -> dict[str, Any]:
-    """Always-rebuild q20 equal — the live default baseline."""
+    """Always-rebuild q20 equal — the live default baseline on ``cost_book``."""
+    book = _normalize_cost_book(cost_book)
     row = score_sticky_book(
         frame,
         q_enter=0.0,
         q_exit=0.0,
         min_names=min_names,
         vol_target=vol_target,
+        cost_book=book,
     )
     if frame is None or frame.empty:
         row["name"] = "q20_rebuild"
@@ -2855,7 +2977,7 @@ def score_q20_rebuild(
     if pred.empty or pred.shape[1] < 2:
         row["name"] = "q20_rebuild"
         return row
-    stats = _lo_q20_book(
+    stats = _q20_book(
         pred,
         y,
         min_names=min_names,
@@ -2863,6 +2985,7 @@ def score_q20_rebuild(
         overnight_r=r_on,
         turnover_z=tz,
         vol_level=vol,
+        cost_book=book,
     )
     n_cal = float(len(pred.index.intersection(y.index)))
     n_book = _as_float(stats.get("n_dates"))
@@ -2878,6 +3001,7 @@ def score_q20_rebuild(
         "name": "q20_rebuild",
         "q_enter": 0.20,
         "q_exit": 0.20,
+        "cost_book": book,
         "unlevered_net_ir": stats.get("unlevered_net_ir"),
         "net_ir": stats.get("net_ir"),
         "unlevered_max_dd": stats.get("unlevered_max_dd"),
@@ -2896,16 +3020,32 @@ def sticky_grid(
     *,
     min_names: int,
     vol_target: float = 0.15,
-    held0: set | frozenset | None = None,
+    held0: set | frozenset | dict | tuple | None = None,
+    cost_book: str = COST_BOOK_LS,
 ) -> dict[str, Any]:
     """Score the TRAIN (q_enter, q_exit) grid on one split. Does not pick."""
-    note = (
-        "sticky long-only: enter top q_enter, hold while in top q_exit; "
-        "equal-weight active set; empty = flat (still in IR). "
-        "Ranks = sector-overnight residual skip. α-ensemble is not the default path. "
-        "(q_enter, q_exit) fit on TRAIN only."
-    )
-    empty = {"rows": [], "best": {}, "baseline": {}, "note": note}
+    book = _normalize_cost_book(cost_book)
+    if book == COST_BOOK_LS:
+        note = (
+            "sticky live_locate: long top / short bottom; enter q_enter, "
+            "hold while in q_exit; each sleeve 0.5 gross; empty sleeve = flat "
+            "on that side (still in IR). Ranks = sector-overnight residual skip. "
+            "(q_enter, q_exit) fit on TRAIN only."
+        )
+    else:
+        note = (
+            "sticky long-only: enter top q_enter, hold while in top q_exit; "
+            "equal-weight active set; empty = flat (still in IR). "
+            "Ranks = sector-overnight residual skip. alpha-ensemble is not "
+            "the default path. (q_enter, q_exit) fit on TRAIN only."
+        )
+    empty = {
+        "rows": [],
+        "best": {},
+        "baseline": {},
+        "note": note,
+        "cost_book": book,
+    }
     if frame is None or frame.empty:
         return empty
     rows: list[dict[str, Any]] = []
@@ -2920,11 +3060,14 @@ def sticky_grid(
                 min_names=min_names,
                 vol_target=vol_target,
                 held0=held0,
+                cost_book=book,
             )
             if not np.isfinite(_as_float(row.get("unlevered_net_ir"))):
                 continue
             rows.append(row)
-    baseline = score_q20_rebuild(frame, min_names=min_names, vol_target=vol_target)
+    baseline = score_q20_rebuild(
+        frame, min_names=min_names, vol_target=vol_target, cost_book=book
+    )
     if not rows:
         return {**empty, "baseline": baseline}
     rows.sort(
@@ -2939,6 +3082,7 @@ def sticky_grid(
         "best": dict(rows[0]),
         "baseline": baseline,
         "note": note,
+        "cost_book": book,
     }
 
 
@@ -2947,9 +3091,17 @@ def fit_sticky_on_train(
     *,
     min_names: int,
     vol_target: float = 0.15,
+    cost_book: str = COST_BOOK_LS,
 ) -> dict[str, Any]:
     """Select (q_enter, q_exit) on TRAIN only. VAL/TEST must never enter."""
-    grid = sticky_grid(frame, min_names=min_names, vol_target=vol_target, held0=None)
+    book = _normalize_cost_book(cost_book)
+    grid = sticky_grid(
+        frame,
+        min_names=min_names,
+        vol_target=vol_target,
+        held0=None,
+        cost_book=book,
+    )
     rows = list(grid.get("rows") or [])
     baseline = dict(grid.get("baseline") or {})
     chosen: dict[str, Any] = {}
@@ -2974,6 +3126,7 @@ def fit_sticky_on_train(
         "chosen": chosen,
         "baseline": baseline,
         "fit_split": "train",
+        "cost_book": book,
         "enters": list(STICKY_ENTERS),
         "exits": list(STICKY_EXITS),
         "note": grid.get("note"),
@@ -2985,8 +3138,11 @@ def decide_sticky_promote(
     val_baseline: dict[str, Any],
     val_chosen: dict[str, Any],
     chosen: dict[str, Any],
+    cost_book: str = COST_BOOK_LS,
 ) -> dict[str, Any]:
-    """VAL-only vs always-rebuild q20. TEST never enters. Spec is TRAIN-chosen."""
+    """VAL-only vs always-rebuild q20 on ``cost_book``. TEST never enters."""
+    book = _normalize_cost_book(cost_book)
+    keep = f"Keep always-rebuild {_book_q20_label(book)}."
     base = dict(val_baseline or {})
     scored = dict(val_chosen or {})
     ir_a = _as_float(base.get("unlevered_net_ir"))
@@ -3010,19 +3166,19 @@ def decide_sticky_promote(
     if not have:
         reason = (
             "NO PROMOTE: TRAIN did not select a (q_enter, q_exit) with "
-            f"coverage >= {STICKY_COVER_VAL:.0%}. Keep always-rebuild q20."
+            f"coverage >= {STICKY_COVER_VAL:.0%}. {keep}"
         )
     elif not cover_ok:
         reason = (
             f"NO PROMOTE: TRAIN sticky e{100 * qe:.0f}/x{100 * qx:.0f} but VAL "
             f"coverage {100 * cover:.0f}% < {100 * STICKY_COVER_VAL:.0f}%. "
-            "Keep always-rebuild q20."
+            f"{keep}"
         )
     elif not ir_ok:
         reason = (
             f"NO PROMOTE: TRAIN sticky e{100 * qe:.0f}/x{100 * qx:.0f} VAL IR "
             f"{ir_b:+.3f} vs q20 {ir_a:+.3f} (delta {ir_delta:+.3f} < "
-            f"{LO_IR_LIFT:.2f}). Keep always-rebuild q20."
+            f"{LO_IR_LIFT:.2f}). {keep}"
         )
     elif not dd_ok:
         reason = (
@@ -3032,15 +3188,16 @@ def decide_sticky_promote(
         )
     else:
         reason = (
-            f"PROMOTE sticky e{100 * qe:.0f}/x{100 * qx:.0f}: VAL IR {ir_b:+.3f} "
-            f"vs q20 {ir_a:+.3f} (delta {ir_delta:+.3f}), max DD {dd_b:+.3f} vs "
-            f"{dd_a:+.3f}, coverage {100 * cover:.0f}%, name_churn "
-            f"{_as_float(scored.get('mean_name_churn')):.3f} vs "
+            f"PROMOTE sticky e{100 * qe:.0f}/x{100 * qx:.0f} on {book}: "
+            f"VAL IR {ir_b:+.3f} vs q20 {ir_a:+.3f} (delta {ir_delta:+.3f}), "
+            f"max DD {dd_b:+.3f} vs {dd_a:+.3f}, coverage {100 * cover:.0f}%, "
+            f"name_churn {_as_float(scored.get('mean_name_churn')):.3f} vs "
             f"{_as_float(base.get('mean_name_churn')):.3f}."
         )
     return {
         "promote_sticky": promote,
         "gated_on": "val",
+        "cost_book": book,
         "reason": reason,
         "spec": (
             {"q_enter": float(qe), "q_exit": float(qx)}
@@ -3418,6 +3575,389 @@ def report_test_prefers_book(test: Mapping[str, Any]) -> str:
     return "tie_or_nan"
 
 
+def _date_gate_bundle(
+    frames: dict[str, pd.DataFrame],
+    *,
+    cost_book: str,
+    min_names: int,
+    vol_target: float,
+) -> dict[str, Any]:
+    """TRAIN-fit + VAL-promote IC/disp/weekday/sticky/ic_scale on one cost book."""
+    book = _normalize_cost_book(cost_book)
+    train = frames.get("train", pd.DataFrame())
+    val = frames.get("val", pd.DataFrame())
+    test = frames.get("test", pd.DataFrame())
+
+    def _gated(
+        split: str,
+        hist: tuple[str, ...],
+        *,
+        window: int = 0,
+        tau: float = 0.0,
+        scale_window: int = 0,
+        scale_tau: float = 0.0,
+        scale_smax: float = 1.0,
+        disp_kind: str = "",
+        disp_window: int = 0,
+        disp_tau: float = float("nan"),
+        weekday_mask: str = "always",
+    ) -> dict[str, Any]:
+        frame = frames.get(split, pd.DataFrame())
+        if frame is None or frame.empty:
+            return {}
+        pred, y, r_on, tz, vol = _wide_from_frame(frame)
+        if pred.empty or pred.shape[1] < 2:
+            return {}
+        trail = None
+        if window > 0:
+            parts_p = [
+                frame_to_wide(frames[s], "pred")
+                for s in hist
+                if s in frames and not frames[s].empty
+            ]
+            parts_y = [
+                frame_to_wide(frames[s], "y")
+                for s in hist
+                if s in frames and not frames[s].empty
+            ]
+            if parts_p and parts_y:
+                hp = pd.concat(parts_p).sort_index().groupby(level=0).last()
+                hy = pd.concat(parts_y).sort_index().groupby(level=0).last()
+                trail = trailing_mean_cs_ic(
+                    hp, hy, window=window, min_names=min_names
+                )
+        scale_trail = None
+        if scale_window > 0:
+            parts_p = [
+                frame_to_wide(frames[s], "pred")
+                for s in hist
+                if s in frames and not frames[s].empty
+            ]
+            parts_y = [
+                frame_to_wide(frames[s], "y")
+                for s in hist
+                if s in frames and not frames[s].empty
+            ]
+            if parts_p and parts_y:
+                hp = pd.concat(parts_p).sort_index().groupby(level=0).last()
+                hy = pd.concat(parts_y).sort_index().groupby(level=0).last()
+                scale_trail = trailing_mean_cs_ic(
+                    hp, hy, window=scale_window, min_names=min_names
+                )
+        disp_trail = None
+        if disp_kind:
+            disp_trail = _hist_disp_series(
+                frames, hist, disp_kind, disp_window, min_names
+            )
+        return _q20_book(
+            pred,
+            y,
+            min_names=min_names,
+            vol_target=vol_target,
+            overnight_r=r_on,
+            turnover_z=tz,
+            vol_level=vol,
+            cost_book=book,
+            ic_gate_window=window,
+            ic_gate_tau=tau,
+            ic_gate_trail=trail,
+            ic_scale_window=scale_window,
+            ic_scale_tau=scale_tau,
+            ic_scale_trail=scale_trail,
+            ic_scale_smax=scale_smax,
+            weekday_mask=weekday_mask,
+            disp_gate_trail=disp_trail,
+            disp_gate_tau=disp_tau,
+            disp_gate_kind=disp_kind,
+            disp_gate_window=disp_window,
+        )
+
+    ic_fit = fit_ic_gate_on_train(
+        train, min_names=min_names, vol_target=vol_target, cost_book=book
+    )
+    ic_chosen = ic_fit.get("chosen") or {}
+    ic_W = int(ic_chosen.get("window") or 0)
+    ic_tau = float(ic_chosen.get("tau") or 0.0)
+    ic_val_always = _gated("val", ("train", "val"))
+    ic_val_gated = (
+        _gated("val", ("train", "val"), window=ic_W, tau=ic_tau)
+        if ic_W
+        else dict(ic_val_always)
+    )
+    ic_test_always = _gated("test", ("train", "val", "test"))
+    ic_test_gated = (
+        _gated("test", ("train", "val", "test"), window=ic_W, tau=ic_tau)
+        if ic_W
+        else dict(ic_test_always)
+    )
+    ic_promo = decide_ic_gate_promote(
+        val_always=ic_val_always,
+        val_gated=ic_val_gated,
+        chosen=ic_chosen,
+        cost_book=book,
+    )
+
+    ics_fit = fit_ic_scale_on_train(
+        train, min_names=min_names, vol_target=vol_target, cost_book=book
+    )
+    ics_chosen = ics_fit.get("chosen") or {}
+    ics_W = int(ics_chosen.get("window") or 0)
+    ics_tau = float(ics_chosen.get("tau") or 0.0)
+    ics_smax = float(ics_chosen.get("s_max") or 1.0)
+    ics_val_always = _gated("val", ("train", "val"))
+    ics_val_scaled = (
+        _gated(
+            "val",
+            ("train", "val"),
+            scale_window=ics_W,
+            scale_tau=ics_tau,
+            scale_smax=ics_smax,
+        )
+        if ics_W
+        else dict(ics_val_always)
+    )
+    ics_test_always = _gated("test", ("train", "val", "test"))
+    ics_test_scaled = (
+        _gated(
+            "test",
+            ("train", "val", "test"),
+            scale_window=ics_W,
+            scale_tau=ics_tau,
+            scale_smax=ics_smax,
+        )
+        if ics_W
+        else dict(ics_test_always)
+    )
+    ics_promo = decide_ic_scale_promote(
+        val_always=ics_val_always,
+        val_scaled=ics_val_scaled,
+        chosen=ics_chosen,
+        cost_book=book,
+    )
+
+    disp_fit = fit_disp_gate_on_train(
+        train, min_names=min_names, vol_target=vol_target, cost_book=book
+    )
+    disp_chosen = disp_fit.get("chosen") or {}
+    disp_kind = str(disp_chosen.get("kind") or "")
+    disp_W = int(disp_chosen.get("window") or 0)
+    disp_tau = float(disp_chosen.get("tau") or float("nan"))
+    disp_val_always = _gated("val", ("train", "val"))
+    disp_val_gated = (
+        _gated(
+            "val",
+            ("train", "val"),
+            disp_kind=disp_kind,
+            disp_window=disp_W,
+            disp_tau=disp_tau,
+        )
+        if disp_kind
+        else dict(disp_val_always)
+    )
+    disp_test_always = _gated("test", ("train", "val", "test"))
+    disp_test_gated = (
+        _gated(
+            "test",
+            ("train", "val", "test"),
+            disp_kind=disp_kind,
+            disp_window=disp_W,
+            disp_tau=disp_tau,
+        )
+        if disp_kind
+        else dict(disp_test_always)
+    )
+    disp_promo = decide_disp_gate_promote(
+        val_always=disp_val_always,
+        val_gated=disp_val_gated,
+        chosen=disp_chosen,
+        cost_book=book,
+    )
+
+    wd_val = weekday_mask_grid(
+        val, min_names=min_names, vol_target=vol_target, cost_book=book
+    )
+    wd_promo = decide_weekday_promote(wd_val, cost_book=book)
+    wd_test = weekday_mask_grid(
+        test, min_names=min_names, vol_target=vol_target, cost_book=book
+    )
+
+    sticky_fit = fit_sticky_on_train(
+        train, min_names=min_names, vol_target=vol_target, cost_book=book
+    )
+    sticky_qe = _as_float((sticky_fit.get("chosen") or {}).get("q_enter"))
+    sticky_qx = _as_float((sticky_fit.get("chosen") or {}).get("q_exit"))
+    have_sticky = (
+        np.isfinite(sticky_qe) and np.isfinite(sticky_qx) and sticky_qx > sticky_qe
+    )
+    train_pred = frame_to_wide(train, "pred")
+    val_pred = frame_to_wide(val, "pred")
+    if book == COST_BOOK_LS:
+        sticky_held_val = (
+            last_sticky_held_ls(
+                train_pred, q_enter=sticky_qe, q_exit=sticky_qx, min_names=min_names
+            )
+            if have_sticky
+            else {"long": set(), "short": set()}
+        )
+        hist_parts = [p for p in (train_pred, val_pred) if p is not None and not p.empty]
+        hist_tv = pd.concat(hist_parts) if hist_parts else pd.DataFrame()
+        if not hist_tv.empty:
+            hist_tv = hist_tv.sort_index().groupby(level=0).last()
+        sticky_held_test = (
+            last_sticky_held_ls(
+                hist_tv, q_enter=sticky_qe, q_exit=sticky_qx, min_names=min_names
+            )
+            if have_sticky
+            else {"long": set(), "short": set()}
+        )
+    else:
+        sticky_held_val = (
+            last_sticky_held(
+                train_pred, q_enter=sticky_qe, q_exit=sticky_qx, min_names=min_names
+            )
+            if have_sticky
+            else set()
+        )
+        hist_parts = [p for p in (train_pred, val_pred) if p is not None and not p.empty]
+        hist_tv = pd.concat(hist_parts) if hist_parts else pd.DataFrame()
+        if not hist_tv.empty:
+            hist_tv = hist_tv.sort_index().groupby(level=0).last()
+        sticky_held_test = (
+            last_sticky_held(
+                hist_tv, q_enter=sticky_qe, q_exit=sticky_qx, min_names=min_names
+            )
+            if have_sticky
+            else set()
+        )
+    sticky_val = sticky_grid(
+        val, min_names=min_names, vol_target=vol_target, cost_book=book
+    )
+    sticky_test = sticky_grid(
+        test, min_names=min_names, vol_target=vol_target, cost_book=book
+    )
+    sticky_val_base = score_q20_rebuild(
+        val, min_names=min_names, vol_target=vol_target, cost_book=book
+    )
+    sticky_test_base = score_q20_rebuild(
+        test, min_names=min_names, vol_target=vol_target, cost_book=book
+    )
+    sticky_val_chosen = (
+        score_sticky_book(
+            val,
+            q_enter=sticky_qe,
+            q_exit=sticky_qx,
+            min_names=min_names,
+            vol_target=vol_target,
+            held0=sticky_held_val,
+            cost_book=book,
+        )
+        if have_sticky
+        else dict(sticky_val_base)
+    )
+    sticky_test_chosen = (
+        score_sticky_book(
+            test,
+            q_enter=sticky_qe,
+            q_exit=sticky_qx,
+            min_names=min_names,
+            vol_target=vol_target,
+            held0=sticky_held_test,
+            cost_book=book,
+        )
+        if have_sticky
+        else dict(sticky_test_base)
+    )
+    sticky_promo = decide_sticky_promote(
+        val_baseline=sticky_val_base,
+        val_chosen=sticky_val_chosen,
+        chosen=sticky_fit.get("chosen") or {},
+        cost_book=book,
+    )
+    sticky_compare = {
+        "train_grid": sticky_fit,
+        "val_grid": sticky_val,
+        "test_grid": sticky_test,
+        "val_chosen": sticky_val_chosen,
+        "val_baseline": sticky_val_base,
+        "test_chosen": sticky_test_chosen,
+        "test_baseline": sticky_test_base,
+        "train_q_enter": sticky_qe if have_sticky else 0.20,
+        "train_q_exit": sticky_qx if have_sticky else 0.20,
+        "cost_book": book,
+    }
+    return {
+        "cost_book": book,
+        "ic_gate_fit": ic_fit,
+        "ic_gate_promotion": ic_promo,
+        "ic_gate_val_always": ic_val_always,
+        "ic_gate_val_gated": ic_val_gated,
+        "ic_gate_test_always": ic_test_always,
+        "ic_gate_test_gated": ic_test_gated,
+        "ic_scale_fit": ics_fit,
+        "ic_scale_promotion": ics_promo,
+        "ic_scale_val_always": ics_val_always,
+        "ic_scale_val_scaled": ics_val_scaled,
+        "ic_scale_test_always": ics_test_always,
+        "ic_scale_test_scaled": ics_test_scaled,
+        "disp_gate_fit": disp_fit,
+        "disp_gate_promotion": disp_promo,
+        "disp_gate_val_always": disp_val_always,
+        "disp_gate_val_gated": disp_val_gated,
+        "disp_gate_test_always": disp_test_always,
+        "disp_gate_test_gated": disp_test_gated,
+        "weekday_val_grid": wd_val,
+        "weekday_test_grid": wd_test,
+        "weekday_promotion": wd_promo,
+        "sticky_fit": sticky_fit,
+        "sticky_compare": sticky_compare,
+        "sticky_promotion": sticky_promo,
+    }
+
+
+def compare_date_gate_books(
+    live_locate: Mapping[str, Any],
+    long_only: Mapping[str, Any],
+) -> dict[str, Any]:
+    """VAL promote / IR-DD deltas: live_locate vs long-only for date gates."""
+    specs = (
+        ("ic", "ic_gate_promotion", "promote_ic_gate"),
+        ("ic_scale", "ic_scale_promotion", "promote_ic_scale"),
+        ("disp", "disp_gate_promotion", "promote_disp_gate"),
+        ("weekday", "weekday_promotion", "promote_weekday"),
+        ("sticky", "sticky_promotion", "promote_sticky"),
+    )
+    rows: list[dict[str, Any]] = []
+    for name, key, flag in specs:
+        ls = dict((live_locate or {}).get(key) or {})
+        lo = dict((long_only or {}).get(key) or {})
+        rows.append(
+            {
+                "gate": name,
+                "live_locate_promote": bool(ls.get(flag)),
+                "long_only_promote": bool(lo.get(flag)),
+                "live_locate_ir_delta": _as_float(ls.get("ir_delta")),
+                "long_only_ir_delta": _as_float(lo.get("ir_delta")),
+                "live_locate_dd_delta": _as_float(ls.get("dd_delta")),
+                "long_only_dd_delta": _as_float(lo.get("dd_delta")),
+                "live_locate_reason": ls.get("reason"),
+                "long_only_reason": lo.get("reason"),
+                "live_locate_spec": ls.get("spec"),
+                "long_only_spec": lo.get("spec"),
+            }
+        )
+    n_ls = sum(1 for r in rows if r["live_locate_promote"])
+    n_lo = sum(1 for r in rows if r["long_only_promote"])
+    return {
+        "cost_books": [COST_BOOK_LS, COST_BOOK_LO],
+        "primary_book": COST_BOOK_LS,
+        "ir_status": "provisional_pending_label_audit",
+        "note": IR_PROVISIONAL_NOTE,
+        "n_promote_live_locate": n_ls,
+        "n_promote_long_only": n_lo,
+        "rows": rows,
+    }
+
+
 def evaluate_overnight_shorting(
     data_dir: str,
     universe: str = "liquid",
@@ -3465,183 +4005,24 @@ def evaluate_overnight_shorting(
         chosen=book_aligned_fit.get("chosen") or {},
     )
     lo_refine = val_long_only_refine(frames["val"], min_names=min_names, vol_target=vol_target)
-    ic_fit = fit_ic_gate_on_train(
-        frames["train"], min_names=min_names, vol_target=vol_target
-    )
-    ic_chosen = ic_fit.get("chosen") or {}
-    ic_W = int(ic_chosen.get("window") or 0)
-    ic_tau = float(ic_chosen.get("tau") or 0.0)
-
-    def _gated_lo(split: str, hist: tuple[str, ...], window: int, tau: float) -> dict[str, Any]:
-        if frames[split].empty:
-            return {}
-        pred, y, r_on, tz, vol = _wide_from_frame(frames[split])
-        if pred.empty or pred.shape[1] < 2:
-            return {}
-        trail = None
-        if window > 0:
-            parts_p = [
-                frame_to_wide(frames[s], "pred")
-                for s in hist
-                if s in frames and not frames[s].empty
-            ]
-            parts_y = [
-                frame_to_wide(frames[s], "y")
-                for s in hist
-                if s in frames and not frames[s].empty
-            ]
-            if parts_p and parts_y:
-                hp = pd.concat(parts_p).sort_index().groupby(level=0).last()
-                hy = pd.concat(parts_y).sort_index().groupby(level=0).last()
-                trail = trailing_mean_cs_ic(
-                    hp, hy, window=window, min_names=min_names
-                )
-        return _lo_q20_book(
-            pred,
-            y,
-            min_names=min_names,
-            vol_target=vol_target,
-            overnight_r=r_on,
-            turnover_z=tz,
-            vol_level=vol,
-            ic_gate_window=window,
-            ic_gate_tau=tau,
-            ic_gate_trail=trail,
+    if log_fn:
+        log_fn(
+            "Date gates (IC / disp / weekday / sticky / ic_scale): "
+            "VAL-score live_locate; long-only is compare-only"
         )
-
-    ic_val_always = _gated_lo("val", ("train", "val"), 0, 0.0)
-    ic_val_gated = (
-        _gated_lo("val", ("train", "val"), ic_W, ic_tau) if ic_W else dict(ic_val_always)
+    ls_gates = _date_gate_bundle(
+        frames,
+        cost_book=COST_BOOK_LS,
+        min_names=min_names,
+        vol_target=vol_target,
     )
-    ic_test_always = _gated_lo("test", ("train", "val", "test"), 0, 0.0)
-    ic_test_gated = (
-        _gated_lo("test", ("train", "val", "test"), ic_W, ic_tau)
-        if ic_W
-        else dict(ic_test_always)
+    lo_gates = _date_gate_bundle(
+        frames,
+        cost_book=COST_BOOK_LO,
+        min_names=min_names,
+        vol_target=vol_target,
     )
-    ic_promo = decide_ic_gate_promote(
-        val_always=ic_val_always, val_gated=ic_val_gated, chosen=ic_chosen
-    )
-    ics_fit = fit_ic_scale_on_train(
-        frames["train"], min_names=min_names, vol_target=vol_target
-    )
-    ics_chosen = ics_fit.get("chosen") or {}
-    ics_W = int(ics_chosen.get("window") or 0)
-    ics_tau = float(ics_chosen.get("tau") or 0.0)
-    ics_smax = float(ics_chosen.get("s_max") or 1.0)
-
-    def _scaled_lo(
-        split: str,
-        hist: tuple[str, ...],
-        window: int,
-        tau: float,
-        s_max: float = 1.0,
-    ) -> dict[str, Any]:
-        if frames[split].empty:
-            return {}
-        pred, y, r_on, tz, vol = _wide_from_frame(frames[split])
-        if pred.empty or pred.shape[1] < 2:
-            return {}
-        trail = None
-        if window > 0:
-            parts_p = [
-                frame_to_wide(frames[s], "pred")
-                for s in hist
-                if s in frames and not frames[s].empty
-            ]
-            parts_y = [
-                frame_to_wide(frames[s], "y")
-                for s in hist
-                if s in frames and not frames[s].empty
-            ]
-            if parts_p and parts_y:
-                hp = pd.concat(parts_p).sort_index().groupby(level=0).last()
-                hy = pd.concat(parts_y).sort_index().groupby(level=0).last()
-                trail = trailing_mean_cs_ic(
-                    hp, hy, window=window, min_names=min_names
-                )
-        return _lo_q20_book(
-            pred,
-            y,
-            min_names=min_names,
-            vol_target=vol_target,
-            overnight_r=r_on,
-            turnover_z=tz,
-            vol_level=vol,
-            ic_scale_window=window,
-            ic_scale_tau=tau,
-            ic_scale_trail=trail,
-            ic_scale_smax=s_max,
-        )
-
-    ics_val_always = _scaled_lo("val", ("train", "val"), 0, 0.0)
-    ics_val_scaled = (
-        _scaled_lo("val", ("train", "val"), ics_W, ics_tau, ics_smax)
-        if ics_W
-        else dict(ics_val_always)
-    )
-    ics_test_always = _scaled_lo("test", ("train", "val", "test"), 0, 0.0)
-    ics_test_scaled = (
-        _scaled_lo("test", ("train", "val", "test"), ics_W, ics_tau, ics_smax)
-        if ics_W
-        else dict(ics_test_always)
-    )
-    ics_promo = decide_ic_scale_promote(
-        val_always=ics_val_always, val_scaled=ics_val_scaled, chosen=ics_chosen
-    )
-    disp_fit = fit_disp_gate_on_train(
-        frames["train"], min_names=min_names, vol_target=vol_target
-    )
-    disp_chosen = disp_fit.get("chosen") or {}
-    disp_kind = str(disp_chosen.get("kind") or "")
-    disp_W = int(disp_chosen.get("window") or 0)
-    disp_tau = float(disp_chosen.get("tau") or float("nan"))
-
-    def _disp_lo(split: str, hist: tuple[str, ...], kind: str, window: int, tau: float) -> dict[str, Any]:
-        if frames[split].empty:
-            return {}
-        pred, y, r_on, tz, vol = _wide_from_frame(frames[split])
-        if pred.empty or pred.shape[1] < 2:
-            return {}
-        trail = None
-        if kind:
-            trail = _hist_disp_series(frames, hist, kind, window, min_names)
-        return _lo_q20_book(
-            pred,
-            y,
-            min_names=min_names,
-            vol_target=vol_target,
-            overnight_r=r_on,
-            turnover_z=tz,
-            vol_level=vol,
-            disp_gate_trail=trail,
-            disp_gate_tau=tau,
-            disp_gate_kind=kind,
-            disp_gate_window=window,
-        )
-
-    disp_val_always = _disp_lo("val", ("train", "val"), "", 0, float("nan"))
-    disp_val_gated = (
-        _disp_lo("val", ("train", "val"), disp_kind, disp_W, disp_tau)
-        if disp_kind
-        else dict(disp_val_always)
-    )
-    disp_test_always = _disp_lo("test", ("train", "val", "test"), "", 0, float("nan"))
-    disp_test_gated = (
-        _disp_lo("test", ("train", "val", "test"), disp_kind, disp_W, disp_tau)
-        if disp_kind
-        else dict(disp_test_always)
-    )
-    disp_promo = decide_disp_gate_promote(
-        val_always=disp_val_always, val_gated=disp_val_gated, chosen=disp_chosen
-    )
-    wd_val = weekday_mask_grid(
-        frames["val"], min_names=min_names, vol_target=vol_target
-    )
-    wd_promo = decide_weekday_promote(wd_val)
-    wd_test = weekday_mask_grid(
-        frames["test"], min_names=min_names, vol_target=vol_target
-    )
+    gate_book_compare = compare_date_gate_books(ls_gates, lo_gates)
     if log_fn:
         log_fn("IDEA 3: SPY/market overnight residual (A) vs sector-overnight (B)")
     spy_frames, _spy_min, spy_train_ic, _spy_hedges = _overnight_skip_frames(
@@ -3849,87 +4230,7 @@ def evaluate_overnight_shorting(
         "fixed_alpha": FIXED_ENSEMBLE_ALPHA,
     }
     if log_fn:
-        log_fn("IDEA 6: sticky long-only enter/exit hysteresis (TRAIN-chosen q)")
-    sticky_fit = fit_sticky_on_train(
-        frames["train"], min_names=min_names, vol_target=vol_target
-    )
-    sticky_qe = _as_float((sticky_fit.get("chosen") or {}).get("q_enter"))
-    sticky_qx = _as_float((sticky_fit.get("chosen") or {}).get("q_exit"))
-    have_sticky = (
-        np.isfinite(sticky_qe) and np.isfinite(sticky_qx) and sticky_qx > sticky_qe
-    )
-    train_pred = frame_to_wide(frames["train"], "pred")
-    val_pred = frame_to_wide(frames["val"], "pred")
-    sticky_held_val = (
-        last_sticky_held(
-            train_pred, q_enter=sticky_qe, q_exit=sticky_qx, min_names=min_names
-        )
-        if have_sticky
-        else set()
-    )
-    hist_parts = [p for p in (train_pred, val_pred) if p is not None and not p.empty]
-    hist_tv = pd.concat(hist_parts) if hist_parts else pd.DataFrame()
-    if not hist_tv.empty:
-        hist_tv = hist_tv.sort_index().groupby(level=0).last()
-    sticky_held_test = (
-        last_sticky_held(
-            hist_tv, q_enter=sticky_qe, q_exit=sticky_qx, min_names=min_names
-        )
-        if have_sticky
-        else set()
-    )
-    sticky_val = sticky_grid(
-        frames["val"], min_names=min_names, vol_target=vol_target
-    )
-    sticky_test = sticky_grid(
-        frames["test"], min_names=min_names, vol_target=vol_target
-    )
-    sticky_val_base = score_q20_rebuild(
-        frames["val"], min_names=min_names, vol_target=vol_target
-    )
-    sticky_test_base = score_q20_rebuild(
-        frames["test"], min_names=min_names, vol_target=vol_target
-    )
-    sticky_val_chosen = (
-        score_sticky_book(
-            frames["val"],
-            q_enter=sticky_qe,
-            q_exit=sticky_qx,
-            min_names=min_names,
-            vol_target=vol_target,
-            held0=sticky_held_val,
-        )
-        if have_sticky
-        else dict(sticky_val_base)
-    )
-    sticky_test_chosen = (
-        score_sticky_book(
-            frames["test"],
-            q_enter=sticky_qe,
-            q_exit=sticky_qx,
-            min_names=min_names,
-            vol_target=vol_target,
-            held0=sticky_held_test,
-        )
-        if have_sticky
-        else dict(sticky_test_base)
-    )
-    sticky_promo = decide_sticky_promote(
-        val_baseline=sticky_val_base,
-        val_chosen=sticky_val_chosen,
-        chosen=sticky_fit.get("chosen") or {},
-    )
-    sticky_compare = {
-        "train_grid": sticky_fit,
-        "val_grid": sticky_val,
-        "test_grid": sticky_test,
-        "val_chosen": sticky_val_chosen,
-        "val_baseline": sticky_val_base,
-        "test_chosen": sticky_test_chosen,
-        "test_baseline": sticky_test_base,
-        "train_q_enter": sticky_qe if have_sticky else 0.20,
-        "train_q_exit": sticky_qx if have_sticky else 0.20,
-    }
+        log_fn("IDEA 6: sticky enter/exit hysteresis (TRAIN-chosen; live_locate VAL)")
     sector_promo = decide_sector_promote(
         val_spy=spy_val_lo,
         val_sector=sector_val_lo,
@@ -4095,27 +4396,39 @@ def evaluate_overnight_shorting(
         "book_aligned_fit": book_aligned_fit,
         "conviction_live": conviction_live,
         "conviction_live_promotion": conviction_live_promotion,
-        "ic_gate_fit": ic_fit,
-        "ic_gate_promotion": ic_promo,
-        "ic_gate_val_always": ic_val_always,
-        "ic_gate_val_gated": ic_val_gated,
-        "ic_gate_test_always": ic_test_always,
-        "ic_gate_test_gated": ic_test_gated,
-        "ic_scale_fit": ics_fit,
-        "ic_scale_promotion": ics_promo,
-        "ic_scale_val_always": ics_val_always,
-        "ic_scale_val_scaled": ics_val_scaled,
-        "ic_scale_test_always": ics_test_always,
-        "ic_scale_test_scaled": ics_test_scaled,
-        "disp_gate_fit": disp_fit,
-        "disp_gate_promotion": disp_promo,
-        "disp_gate_val_always": disp_val_always,
-        "disp_gate_val_gated": disp_val_gated,
-        "disp_gate_test_always": disp_test_always,
-        "disp_gate_test_gated": disp_test_gated,
-        "weekday_val_grid": wd_val,
-        "weekday_test_grid": wd_test,
-        "weekday_promotion": wd_promo,
+        "ir_status": "provisional_pending_label_audit",
+        "ir_provisional_note": IR_PROVISIONAL_NOTE,
+        "date_gate_primary_book": COST_BOOK_LS,
+        "gate_book_compare": gate_book_compare,
+        "ic_gate_fit": ls_gates["ic_gate_fit"],
+        "ic_gate_promotion": ls_gates["ic_gate_promotion"],
+        "ic_gate_val_always": ls_gates["ic_gate_val_always"],
+        "ic_gate_val_gated": ls_gates["ic_gate_val_gated"],
+        "ic_gate_test_always": ls_gates["ic_gate_test_always"],
+        "ic_gate_test_gated": ls_gates["ic_gate_test_gated"],
+        "ic_gate_fit_long_only": lo_gates["ic_gate_fit"],
+        "ic_gate_promotion_long_only": lo_gates["ic_gate_promotion"],
+        "ic_scale_fit": ls_gates["ic_scale_fit"],
+        "ic_scale_promotion": ls_gates["ic_scale_promotion"],
+        "ic_scale_val_always": ls_gates["ic_scale_val_always"],
+        "ic_scale_val_scaled": ls_gates["ic_scale_val_scaled"],
+        "ic_scale_test_always": ls_gates["ic_scale_test_always"],
+        "ic_scale_test_scaled": ls_gates["ic_scale_test_scaled"],
+        "ic_scale_fit_long_only": lo_gates["ic_scale_fit"],
+        "ic_scale_promotion_long_only": lo_gates["ic_scale_promotion"],
+        "disp_gate_fit": ls_gates["disp_gate_fit"],
+        "disp_gate_promotion": ls_gates["disp_gate_promotion"],
+        "disp_gate_val_always": ls_gates["disp_gate_val_always"],
+        "disp_gate_val_gated": ls_gates["disp_gate_val_gated"],
+        "disp_gate_test_always": ls_gates["disp_gate_test_always"],
+        "disp_gate_test_gated": ls_gates["disp_gate_test_gated"],
+        "disp_gate_fit_long_only": lo_gates["disp_gate_fit"],
+        "disp_gate_promotion_long_only": lo_gates["disp_gate_promotion"],
+        "weekday_val_grid": ls_gates["weekday_val_grid"],
+        "weekday_test_grid": ls_gates["weekday_test_grid"],
+        "weekday_promotion": ls_gates["weekday_promotion"],
+        "weekday_val_grid_long_only": lo_gates["weekday_val_grid"],
+        "weekday_promotion_long_only": lo_gates["weekday_promotion"],
         "sector_compare": sector_compare,
         "sector_promotion": sector_promo,
         "ensemble_fit": ens_fit,
@@ -4124,9 +4437,12 @@ def evaluate_overnight_shorting(
         "adaptive_ensemble_fit": adp_fit,
         "adaptive_ensemble_compare": adp_compare,
         "adaptive_ensemble_promotion": adp_promo,
-        "sticky_fit": sticky_fit,
-        "sticky_compare": sticky_compare,
-        "sticky_promotion": sticky_promo,
+        "sticky_fit": ls_gates["sticky_fit"],
+        "sticky_compare": ls_gates["sticky_compare"],
+        "sticky_promotion": ls_gates["sticky_promotion"],
+        "sticky_fit_long_only": lo_gates["sticky_fit"],
+        "sticky_compare_long_only": lo_gates["sticky_compare"],
+        "sticky_promotion_long_only": lo_gates["sticky_promotion"],
         "ls_experiment": ls_exp,
         "ls_spec_promotion": ls_spec_promo,
         "live_locate_default_knobs": {
@@ -4162,6 +4478,7 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
         f"  train CS IC={_fmt(payload.get('train_cs_ic'), '+.4f')}",
         "  Overnight-up 60% is settled (STOP 60% / best_val_up=59.07%). "
         "This report is the cost-aware live IR path.",
+        f"  {IR_PROVISIONAL_NOTE}",
         "",
         _split_block("LOCKED VAL (gate)", payload.get("val") or {}),
         "",
@@ -4204,6 +4521,8 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
         f"{'YES' if (payload.get('lo_refine_promotion') or {}).get('promote_lo') else 'NO'}",
         f"  spec = {(payload.get('lo_refine_promotion') or {}).get('spec')}",
         f"  {(payload.get('lo_refine_promotion') or {}).get('reason')}",
+        "",
+        _gate_book_compare_block(payload),
         "",
         _ic_gate_block(payload),
         "",
@@ -4266,6 +4585,32 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
     return _cp1252_safe("\n".join(lines))
 
 
+def _gate_book_compare_block(payload: dict[str, Any]) -> str:
+    cmp_ = payload.get("gate_book_compare") or {}
+    rows = list(cmp_.get("rows") or [])
+    if not rows:
+        return ""
+    lines = [
+        "DATE GATES on live_locate vs long-only (VAL IR/DD; TEST report-only)",
+        f"  primary book = {cmp_.get('primary_book') or COST_BOOK_LS}",
+        f"  {cmp_.get('note') or IR_PROVISIONAL_NOTE}",
+        f"  promote count  live_locate={cmp_.get('n_promote_live_locate')}  "
+        f"long_only={cmp_.get('n_promote_long_only')}",
+        "  gate       live_locate              long_only",
+    ]
+    for row in rows:
+        ls_p = "YES" if row.get("live_locate_promote") else "NO"
+        lo_p = "YES" if row.get("long_only_promote") else "NO"
+        lines.append(
+            f"  {str(row.get('gate') or ''):10} "
+            f"{ls_p:3} dIR {_fmt(row.get('live_locate_ir_delta'), '+.3f')}  "
+            f"dDD {_fmt(row.get('live_locate_dd_delta'), '+.3f')}   "
+            f"{lo_p:3} dIR {_fmt(row.get('long_only_ir_delta'), '+.3f')}  "
+            f"dDD {_fmt(row.get('long_only_dd_delta'), '+.3f')}"
+        )
+    return "\n".join(lines)
+
+
 def _ic_gate_block(payload: dict[str, Any]) -> str:
     promo = payload.get("ic_gate_promotion") or {}
     fit = payload.get("ic_gate_fit") or {}
@@ -4274,13 +4619,15 @@ def _ic_gate_block(payload: dict[str, Any]) -> str:
     vg = payload.get("ic_gate_val_gated") or {}
     ta = payload.get("ic_gate_test_always") or {}
     tg = payload.get("ic_gate_test_gated") or {}
+    book = promo.get("cost_book") or fit.get("cost_book") or COST_BOOK_LS
 
     def _cov(value: Any) -> str:
         x = _as_float(value)
         return "nan%" if not np.isfinite(x) else f"{100.0 * x:.0f}%"
 
     lines = [
-        f"PROMOTE IC-GATE? {'YES' if promo.get('promote_ic_gate') else 'NO'}",
+        f"PROMOTE IC-GATE? {'YES' if promo.get('promote_ic_gate') else 'NO'}  "
+        f"book={book}",
         f"  TRAIN chose W={chosen.get('window')} τ={chosen.get('tau')}  "
         f"cover {_cov(chosen.get('ic_gate_coverage'))}  "
         f"(fit_split={fit.get('fit_split')})",
@@ -4310,8 +4657,10 @@ def _ic_scale_block(payload: dict[str, Any]) -> str:
     vs = payload.get("ic_scale_val_scaled") or {}
     ta = payload.get("ic_scale_test_always") or {}
     ts = payload.get("ic_scale_test_scaled") or {}
+    book = promo.get("cost_book") or fit.get("cost_book") or COST_BOOK_LS
     lines = [
-        f"PROMOTE IC-SCALE? {'YES' if promo.get('promote_ic_scale') else 'NO'}",
+        f"PROMOTE IC-SCALE? {'YES' if promo.get('promote_ic_scale') else 'NO'}  "
+        f"book={book}",
         f"  {fit.get('note')}",
         f"  TRAIN chose W={chosen.get('window')} τ={chosen.get('tau')}  "
         f"s_max={_fmt(chosen.get('s_max'), '.2f')}  "
@@ -4361,8 +4710,10 @@ def _disp_gate_block(payload: dict[str, Any]) -> str:
         x = _as_float(value)
         return "nan%" if not np.isfinite(x) else f"{100.0 * x:.0f}%"
 
+    book = promo.get("cost_book") or fit.get("cost_book") or COST_BOOK_LS
     lines = [
-        f"PROMOTE DISP-GATE? {'YES' if promo.get('promote_disp_gate') else 'NO'}",
+        f"PROMOTE DISP-GATE? {'YES' if promo.get('promote_disp_gate') else 'NO'}  "
+        f"book={book}",
         f"  {fit.get('note')}",
         f"  TRAIN chose {chosen.get('kind')} W={chosen.get('window')} "
         f"q={chosen.get('q')} τ={_fmt(chosen.get('tau'), '.4f')}  "
@@ -4406,8 +4757,10 @@ def _weekday_block(payload: dict[str, Any]) -> str:
             f"{int(_as_float(r.get('weekday_n_dates'), 0.0))}"
         )
 
+    book = promo.get("cost_book") or val.get("cost_book") or COST_BOOK_LS
     lines = [
-        f"PROMOTE WEEKDAY MASK? {'YES' if promo.get('promote_weekday') else 'NO'}",
+        f"PROMOTE WEEKDAY MASK? {'YES' if promo.get('promote_weekday') else 'NO'}  "
+        f"book={book}",
         f"  {val.get('note')}",
         f"  {promo.get('reason')}",
         f"  VAL always-on  IR {_fmt(base.get('unlevered_net_ir'), '+.3f')}  "
@@ -4614,9 +4967,10 @@ def _sticky_block(payload: dict[str, Any]) -> str:
             f"cover {_fmt(100.0 * _as_float(r.get('coverage')), '.0f')}%"
         )
 
+    book = promo.get("cost_book") or fit.get("cost_book") or COST_BOOK_LS
     lines = [
         f"PROMOTE STICKY HYSTERESIS? "
-        f"{'YES' if promo.get('promote_sticky') else 'NO'}",
+        f"{'YES' if promo.get('promote_sticky') else 'NO'}  book={book}",
         f"  {fit.get('note') or val.get('note')}",
         f"  TRAIN chose e={_fmt(100.0 * _as_float(train_ch.get('q_enter')), '.0f')}% "
         f"x={_fmt(100.0 * _as_float(train_ch.get('q_exit')), '.0f')}%  "

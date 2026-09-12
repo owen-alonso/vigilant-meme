@@ -125,14 +125,14 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/be
 # LS haircut experiment (NOT default): HTB shorts at half size, short NAV 0.30
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --live-costs --ls-haircut-experiment
-# causal trailing overnight CS-IC trade gate (TRAIN-fit W,τ; default off)
+# causal trailing overnight CS-IC trade gate (TRAIN-fit W,τ; VAL-gated on live_locate)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
-  --holding overnight --live-costs --long-only --ic-gate-window 60 --ic-gate-tau 0.0
-# causal Friday / weekend weekday mask (VAL-gated; default always-on)
+  --holding overnight --live-costs --ic-gate-window 60 --ic-gate-tau 0.0
+# causal Friday / weekend weekday mask (VAL-gated on live_locate; default always-on)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
-  --holding overnight --live-costs --long-only --weekday-mask flat_friday
+  --holding overnight --live-costs --weekday-mask flat_friday
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
-  --holding overnight --live-costs --long-only --weekday-mask weekend_only
+  --holding overnight --live-costs --weekday-mask weekend_only
 # sector-overnight residual is the default skip (--sector-residual).
 # SPY-only overnight residual baseline (A) for the VAL compare:
 python -m forecast.training --universe liquid --interval daily --skip-only \
@@ -140,13 +140,13 @@ python -m forecast.training --universe liquid --interval daily --skip-only \
   --checkpoint-dir checkpoints/forecast_ridge_overnight_spy
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight_spy/best.pt \
   --holding overnight --live-costs --long-only
-# causal CS-dispersion stress gate (TRAIN-fit kind/W/τ; default off)
+# causal CS-dispersion stress gate (TRAIN-fit kind/W/τ; VAL-gated on live_locate)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
-  --holding overnight --live-costs --long-only --disp-gate-kind cc --disp-gate-window 1 --disp-gate-tau 0.02
+  --holding overnight --live-costs --disp-gate-kind cc --disp-gate-window 1 --disp-gate-tau 0.02
 # overnight ⊕ close-to-close rank ensemble is TRAIN-chosen α, VAL-gated (α=1 default)
 # causal adaptive α_t (trailing CS IC of overnight vs c2c) is TRAIN W/rule, VAL-gated (default off)
-# sticky long-only enter/exit hysteresis is TRAIN-chosen, VAL-gated (default always-rebuild q20)
-# soft trailing CS-IC gross scale is TRAIN-chosen, VAL-gated (default off / full q20)
+# sticky enter/exit hysteresis is TRAIN-chosen, VAL-gated on live_locate (default always-rebuild q20)
+# soft trailing CS-IC gross scale is TRAIN-chosen, VAL-gated on live_locate (default off / full q20)
 python -m forecast.training --universe liquid --interval daily --skip-only \
   --label-return close --checkpoint-dir checkpoints/forecast_ridge
 # harsh auction stress
