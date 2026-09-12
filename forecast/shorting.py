@@ -181,8 +181,8 @@ python -m forecast.training --universe liquid --interval daily --skip-only \\
   --label-return close --checkpoint-dir checkpoints/forecast_ridge
 python scripts/overnight_shorting.py --data-dir data --universe liquid \\
     --json checkpoints/forecast_ridge_overnight/shorting.json
-# IDEA 8: causal adaptive α_t from trailing CS IC of A vs B (TRAIN W/rule).
-# Compare vs fixed α=0.70 and α=1. VAL gate, TEST report-only. Default off.
+# IDEA 8: causal adaptive alpha_t from trailing CS IC of A vs B (TRAIN W/rule).
+# Compare vs fixed alpha=0.70 and alpha=1. VAL gate, TEST report-only. Default off.
 python scripts/overnight_shorting.py --data-dir data --universe liquid \\
     --json checkpoints/forecast_ridge_overnight/shorting.json
 # IDEA 6: sticky long-only enter/exit (TRAIN-chosen; default off / always-rebuild q20)
