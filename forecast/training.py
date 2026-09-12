@@ -761,6 +761,47 @@ def apply_ridge_skip(
     return ic
 
 
+def apply_pup_skip(
+    model: ReturnForecaster,
+    bundle: dict[str, Any],
+    train_cfg: ForecastTrainConfig,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Fit the (2a) P(up) logistic on TRAIN last-bar features. VAL never enters."""
+    if not bool(getattr(train_cfg, "pup_head", False)):
+        return {}
+    from forecast.pup import (
+        evaluate_pup,
+        fit_pup_logistic,
+        labelled_pup_rows,
+    )
+
+    x, y, _dates = labelled_pup_rows(
+        bundle["train_symbols"],
+        bundle["feature_mean"],
+        bundle["feature_std"],
+    )
+    spec = fit_pup_logistic(
+        x, y, ridge=float(getattr(train_cfg, "pup_ridge", 1.0) or 1.0)
+    )
+    weights = np.asarray(spec["weights"], dtype=np.float64)
+    bias = float(spec["bias"])
+    with torch.no_grad():
+        w = torch.from_numpy(weights).to(
+            device=device, dtype=model.up_skip.weight.dtype
+        ).unsqueeze(0)
+        if w.shape == model.up_skip.weight.shape:
+            model.up_skip.weight.copy_(w)
+            model.up_skip.bias.copy_(
+                torch.tensor([bias], device=device, dtype=model.up_skip.bias.dtype)
+            )
+    model.up_skip.weight.requires_grad_(False)
+    model.up_skip.bias.requires_grad_(False)
+    payload = evaluate_pup(bundle, spec)
+    payload["fit"]["copied_to"] = "up_skip"
+    return payload
+
+
 def _fmt(metrics: dict[str, float] | None) -> str:
     """Pretty-print eval metrics. Empty / partial dicts must not raise."""
     if not metrics:
@@ -860,7 +901,9 @@ def _train(
             f"test_end={getattr(data_cfg, 'test_end', '') or 'open'} "
             f"time_upweight={bool(getattr(train_cfg, 'time_upweight_recent', False))} "
             f"session_hl={float(getattr(train_cfg, 'time_upweight_halflife_sessions', 0.0) or 0.0)} "
-            f"num_workers={train_cfg.num_workers}"
+            f"num_workers={train_cfg.num_workers} "
+            f"pup_head={bool(getattr(train_cfg, 'pup_head', False))} "
+            f"mmap={bundle.get('mmap_manifest') or bundle.get('mmap') or 'off'}"
         )
         log_fn(formula_log_line(
             getattr(data_cfg, "label_return", "close"),
@@ -886,6 +929,11 @@ def _train(
     if log_fn and np.isfinite(skip_ic):
         kind = "CS" if train_cfg.ridge_cs_demean else "pooled"
         log_fn(f"ridge skip in-sample {kind} IC={skip_ic:+.4f} (train labelled bars)")
+    pup_payload = apply_pup_skip(model, bundle, train_cfg, device)
+    if pup_payload and log_fn:
+        from forecast.pup import format_pup_block
+
+        log_fn(format_pup_block(pup_payload))
     if log_fn and not bundle.get("cross_section"):
         log_fn(
             "NOTE: cross-section dataset is off "
@@ -1054,8 +1102,11 @@ def _train(
             "symbols": bundle["meta"],
             "cross_section": bundle.get("cross_section", False),
             "skip_only": True,
+            "pup": pup_payload,
         }
         (ckpt_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
+        if pup_payload:
+            (ckpt_dir / "pup.json").write_text(json.dumps(pup_payload, indent=2, default=str))
         if log_fn:
             log_fn(f"skip-only run wrote {ckpt_dir / 'best.pt'}")
         return summary
@@ -1264,6 +1315,7 @@ def _train(
         "symbols": bundle["meta"],
         "cross_section": bundle.get("cross_section", False),
         "skip_only": False,
+        "pup": pup_payload,
     }
     if model_cfg.dynamic_weights:
         dyn_health = model.collect_dynamic_health(after_training=True)
@@ -1451,6 +1503,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--init-checkpoint",
         default="",
         help="warm-start encoder weights (skip-only still refits the linear skip)",
+    )
+    g.add_argument(
+        "--mmap-manifest",
+        default="",
+        help="Data Manager mmap_manifest.json (default: data/_panel_cache/"
+        "mmap_manifest.json when present). Never cs_train_*.pt.",
+    )
+    g.add_argument(
+        "--no-mmap",
+        action="store_true",
+        help="rebuild panels from parquet even if a mmap manifest exists",
+    )
+    g.add_argument(
+        "--write-mmap",
+        action="store_true",
+        help="after parquet build, write data/_panel_cache mmap and train from it",
+    )
+    g.add_argument(
+        "--pit-dir",
+        default="",
+        help="PIT side-tape dir (default: <data-dir>/_pit). "
+        "next_split_days==1 drops overnight labels",
+    )
+    g.add_argument(
+        "--pup-head",
+        action="store_true",
+        help="(2a) fit a direct overnight-up P(up) logistic head (not a sleeve grid)",
+    )
+    g.add_argument(
+        "--pup-ridge",
+        type=float,
+        default=1.0,
+        help="ridge on the P(up) logistic slopes (bias unpenalized)",
     )
 
     g = p.add_argument_group("model")
@@ -1787,6 +1872,10 @@ def configs_from_cli(
         industry_residual=args.industry_residual,
         label_return=_cli_label_return(args),
         fill_minutes=_cli_fill_minutes(args),
+        mmap_manifest=str(getattr(args, "mmap_manifest", "") or ""),
+        use_mmap=not bool(getattr(args, "no_mmap", False)),
+        write_mmap=bool(getattr(args, "write_mmap", False)),
+        pit_dir=str(getattr(args, "pit_dir", "") or ""),
     )
     model_cfg = ForecastModelConfig(
         n_features=len(FEATURE_NAMES),
@@ -1850,6 +1939,8 @@ def configs_from_cli(
         log_interval=args.log_interval,
         num_workers=args.num_workers,
         checkpoint_dir=args.checkpoint_dir,
+        pup_head=bool(getattr(args, "pup_head", False)),
+        pup_ridge=float(getattr(args, "pup_ridge", 1.0) or 1.0),
         early_stop_evals=args.early_stop_evals,
         lr_plateau_evals=args.lr_plateau_evals,
         lr_plateau_factor=args.lr_plateau_factor,

@@ -213,7 +213,36 @@ Fine-tune **train** only applies `time_upweight_recent` with half-life **126 ses
 
 **VAL-gate** the FT checkpoint on **fine-tune val cost-aware IR** (`live_locate` / overnight `--live-costs`), not hit-rate, vs the prior overnight baseline (~**+5.58** liquid live_locate). TEST is report-only. Keep live_locate **q20 / haircut 0.50 / short 0.50** unless that VAL IR clearly promotes. Do not reopen the overnight-up 60% grid or expand the Mamba blend.
 
-Windows desktop: `--num-workers 0` (default). Do not pickle the 6.7GB CS / `data/_panel_cache/` panel per worker.
+Windows desktop: `--num-workers 0` (default). Do not pickle the 6.7GB CS / `data/_panel_cache/` panel per worker. Do **not** load `cs_train_*.pt`.
+
+### mmap panel feed + (2a) P(up) overnight head
+
+Cut (0) skip-only FT was Eval-NO (live_locate IR +0.723 / DD -1.127 vs +5.58 / -0.95). Do not promote that checkpoint. This cut wires the Data Manager mmap feed into CS batching and adds a **direct** overnight-up classifier — not a residual-skip rank grid (closed) and not a bigger Mamba.
+
+Manifest: `data/_panel_cache/mmap_manifest.json`. Load API: `load_manifest`, `load_symbol_mmap(..., mmap_mode="r")` → float32 features `[T, F]` memmap + labels. PIT side-tape: `data/_pit/` (`next_split_days==1` nulls overnight labels).
+
+```bash
+# write mmap once (Data Manager / parquet → memmap). num_workers=0
+python -m forecast.panel_mmap --data-dir data --universe liquid --label-return overnight --write
+
+# train residual skip + (2a) P(up) head from mmap (no DataFrame rebuild, no cs_train_*.pt)
+python -m forecast.training --universe liquid --interval daily --skip-only \
+  --label-return overnight --pup-head --num-workers 0 \
+  --mmap-manifest data/_panel_cache/mmap_manifest.json \
+  --checkpoint-dir checkpoints/forecast_pup_overnight
+
+# VAL overnight-up % + cover (hit-rate gate). TEST report-only.
+python scripts/overnight_pup.py --data-dir data --universe liquid \
+  --checkpoint checkpoints/forecast_pup_overnight/best.pt \
+  --json checkpoints/forecast_pup_overnight/pup.json
+python scripts/overnight_pup.py --synthetic   # cloud CI only
+
+# Book live_locate IR/DD is report-only on this cut (gate remains vs +5.58)
+python -m forecast.backtest --checkpoint checkpoints/forecast_pup_overnight/best.pt \
+  --holding overnight --live-costs
+```
+
+Promote P(up) only if locked VAL overnight-up ≥ 60% at cover ≥ 5% of the full frame. One sleeve rule (rank P(up), cover floor) — no overnight-up q-grid. If it misses, report the honest lift vs skip-rank 59.07%. (2b) cost-aware ranking / IR loss can follow; it does not block (2a).
 
 ```bash
 # regime heads / surgical vol+CS-product drop / trailing readout window (all lost on val)
@@ -348,7 +377,11 @@ Not on `-h` but fixed in code (and stored in the checkpoint): vol EWM half-life 
 | `--seed` | `42` | Python / NumPy / PyTorch seed. |
 | `--eval-interval` | `250` | Validate (and maybe write `best.pt`) every N steps. |
 | `--log-interval` | `25` | Print train loss / grad / LR every N steps. |
-| `--num-workers` | `0` | DataLoader workers. Keep `0` on Windows unless you know you need more. |
+| `--num-workers` | `0` | DataLoader workers. Keep `0` on Windows unless you know you need more. Do not pickle mmap / `cs_train_*.pt`. |
+| `--mmap-manifest` | auto | `data/_panel_cache/mmap_manifest.json` when present. CS batches read memmaps. |
+| `--write-mmap` | off | After a parquet build, write the mmap cache and train from it. |
+| `--pup-head` | off | (2a) direct overnight-up P(up) logistic. Not a sleeve grid. |
+| `--pit-dir` | `data/_pit` | Side-tape; `next_split_days==1` drops overnight labels. |
 | `--checkpoint-dir` | `checkpoints/forecast` | `best.pt`, `last.pt`, `summary.json`. Relative paths are under the **repo root**. |
 | `--early-stop-evals` | `8` | Stop if val IC does not improve for this many evals. |
 | `--cpu` | off | Force CPU even if CUDA is available. |

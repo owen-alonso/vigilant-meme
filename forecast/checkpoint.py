@@ -33,8 +33,11 @@ def _load_forecaster_weights(model: ReturnForecaster, state_dict: dict[str, Any]
     incompatible = model.load_state_dict(state_dict, strict=False)
     missing = list(incompatible.missing_keys)
     unexpected = list(incompatible.unexpected_keys)
+    optional_pfx = ("skip.", "up_skip.")
     skip_missing = [k for k in missing if k.startswith("skip.")]
-    other_missing = [k for k in missing if not k.startswith("skip.")]
+    up_missing = [k for k in missing if k.startswith("up_skip.")]
+    other_missing = [k for k in missing if not k.startswith(optional_pfx)]
+    unexpected = [k for k in unexpected if not k.startswith(optional_pfx)]
     if other_missing or unexpected:
         raise RuntimeError(
             "checkpoint does not match the forecast model "
@@ -45,6 +48,11 @@ def _load_forecaster_weights(model: ReturnForecaster, state_dict: dict[str, Any]
         nn.init.zeros_(model.skip.bias)
         model.skip.weight.requires_grad_(False)
         model.skip.bias.requires_grad_(False)
+    if up_missing:
+        nn.init.zeros_(model.up_skip.weight)
+        nn.init.zeros_(model.up_skip.bias)
+        model.up_skip.weight.requires_grad_(False)
+        model.up_skip.bias.requires_grad_(False)
 
 
 def save_forecast_checkpoint(

@@ -480,6 +480,15 @@ def compute_features(grid: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     forward = _forward_log_return(out, log_close, cfg)
     out["target_raw"] = forward
     out["target"] = forward / out["scale"]
+    # Raw overnight gap is always stored (P(up) / PIT). Residualization
+    # must not overwrite it — next open is a label, never a feature.
+    out["overnight_r"] = forward_log_return(
+        close=out["close"],
+        open_px=out["open"],
+        kind="overnight",
+        horizon=int(cfg.horizon),
+        fill_minutes=0,
+    )
     horizon_traded = out["traded"].shift(-cfg.horizon)
     out["horizon_traded"] = horizon_traded.fillna(0.0)
 
@@ -930,11 +939,13 @@ class SymbolArrays:
     """Contiguous per-symbol arrays for one chronological split."""
 
     symbol: str
-    features: np.ndarray  # [T, F] float32
+    features: np.ndarray  # [T, F] float32 (may be a read-only memmap)
     target: np.ndarray  # [T]    float32, volatility units
     scale: np.ndarray  # [T]    float32, target -> log-return multiplier
     valid: np.ndarray  # [T]    bool
     dates: np.ndarray | None = None  # [T] int64 days since epoch
+    overnight_r: np.ndarray | None = None  # [T] raw close_t -> open_{t+h}
+    next_split_days: np.ndarray | None = None  # [T] PIT side-tape; 1 = drop
 
 
 def _date_keys(panel: pd.DataFrame) -> np.ndarray:
@@ -946,6 +957,12 @@ def _date_keys(panel: pd.DataFrame) -> np.ndarray:
 
 
 def panel_to_arrays(panel: pd.DataFrame, symbol: str) -> SymbolArrays:
+    overnight = None
+    if "overnight_r" in panel.columns:
+        overnight = panel["overnight_r"].to_numpy(dtype=np.float32)
+    split_days = None
+    if "next_split_days" in panel.columns:
+        split_days = panel["next_split_days"].to_numpy(dtype=np.int16)
     return SymbolArrays(
         symbol=symbol,
         features=panel[list(FEATURE_NAMES)].to_numpy(dtype=np.float32),
@@ -953,6 +970,8 @@ def panel_to_arrays(panel: pd.DataFrame, symbol: str) -> SymbolArrays:
         scale=panel["scale"].to_numpy(dtype=np.float32),
         valid=panel["valid"].to_numpy(dtype=bool),
         dates=_date_keys(panel) if "datetime" in panel.columns else None,
+        overnight_r=overnight,
+        next_split_days=split_days,
     )
 
 
@@ -1198,6 +1217,38 @@ def _arrays_with_valid(src: SymbolArrays, valid: np.ndarray) -> SymbolArrays:
         scale=src.scale,
         valid=valid,
         dates=src.dates,
+        overnight_r=src.overnight_r,
+        next_split_days=src.next_split_days,
+    )
+
+
+def _ts_to_day(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    ts = pd.Timestamp(value)
+    return int((ts.normalize() - pd.Timestamp("1970-01-01")) // pd.Timedelta("1D"))
+
+
+def _apply_pit_to_base(base: SymbolArrays, tape: dict[int, float] | None) -> SymbolArrays:
+    from forecast.pit import mask_overnight_pit, next_split_days_aligned
+
+    length = int(len(base.target))
+    days = base.next_split_days
+    if days is None and tape:
+        days = next_split_days_aligned(base.dates, tape, length=length)
+    if days is None:
+        return base
+    return SymbolArrays(
+        symbol=base.symbol,
+        features=base.features,
+        target=base.target,
+        scale=base.scale,
+        valid=mask_overnight_pit(base.valid, days),
+        dates=base.dates,
+        overnight_r=base.overnight_r,
+        next_split_days=np.asarray(days, dtype=np.int16),
     )
 
 
@@ -1243,6 +1294,284 @@ def global_session_cuts(
     return sessions[cut_train], sessions[cut_val]
 
 
+def _global_date_cuts(bases: dict[str, SymbolArrays], cfg: DataConfig) -> tuple[int, int]:
+    chunks = [np.unique(b.dates) for b in bases.values() if b.dates is not None and len(b.dates)]
+    if not chunks:
+        raise ValueError("no dates on mmap/array bases for a calendar split")
+    sessions = np.unique(np.concatenate(chunks))
+    cut_train, cut_val = split_session_bounds(len(sessions), cfg)
+    return int(sessions[cut_train]), int(sessions[cut_val])
+
+
+def _split_bases(
+    bases: dict[str, SymbolArrays],
+    cfg: DataConfig,
+    *,
+    path_by_symbol: dict[str, Path] | None = None,
+    log_fn: Any | None = None,
+) -> tuple[list[SymbolArrays], list[SymbolArrays], list[SymbolArrays], list[dict[str, Any]]]:
+    """Apply calendar cuts + PIT-aware valid masks. Features stay mmap-backed."""
+    raw_from = str(getattr(cfg, "train_from", "") or "").strip()
+    train_from_day = _ts_to_day(raw_from) if raw_from else None
+    pinned = explicit_calendar_cuts(cfg)
+    if pinned is not None:
+        train_end_day = _ts_to_day(pinned[0])
+        val_end_day = _ts_to_day(pinned[1])
+        test_end_day = _ts_to_day(pinned[2]) if pinned[2] is not None else None
+        per_symbol = False
+    elif cfg.global_calendar_split and cfg.is_calendar() and len(bases) >= 1:
+        train_end_day, val_end_day = _global_date_cuts(bases, cfg)
+        test_end_day = None
+        per_symbol = False
+    else:
+        train_end_day = val_end_day = test_end_day = None
+        per_symbol = True
+
+    train_syms: list[SymbolArrays] = []
+    val_syms: list[SymbolArrays] = []
+    test_syms: list[SymbolArrays] = []
+    meta: list[dict[str, Any]] = []
+    paths = path_by_symbol or {}
+    bench = str(cfg.benchmark_symbol or "").upper()
+
+    for symbol, base in bases.items():
+        dates = base.dates
+        if dates is None:
+            raise ValueError(f"{symbol}: panel arrays need dates for CS splits")
+        dates_i = np.asarray(dates, dtype=np.int64)
+        sessions = np.unique(dates_i)
+        if per_symbol:
+            cut_train, cut_val = split_session_bounds(len(sessions), cfg)
+            sym_train_end, sym_val_end = int(sessions[cut_train]), int(sessions[cut_val])
+        else:
+            sym_train_end, sym_val_end = int(train_end_day), int(val_end_day)
+        is_train = dates_i < sym_train_end
+        if train_from_day is not None:
+            is_train = is_train & (dates_i >= int(train_from_day))
+        is_val = (dates_i >= sym_train_end) & (dates_i < sym_val_end)
+        is_test = dates_i >= sym_val_end
+        if test_end_day is not None:
+            is_test = is_test & (dates_i < int(test_end_day))
+        train_syms.append(
+            _arrays_with_valid(base, _mask_split_valid(base.valid, is_train, cfg))
+        )
+        val_syms.append(
+            _arrays_with_valid(base, _mask_split_valid(base.valid, is_val, cfg))
+        )
+        test_syms.append(
+            _arrays_with_valid(base, _mask_split_valid(base.valid, is_test, cfg))
+        )
+        meta.append(
+            {
+                "symbol": symbol,
+                "path": str(paths.get(symbol, "")),
+                "sessions": int(len(sessions)),
+                "grid_bars": int(len(base.target)),
+                "valid_bars": int(np.asarray(base.valid).sum()),
+                "train_end": str(pd.Timestamp("1970-01-01") + pd.Timedelta(days=int(sym_train_end)))[:10],
+                "val_end": str(pd.Timestamp("1970-01-01") + pd.Timedelta(days=int(sym_val_end)))[:10],
+                "test_end": (
+                    str(pd.Timestamp("1970-01-01") + pd.Timedelta(days=int(test_end_day)))[:10]
+                    if test_end_day is not None
+                    else ""
+                ),
+                "benchmark": bench,
+                "sector_residual": bool(getattr(cfg, "sector_residual", False)),
+                "hedge": hedge_symbol_for(
+                    symbol,
+                    sector_residual=bool(getattr(cfg, "sector_residual", False)),
+                    benchmark=bench,
+                ),
+                "train_from": raw_from,
+                "mmap": bool(isinstance(base.features, np.memmap)),
+            }
+        )
+        if log_fn:
+            m = meta[-1]
+            log_fn(
+                f"{symbol}: {m['sessions']} sessions, {m['grid_bars']} grid bars, "
+                f"{m['valid_bars']} labelled | train<{m['train_end']} "
+                f"val<{m['val_end']} test"
+                + (f"<{m['test_end']}" if m.get("test_end") else f">= {m['val_end']}")
+                + (" [mmap]" if m.get("mmap") else "")
+            )
+    return train_syms, val_syms, test_syms, meta
+
+
+def _finalize_bundle(
+    cfg: DataConfig,
+    train_syms: list[SymbolArrays],
+    val_syms: list[SymbolArrays],
+    test_syms: list[SymbolArrays],
+    meta: list[dict[str, Any]],
+    *,
+    log_fn: Any | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    mean, std = feature_stats(train_syms)
+    last_bar = bool(cfg.eval_last_bar) and cfg.is_calendar()
+    eval_stride = 1 if last_bar else max(1, cfg.seq_len - cfg.min_context)
+    common = {
+        "feature_mean": mean,
+        "feature_std": std,
+        "min_context": cfg.min_context,
+        "last_bar_only": last_bar,
+    }
+    use_cs = (
+        last_bar
+        and cfg.is_calendar()
+        and len(train_syms) >= int(cfg.cross_section_min_names)
+    )
+    datasets: dict[str, Any] | None = None
+    if use_cs:
+        datasets = {
+            "train": CrossSectionDataset(
+                train_syms,
+                cfg.seq_len,
+                feature_mean=mean,
+                feature_std=std,
+                min_names=cfg.cross_section_min_names,
+            ),
+            "val": CrossSectionDataset(
+                val_syms,
+                cfg.seq_len,
+                feature_mean=mean,
+                feature_std=std,
+                min_names=cfg.cross_section_min_names,
+            ),
+            "test": CrossSectionDataset(
+                test_syms,
+                cfg.seq_len,
+                feature_mean=mean,
+                feature_std=std,
+                min_names=cfg.cross_section_min_names,
+            ),
+        }
+        if log_fn:
+            log_fn(
+                f"cross-section dates: train={len(datasets['train'])} "
+                f"val={len(datasets['val'])} test={len(datasets['test'])} "
+                f"(min_names={cfg.cross_section_min_names})"
+            )
+        if len(datasets["train"]) == 0 or len(datasets["val"]) == 0:
+            if log_fn:
+                log_fn(
+                    "cross-section empty on train/val; falling back to last-bar sequences"
+                )
+            use_cs = False
+            datasets = None
+    if not use_cs:
+        datasets = {
+            "train": SequenceDataset(
+                train_syms,
+                cfg.seq_len,
+                cfg.stride,
+                supervise_last=cfg.supervise_last,
+                **common,
+            ),
+            "val": SequenceDataset(
+                val_syms, cfg.seq_len, eval_stride, supervise_last=1, **common
+            ),
+            "test": SequenceDataset(
+                test_syms, cfg.seq_len, eval_stride, supervise_last=1, **common
+            ),
+        }
+    if log_fn:
+        for name, ds in datasets.items():
+            log_fn(f"{name}: {len(ds)} windows, {ds.n_valid_bars} labelled bars")
+    raw_from = str(getattr(cfg, "train_from", "") or "").strip()
+    out = {
+        "datasets": datasets,
+        "train_symbols": train_syms,
+        "val_symbols": val_syms,
+        "test_symbols": test_syms,
+        "feature_mean": mean,
+        "feature_std": std,
+        "feature_names": list(FEATURE_NAMES),
+        "meta": meta,
+        "cross_section": use_cs,
+        "cs_min_names": int(cfg.cross_section_min_names),
+        "universe": cfg.universe,
+        "equities_only": bool(getattr(cfg, "equities_only", False)),
+        "train_from": raw_from,
+        "train_end": str(getattr(cfg, "train_end", "") or ""),
+        "val_end": str(getattr(cfg, "val_end", "") or ""),
+        "test_end": str(getattr(cfg, "test_end", "") or ""),
+        "n_trading_names": int(len(train_syms)),
+        "label_return": normalize_label_return(getattr(cfg, "label_return", "close")),
+    }
+    if extra:
+        out.update(extra)
+    return out
+
+
+def _pit_tape_for_cfg(cfg: DataConfig, symbols: Sequence[str]) -> dict[str, dict[int, float]]:
+    from forecast.pit import load_pit_side_tape
+
+    pit_dir = str(getattr(cfg, "pit_dir", "") or "").strip() or None
+    return load_pit_side_tape(cfg.data_dir, pit_dir=pit_dir, symbols=symbols)
+
+
+def _build_datasets_from_mmap(
+    cfg: DataConfig,
+    manifest_path: Path,
+    *,
+    log_fn: Any | None = None,
+) -> dict[str, Any]:
+    """CS train path: memmap panels only. No DataFrame rebuild, no ``.pt``."""
+    from forecast.panel_mmap import (
+        list_mmap_symbols,
+        load_manifest,
+        load_symbol_mmap,
+        symbol_arrays_from_mmap,
+    )
+    from forecast.universe import is_equity_name
+
+    payload = load_manifest(manifest_path)
+    allowed = allowed_symbols(cfg.universe)
+    bench = str(cfg.benchmark_symbol or "").upper()
+    tape = _pit_tape_for_cfg(cfg, list_mmap_symbols(payload))
+    bases: dict[str, SymbolArrays] = {}
+    for symbol in list_mmap_symbols(payload):
+        if allowed is not None and symbol not in allowed:
+            continue
+        if symbol == bench:
+            continue
+        if bool(getattr(cfg, "equities_only", False)) and not is_equity_name(symbol):
+            continue
+        packed = load_symbol_mmap(payload, symbol, mmap_mode="r")
+        if not isinstance(packed.features, np.memmap):
+            raise RuntimeError(f"{symbol}: load_symbol_mmap did not return a memmap")
+        if packed.features.dtype != np.float32:
+            raise RuntimeError(f"{symbol}: mmap features must be float32")
+        base = symbol_arrays_from_mmap(packed)
+        bases[symbol] = _apply_pit_to_base(base, tape.get(symbol))
+    if not bases:
+        raise FileNotFoundError(
+            f"mmap manifest {manifest_path} had no trading names "
+            f"(universe={cfg.universe!r})"
+        )
+    if log_fn:
+        log_fn(
+            f"mmap feed {manifest_path}: {len(bases)} trading names "
+            f"(no DataFrame rebuild, mmap_mode=r, num_workers=0)"
+        )
+    train_syms, val_syms, test_syms, meta = _split_bases(bases, cfg, log_fn=log_fn)
+    return _finalize_bundle(
+        cfg,
+        train_syms,
+        val_syms,
+        test_syms,
+        meta,
+        log_fn=log_fn,
+        extra={
+            "mmap_manifest": str(manifest_path),
+            "mmap": True,
+            "cs_train_pt": False,
+        },
+    )
+
+
 def build_datasets(
     cfg: DataConfig,
     *,
@@ -1254,8 +1583,34 @@ def build_datasets(
     Calendar splits share one ``train_end`` / ``val_end``. Windows run over the
     full series so a val last bar can use train history. The benchmark ticker
     (default SPY) is a market feature / residual label, not a training name.
+
+    When ``data/_panel_cache/mmap_manifest.json`` exists (or
+    ``cfg.mmap_manifest``), the CS train path reads mmap'd panels and does
+    **not** rebuild DataFrames or load ``cs_train_*.pt``.
     """
     from forecast.diagnostics import assert_calendar_price_quality
+    from forecast.panel_mmap import (
+        assert_no_cs_train_pt,
+        resolve_mmap_manifest,
+        write_mmap_cache,
+        load_manifest,
+        load_symbol_mmap,
+        symbol_arrays_from_mmap,
+    )
+
+    assert_no_cs_train_pt(getattr(cfg, "mmap_manifest", "") or None)
+    if bool(getattr(cfg, "use_mmap", True)):
+        try:
+            manifest_path = resolve_mmap_manifest(
+                cfg.data_dir,
+                str(getattr(cfg, "mmap_manifest", "") or "") or None,
+            )
+        except FileNotFoundError:
+            if str(getattr(cfg, "mmap_manifest", "") or "").strip():
+                raise
+            manifest_path = None
+        if manifest_path is not None and not bool(getattr(cfg, "write_mmap", False)):
+            return _build_datasets_from_mmap(cfg, manifest_path, log_fn=log_fn)
 
     paths = list(paths) if paths is not None else discover_symbol_files(
         cfg.data_dir, interval=cfg.interval
@@ -1311,6 +1666,7 @@ def build_datasets(
     raw_from = str(getattr(cfg, "train_from", "") or "").strip()
     if raw_from:
         train_from_ts = pd.Timestamp(raw_from)
+    tape = _pit_tape_for_cfg(cfg, list(trade_panels))
     if not trade_panels:
         raise ValueError(
             f"no trading names after filters (benchmark={bench}, "
@@ -1341,6 +1697,7 @@ def build_datasets(
     val_syms: list[SymbolArrays] = []
     test_syms: list[SymbolArrays] = []
     meta: list[dict[str, Any]] = []
+    bases: dict[str, SymbolArrays] = {}
 
     for symbol, panel in trade_panels.items():
         path = path_by_symbol[symbol]
@@ -1360,8 +1717,9 @@ def build_datasets(
         is_test = (panel["session"] >= sym_val_end).to_numpy()
         if test_end is not None:
             is_test = is_test & (panel["session"] < test_end).to_numpy()
-        base = panel_to_arrays(panel, symbol)
-        base_valid = panel["valid"].to_numpy(dtype=bool)
+        base = _apply_pit_to_base(panel_to_arrays(panel, symbol), tape.get(symbol))
+        bases[symbol] = base
+        base_valid = base.valid
         train_syms.append(
             _arrays_with_valid(base, _mask_split_valid(base_valid, is_train, cfg))
         )
@@ -1427,97 +1785,50 @@ def build_datasets(
                         "data-generating process as train."
                     )
 
-    mean, std = feature_stats(train_syms)
-    last_bar = bool(cfg.eval_last_bar) and cfg.is_calendar()
-    eval_stride = 1 if last_bar else max(1, cfg.seq_len - cfg.min_context)
-    common = {
-        "feature_mean": mean,
-        "feature_std": std,
-        "min_context": cfg.min_context,
-        "last_bar_only": last_bar,
-    }
-    use_cs = (
-        last_bar
-        and cfg.is_calendar()
-        and len(train_syms) >= int(cfg.cross_section_min_names)
-    )
-    if use_cs:
-        datasets = {
-            "train": CrossSectionDataset(
-                train_syms,
-                cfg.seq_len,
-                feature_mean=mean,
-                feature_std=std,
-                min_names=cfg.cross_section_min_names,
-            ),
-            "val": CrossSectionDataset(
-                val_syms,
-                cfg.seq_len,
-                feature_mean=mean,
-                feature_std=std,
-                min_names=cfg.cross_section_min_names,
-            ),
-            "test": CrossSectionDataset(
-                test_syms,
-                cfg.seq_len,
-                feature_mean=mean,
-                feature_std=std,
-                min_names=cfg.cross_section_min_names,
-            ),
-        }
+    extra: dict[str, Any] = {"mmap": False, "cs_train_pt": False}
+    if bool(getattr(cfg, "write_mmap", False)) and bases:
+        cache_raw = str(getattr(cfg, "mmap_cache_dir", "") or "").strip()
+        cache_dir = (
+            resolve_path(cache_raw)
+            if cache_raw
+            else resolve_path(Path(cfg.data_dir) / "_panel_cache")
+        )
+        dest = write_mmap_cache(
+            list(bases.values()),
+            cache_dir,
+            feature_names=FEATURE_NAMES,
+            label_return=normalize_label_return(getattr(cfg, "label_return", "close")),
+            universe=str(cfg.universe or ""),
+        )
+        man = load_manifest(dest)
+
+        def _swap(split: list[SymbolArrays]) -> list[SymbolArrays]:
+            out: list[SymbolArrays] = []
+            for src in split:
+                packed = load_symbol_mmap(man, src.symbol, mmap_mode="r")
+                out.append(symbol_arrays_from_mmap(packed, valid=src.valid))
+            return out
+
+        train_syms = _swap(train_syms)
+        val_syms = _swap(val_syms)
+        test_syms = _swap(test_syms)
+        extra["mmap_manifest"] = str(dest)
+        extra["mmap"] = True
         if log_fn:
             log_fn(
-                f"cross-section dates: train={len(datasets['train'])} "
-                f"val={len(datasets['val'])} test={len(datasets['test'])} "
-                f"(min_names={cfg.cross_section_min_names})"
+                f"wrote mmap panel cache -> {dest} "
+                "(train CS now reads memmaps; not cs_train_*.pt)"
             )
-        # Empty test is allowed (pretrain ends before FT; no locked test).
-        if len(datasets["train"]) == 0 or len(datasets["val"]) == 0:
-            if log_fn:
-                log_fn(
-                    "cross-section empty on train/val; falling back to last-bar sequences"
-                )
-            use_cs = False
-            datasets = None
-    if not use_cs:
-        datasets = {
-            "train": SequenceDataset(
-                train_syms,
-                cfg.seq_len,
-                cfg.stride,
-                supervise_last=cfg.supervise_last,
-                **common,
-            ),
-            "val": SequenceDataset(
-                val_syms, cfg.seq_len, eval_stride, supervise_last=1, **common
-            ),
-            "test": SequenceDataset(
-                test_syms, cfg.seq_len, eval_stride, supervise_last=1, **common
-            ),
-        }
-    if log_fn:
-        for name, ds in datasets.items():
-            log_fn(f"{name}: {len(ds)} windows, {ds.n_valid_bars} labelled bars")
-    return {
-        "datasets": datasets,
-        "train_symbols": train_syms,
-        "val_symbols": val_syms,
-        "test_symbols": test_syms,
-        "feature_mean": mean,
-        "feature_std": std,
-        "feature_names": list(FEATURE_NAMES),
-        "meta": meta,
-        "cross_section": use_cs,
-        "cs_min_names": int(cfg.cross_section_min_names),
-        "universe": cfg.universe,
-        "equities_only": bool(getattr(cfg, "equities_only", False)),
-        "train_from": raw_from,
-        "train_end": str(getattr(cfg, "train_end", "") or ""),
-        "val_end": str(getattr(cfg, "val_end", "") or ""),
-        "test_end": str(getattr(cfg, "test_end", "") or ""),
-        "n_trading_names": int(len(trade_panels)),
-        "label_return": normalize_label_return(getattr(cfg, "label_return", "close")),
-    }
+    del raw_panels, trade_panels, bases
+    return _finalize_bundle(
+        cfg,
+        train_syms,
+        val_syms,
+        test_syms,
+        meta,
+        log_fn=log_fn,
+        extra=extra,
+    )
 
 
 def feature_stats(symbols: Sequence[SymbolArrays]) -> tuple[np.ndarray, np.ndarray]:
