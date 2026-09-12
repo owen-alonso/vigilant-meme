@@ -378,7 +378,7 @@ def align_encoder_pred(
     if enc is None or enc.empty:
         return skip.copy(), 0
     key = frame[["symbol", "date"]].merge(enc, on=["symbol", "date"], how="left")
-    pred = key["enc_pred"].to_numpy(dtype=np.float64)
+    pred = np.array(key["enc_pred"].to_numpy(dtype=np.float64), copy=True)
     missing = ~np.isfinite(pred)
     n_hit = int((~missing).sum())
     pred[missing] = skip[missing]

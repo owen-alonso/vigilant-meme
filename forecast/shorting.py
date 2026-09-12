@@ -4411,9 +4411,9 @@ def _conviction_live_block(payload: dict[str, Any]) -> str:
             _fmt_conv_row("E chosen", va.get("chosen") or {}),
             _fmt_conv_row("q90 no |pred|", va.get("q90") or {}),
             f"  VAL IR delta {_fmt(promo.get('val_ir_delta'), '+.3f')} "
-            f"(need ≥+{LO_IR_LIFT:.2f})  DD delta {_fmt(promo.get('val_dd_delta'), '+.3f')} "
-            f"(need ≥-{LO_DD_TOL:.2f})  cover {_fmt(100.0 * _as_float(promo.get('coverage')), '.1f')}% "
-            f"(need ≥{100.0 * BOOK_ALIGN_COVER:.0f}%)",
+            f"(need >=+{LO_IR_LIFT:.2f})  DD delta {_fmt(promo.get('val_dd_delta'), '+.3f')} "
+            f"(need >=-{LO_DD_TOL:.2f})  cover {_fmt(100.0 * _as_float(promo.get('coverage')), '.1f')}% "
+            f"(need >={100.0 * BOOK_ALIGN_COVER:.0f}%)",
             "  TEST (report-only):",
             _fmt_conv_row("q20 equal", te.get("q20") or {}),
             _fmt_conv_row("E chosen", te.get("chosen") or {}),

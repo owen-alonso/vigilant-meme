@@ -340,6 +340,7 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert ba_promo["gated_on"] == "val"
     assert "promote_book_aligned" in ba_promo
     report = format_accuracy_report(payload)
+    report.encode("cp1252")
     assert "PROMOTE BOOK-ALIGNED" in report
     assert "conviction_live" in payload
     assert payload["conviction_live_promotion"]["gated_on"] == "val"

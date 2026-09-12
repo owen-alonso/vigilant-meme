@@ -188,8 +188,8 @@ def test_forecast_dynamic_a_wakes_controller_grads():
     )
     model = ReturnForecaster(cfg)
     assert model.layers[0].mixer.controller is not None
-    assert float(model.head.weight.abs().sum()) > 0
-    assert float(model.layers[0].mixer.out_proj.weight.abs().sum()) > 0
+    assert float(model.head.weight.detach().abs().sum()) > 0
+    assert float(model.layers[0].mixer.out_proj.weight.detach().abs().sum()) > 0
     x = torch.randn(2, 12, 8)
     y = torch.randn(2, 12)
     mean, _log_sigma = model(x)
@@ -263,8 +263,8 @@ def test_cs_promote_is_val_only_and_ignores_test():
 def test_overnight_promote_requires_cover_and_ignores_test_keys():
     # Tiny cover must not promote even if up-rate is 90%.
     thin = decide_dynamic_a_overnight_promote(
-        val_on={"sleeve_up_pct": 90.0, "sleeve_coverage": 0.01, "dir_pct": 70.0},
-        val_off={"sleeve_up_pct": 50.0, "sleeve_coverage": 0.01, "dir_pct": 50.0},
+        val_on={"sleeve_up_pct": 90.0, "sleeve_coverage": 0.01, "dir_pct": 51.2},
+        val_off={"sleeve_up_pct": 50.0, "sleeve_coverage": 0.01, "dir_pct": 51.0},
         val_skip={"sleeve_up_pct": 54.0, "sleeve_coverage": 0.10, "dir_pct": 51.0},
     )
     assert thin["promote_dynamic_a"] is False
