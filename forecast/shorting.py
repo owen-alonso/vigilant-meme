@@ -151,7 +151,7 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/be
 # VAL-gated LS haircut experiment (NOT default): HTB shorts at half size, short NAV 0.30
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --ls-haircut-experiment
-# causal trailing CS-IC trade gate (TRAIN-fit W,τ; default off until VAL promote)
+# causal trailing CS-IC trade gate (TRAIN-fit W,tau; default off until VAL promote)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only --ic-gate-window 60 --ic-gate-tau 0.0
 # causal Friday / weekend weekday mask (VAL-gated; default always-on)
@@ -169,14 +169,14 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight_sp
   --holding overnight --live-costs --long-only
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only
-# causal CS-dispersion stress gate (TRAIN-fit kind/W/τ; default off until VAL promote)
+# causal CS-dispersion stress gate (TRAIN-fit kind/W/tau; default off until VAL promote)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only --disp-gate-kind cc --disp-gate-window 1 --disp-gate-tau 0.02
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only --disp-gate-kind on_trail --disp-gate-window 20 --disp-gate-tau 1.0
-# IDEA 5: overnight ⊕ close-to-close rank ensemble (TRAIN-chosen α; default α=1)
+# IDEA 5: overnight + close-to-close rank ensemble (TRAIN-chosen alpha; default alpha=1)
 # A = overnight sector residual (current). B = close-to-close residual skip.
-# α grid {0.5, 0.6, 0.7, 0.8, 1.0}; α=1 is overnight-only. VAL gate, TEST report-only.
+# alpha grid {0.5, 0.6, 0.7, 0.8, 1.0}; alpha=1 is overnight-only. VAL gate, TEST report-only.
 python -m forecast.training --universe liquid --interval daily --skip-only \\
   --label-return close --checkpoint-dir checkpoints/forecast_ridge
 python scripts/overnight_shorting.py --data-dir data --universe liquid \\
@@ -3645,7 +3645,7 @@ def evaluate_overnight_shorting(
         if str(row.get("hedge") or "").upper() not in ("", bench)
     )
     if log_fn:
-        log_fn("IDEA 5: overnight ⊕ close-to-close rank ensemble (TRAIN-chosen α)")
+        log_fn("IDEA 5: overnight + close-to-close rank ensemble (TRAIN-chosen alpha)")
     cc_frames, _cc_min, cc_train_ic, _cc_hedges = _overnight_skip_frames(
         data_dir,
         universe,
@@ -3723,7 +3723,7 @@ def evaluate_overnight_shorting(
         "train_alpha": ens_alpha,
     }
     if log_fn:
-        log_fn("IDEA 8: causal adaptive overnight⊕c2c α (TRAIN W/rule)")
+        log_fn("IDEA 8: causal adaptive overnight+c2c alpha (TRAIN W/rule)")
     ens_val_070 = score_ensemble_alpha(
         frames["val"],
         cc_frames.get("val", pd.DataFrame()),
