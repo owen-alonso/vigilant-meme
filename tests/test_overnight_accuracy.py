@@ -428,6 +428,8 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert "PROMOTE E+J LIVE LS" in report
     up_rank = payload["overnight_up_rank"]
     assert up_rank["fit"]["fit_split"] == "train"
+    assert up_rank["fit"]["select_split"] == "val"
+    assert up_rank["autopsy"]["test_used"] is False
     assert up_rank["promotion"]["gated_on"] == "val"
     assert up_rank["promotion"]["live_book_unchanged"] is True
     assert "promote_up_rank" in up_rank["promotion"]

@@ -1,12 +1,13 @@
-"""VAL-gated overnight-up rank sleeve (IDEA N).
+"""VAL-selected overnight-up rank sleeve (IDEA N).
 
-Liquid Dynamic A chose alpha=0 and matched the skip: the residual encoder
-did not change ranks. This module ranks names for overnight-up directly
-(pred_r / 2-feature P(up) / residual-among-up-gap / CS blend) and fits a
-top-q x |score| sleeve on TRAIN only. VAL gates a 60% hit with cover >= 5%.
-TEST is report-only. Live q20 is unchanged.
+Liquid TRAIN-greedy (logit2 q=0.95) hit 62% on TRAIN and 57.5% on VAL --
+a cliff. This module enumerates rank sleeves on TRAIN (cover >= 5%,
+excess >= 0), then **selects on locked VAL**. TEST never enters the pick.
+Live q20 is unchanged. ASCII / cp1252-safe prints only.
 
-ASCII / cp1252-safe prints only.
+Kinds rank the overnight-up object directly (not a bigger Mamba / not an
+alpha-blend of a residual encoder): pred / pred_r / pred_pos_gap /
+pred_r_pos / regularized P(up) / CS z-blend.
 """
 
 from __future__ import annotations
@@ -20,9 +21,13 @@ import pandas as pd
 MIN_COVER = 0.05
 TARGET_UP_PCT = 60.0
 VS_E_LIFT_PP = 0.50
-UP_QS = (0.70, 0.80, 0.90, 0.93, 0.95)
-UP_ABS_QS = (0.0, 0.50, 0.70, 0.80, 0.85)
+# Drop q=0.95 / abs_q=0.85 -- those were the liquid TRAIN 62% -> VAL 57% cliff.
+# Keep a middle q=0.85 / abs_q=0.60 so E-style residual can tighten if VAL holds.
+UP_QS = (0.70, 0.80, 0.85, 0.90, 0.93)
+UP_ABS_QS = (0.0, 0.50, 0.60, 0.70, 0.80)
 BLEND_ALPHAS = (0.0, 0.50, 1.0)
+LOGIT2_RIDGE = 1.0
+RANK_KINDS = ("pred", "pred_r", "pred_pos_gap", "pred_r_pos", "logit2", "cs_blend")
 
 
 def _as_float(value: Any, default: float = float("nan")) -> float:
@@ -61,14 +66,19 @@ def fit_logit2_up(
     r_on: np.ndarray,
     *,
     n_iter: int = 20,
+    ridge: float = LOGIT2_RIDGE,
 ) -> dict[str, float]:
-    """TRAIN-only P(up | pred, pred_r). VAL/TEST never enter."""
+    """TRAIN-only P(up | pred, pred_r). VAL/TEST never enter.
+
+    Light ridge on the two slopes (not the bias) so a TRAIN 62% logit2
+    spike is less likely. VAL still has to select the spec.
+    """
     a = np.asarray(pred, dtype=np.float64)
     b = np.asarray(pred_r, dtype=np.float64)
     y = np.asarray(r_on, dtype=np.float64)
     ok = np.isfinite(a) & np.isfinite(b) & np.isfinite(y)
     a, b, y = a[ok], b[ok], y[ok]
-    fallback = {"a_pred": 0.0, "a_pr": 0.0, "bias": 0.0}
+    fallback = {"a_pred": 0.0, "a_pr": 0.0, "bias": 0.0, "ridge": float(ridge)}
     if a.size < 64:
         return fallback
     yb = (y > 0.0).astype(np.float64)
@@ -76,6 +86,7 @@ def fit_logit2_up(
         np.log(max(yb.mean(), 1e-3) / max(1.0 - yb.mean(), 1e-3))
     )
     ones = np.ones_like(a)
+    pen = np.diag([float(ridge), float(ridge), 0.0])
     for _ in range(int(n_iter)):
         lin = ap * a + ar * b + bias
         pr = _sigmoid(lin)
@@ -83,9 +94,14 @@ def fit_logit2_up(
         z = lin + (yb - pr) / w
         sw = np.sqrt(w)
         design = np.column_stack([a * sw, b * sw, ones * sw])
-        coef, *_ = np.linalg.lstsq(design, z * sw, rcond=None)
+        xtx = design.T @ design
+        xty = design.T @ (z * sw)
+        try:
+            coef = np.linalg.solve(xtx + pen, xty)
+        except np.linalg.LinAlgError:
+            coef, *_ = np.linalg.lstsq(design, z * sw, rcond=None)
         ap, ar, bias = float(coef[0]), float(coef[1]), float(coef[2])
-    return {"a_pred": ap, "a_pr": ar, "bias": bias}
+    return {"a_pred": ap, "a_pr": ar, "bias": bias, "ridge": float(ridge)}
 
 
 def apply_logit2_up(
@@ -119,6 +135,10 @@ def rank_score(
         return pred_r
     if kind == "pred_pos_gap":
         out = pred.astype(np.float64, copy=True)
+        out[~(np.isfinite(pred_r) & (pred_r > 0.0))] = np.nan
+        return out
+    if kind == "pred_r_pos":
+        out = pred_r.astype(np.float64, copy=True)
         out[~(np.isfinite(pred_r) & (pred_r > 0.0))] = np.nan
         return out
     if kind == "logit2":
@@ -172,10 +192,10 @@ def fit_overnight_up_rank_on_train(
         "qs": list(UP_QS),
         "abs_qs": list(UP_ABS_QS),
         "note": (
-            "TRAIN-fit overnight-up rank sleeve. Score kinds: residual, "
-            "pred_r gap, residual among predicted-up gaps, 2-feature P(up), "
-            "within-date z blend. Optional high-drift weekday filter. "
-            "Cover is vs the full TRAIN frame (floor 5%)."
+            "TRAIN-enumerate overnight-up rank sleeves (cover >= 5%). "
+            "Kinds: residual, pred_r, residual-among-up-gap, pred_r-among-up, "
+            "ridged P(up), CS z-blend. Optional high-drift weekday filter. "
+            "VAL selects; TEST never picks."
         ),
     }
     if df.empty or "pred" not in df.columns or "r_on" not in df.columns:
@@ -190,6 +210,7 @@ def fit_overnight_up_rank_on_train(
         ("pred", 0.5),
         ("pred_r", 0.5),
         ("pred_pos_gap", 0.5),
+        ("pred_r_pos", 0.5),
         ("logit2", 0.5),
     ]
     kinds.extend(("cs_blend", float(a)) for a in BLEND_ALPHAS)
@@ -317,6 +338,147 @@ def score_up_rank_sleeve(
     }
 
 
+def spec_id(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Identity of a frozen TRAIN spec. abs_tau is part of the sleeve, not the id."""
+    return (
+        str(row.get("kind") or "pred"),
+        round(_as_float(row.get("blend_alpha"), 0.5), 4),
+        round(_as_float(row.get("q"), 0.80), 4),
+        round(_as_float(row.get("abs_q"), 0.0), 4),
+        str(row.get("dow_mode") or "all"),
+    )
+
+
+def pick_up_rank_on_val(
+    train_rows: list[Mapping[str, Any]],
+    val_rows: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """VAL selects among TRAIN-valid specs. TEST never enters.
+
+    TRAIN filter: cover >= 5% and excess >= 0.
+    VAL filter: cover >= 5%.
+    Among VAL >= 60%: prefer higher overnight-up, then more cover.
+    Among misses: prefer higher VAL up, then more cover.
+    Cliff |TRAIN-VAL| is a weak tiebreak only. Cover floor stays 5%.
+    """
+    train_by = {spec_id(r): dict(r) for r in train_rows}
+    best: dict[str, Any] = {}
+    best_key: tuple[float, ...] | None = None
+    n_val_ok = 0
+    n_hit_60 = 0
+    best_val_up = float("-inf")
+    for vr in val_rows:
+        tr = train_by.get(spec_id(vr))
+        if tr is None:
+            continue
+        train_cover = _as_float(tr.get("cover_full", tr.get("coverage")))
+        train_xs = _as_float(tr.get("excess_pp"))
+        if not (math.isfinite(train_cover) and train_cover >= MIN_COVER):
+            continue
+        if not (math.isfinite(train_xs) and train_xs >= 0.0):
+            continue
+        up = _as_float(vr.get("up_pct"))
+        cover = _as_float(vr.get("cover_full", vr.get("coverage")))
+        if not math.isfinite(up) or not math.isfinite(cover) or cover < MIN_COVER:
+            continue
+        n_val_ok += 1
+        hit = bool(up >= TARGET_UP_PCT)
+        if hit:
+            n_hit_60 += 1
+        if up > best_val_up:
+            best_val_up = up
+        train_up = _as_float(tr.get("up_pct"))
+        cliff = (
+            float(train_up - up)
+            if math.isfinite(train_up) and math.isfinite(up)
+            else 0.0
+        )
+        if hit:
+            key = (1.0, up, cover, -abs(cliff))
+        else:
+            key = (0.0, up, cover, -abs(cliff))
+        if best_key is None or key > best_key:
+            best_key = key
+            best = {
+                **tr,
+                "val_up_pct": up,
+                "val_cover_full": cover,
+                "val_excess_pp": _as_float(vr.get("excess_pp")),
+                "train_up_pct": train_up,
+                "train_cover_full": train_cover,
+                "cliff_pp": cliff,
+            }
+    return {
+        "chosen": best,
+        "n_val_ok": float(n_val_ok),
+        "n_hit_60": float(n_hit_60),
+        "best_val_up": (
+            float(best_val_up) if math.isfinite(best_val_up) else float("nan")
+        ),
+        "select_split": "val",
+        "gated_on": "val",
+    }
+
+
+def score_train_specs_on_split(
+    df: pd.DataFrame,
+    specs: list[Mapping[str, Any]],
+    *,
+    min_names: int,
+    logit2: Mapping[str, Any] | None,
+    n_full: int,
+) -> list[dict[str, Any]]:
+    """Score TRAIN-frozen specs on a split. Does not refit tau / logit2 / DOW."""
+    from forecast.accuracy import score_book_aligned_sleeve
+
+    groups: dict[tuple[Any, ...], list[Mapping[str, Any]]] = {}
+    for spec in specs:
+        key = (
+            str(spec.get("kind") or "pred"),
+            round(_as_float(spec.get("blend_alpha"), 0.5), 4),
+            str(spec.get("dow_mode") or "all"),
+        )
+        groups.setdefault(key, []).append(spec)
+    out: list[dict[str, Any]] = []
+    full = float(n_full if n_full else len(df))
+    for (kind, alpha, dow), bunch in groups.items():
+        template = {
+            "kind": kind,
+            "blend_alpha": alpha,
+            "dow_mode": dow,
+            "dows": (bunch[0].get("dows") if bunch else None),
+        }
+        ranked = apply_up_rank_spec(df, template, logit2=logit2)
+        frac = float(len(ranked) / full) if full > 0 else 1.0
+        for spec in bunch:
+            sleeve = score_book_aligned_sleeve(
+                ranked,
+                q=_as_float(spec.get("q"), 0.80),
+                abs_tau=_as_float(spec.get("abs_tau"), 0.0),
+                min_names=min_names,
+            )
+            cover_sub = _as_float(sleeve.get("coverage"))
+            cover_full = (
+                cover_sub
+                if dow == "all" or not np.isfinite(cover_sub)
+                else float(cover_sub * frac)
+            )
+            out.append(
+                {
+                    **dict(spec),
+                    **sleeve,
+                    "kind": kind,
+                    "blend_alpha": alpha,
+                    "dow_mode": dow,
+                    "abs_q": _as_float(spec.get("abs_q"), 0.0),
+                    "abs_tau": _as_float(spec.get("abs_tau"), 0.0),
+                    "cover_full": cover_full,
+                    "coverage": cover_full,
+                }
+            )
+    return out
+
+
 def decide_overnight_up_rank_promote(
     *,
     val_chosen: Mapping[str, Any],
@@ -397,7 +559,10 @@ def format_overnight_up_rank_block(payload: Mapping[str, Any]) -> str:
     promo = dict(blob.get("promotion") or {})
     fit = dict(blob.get("fit") or {})
     cmp = dict(blob.get("compare") or {})
+    autopsy = dict(blob.get("autopsy") or fit.get("autopsy") or {})
     chosen = dict(fit.get("chosen") or {})
+    greedy = dict(fit.get("train_greedy") or {})
+    greedy_val = dict(cmp.get("train_greedy_val") or {})
     va = dict(cmp.get("val") or {})
     te = dict(cmp.get("test") or {})
     e_va = dict(cmp.get("val_e") or {})
@@ -406,22 +571,32 @@ def format_overnight_up_rank_block(payload: Mapping[str, Any]) -> str:
     lines = [
         f"PROMOTE OVERNIGHT-UP RANK? {'YES' if yes else 'NO'}  "
         f"REACHED 60%? {'YES' if bool(promo.get('reached_60')) else 'NO'}",
-        "  TRAIN-fit rank for overnight-up (not a bigger Mamba). "
-        "Kinds: residual / pred_r / residual among predicted-up gaps / "
-        "2-feature P(up) / CS z-blend. Optional high-drift weekday filter. "
-        "Cover floor 5% vs the full split. VAL gates; TEST report-only. "
-        "Live q20 unchanged.",
-        f"  TRAIN pick kind={chosen.get('kind')!r}  "
+        "  TRAIN-filter / VAL-select overnight-up rank (not a bigger Mamba, "
+        "not a Dynamic A alpha-blend). Kinds: residual / pred_r / "
+        "residual among predicted-up gaps / pred_r among predicted-up / "
+        "ridged P(up) / CS z-blend. Optional high-drift weekday filter. "
+        "Cover floor 5% vs the full split. TEST report-only. Live q20 unchanged.",
+        f"  VAL pick kind={chosen.get('kind')!r}  "
         f"blend_a={_as_float(chosen.get('blend_alpha')):.2f}  "
         f"q={_as_float(chosen.get('q')):.2f}  "
         f"abs_q={_as_float(chosen.get('abs_q')):.2f}  "
         f"dow={chosen.get('dow_mode')!r}  "
-        f"fit_split={fit.get('fit_split')!r}  "
-        f"n_cand={int(_as_float(fit.get('n_candidates'), 0.0))}",
+        f"select_split={str(fit.get('select_split') or 'val')!r}  "
+        f"n_train={int(_as_float(fit.get('n_candidates'), 0.0))}  "
+        f"n_val_ok={int(_as_float(autopsy.get('n_val_ok'), 0.0))}  "
+        f"n_hit_60={int(_as_float(autopsy.get('n_hit_60'), 0.0))}",
+        f"  TRAIN greedy kind={greedy.get('kind')!r}  "
+        f"q={_as_float(greedy.get('q')):.2f}  "
+        f"abs_q={_as_float(greedy.get('abs_q')):.2f}  "
+        f"up {_as_float(greedy.get('up_pct')):.2f}%  "
+        f"-> VAL {_as_float(greedy_val.get('up_pct')):.2f}%  "
+        f"cliff {_as_float(autopsy.get('train_greedy_cliff_pp')):+.2f}pp  "
+        "(not used)",
         f"  VAL   rank  up {_as_float(va.get('up_pct')):.2f}%  "
         f"xs {_as_float(va.get('excess_pp')):+.2f}pp  "
         f"cover {100.0 * _as_float(va.get('cover_full', va.get('coverage'))):.1f}%  "
-        f"n={int(_as_float(va.get('n'), 0.0))}",
+        f"n={int(_as_float(va.get('n'), 0.0))}  "
+        f"best_val_up {_as_float(autopsy.get('best_val_up')):.2f}%",
         f"  VAL   E     up {_as_float(e_va.get('up_pct')):.2f}%  "
         f"cover {100.0 * _as_float(e_va.get('coverage')):.1f}%",
         f"  VAL   vs E {_as_float(promo.get('val_vs_e_pp')):+.2f} pp  "
@@ -444,13 +619,28 @@ def evaluate_overnight_up_rank(
     e_test: Mapping[str, Any] | None = None,
     log_fn: Any | None = None,
 ) -> dict[str, Any]:
-    """Fit on TRAIN, gate on VAL, report TEST."""
+    """Enumerate on TRAIN, select on VAL, report TEST. TEST never picks."""
     tr = frames["train"]
     va = frames["val"]
     te = frames["test"]
     fit = fit_overnight_up_rank_on_train(tr, min_names=min_names)
-    spec = dict(fit.get("chosen") or {})
+    train_greedy = dict(fit.get("chosen") or {})
     logit2 = dict(fit.get("logit2") or {})
+    train_rows = [dict(r) for r in (fit.get("rows") or [])]
+    val_rows = score_train_specs_on_split(
+        va, train_rows, min_names=min_names, logit2=logit2, n_full=len(va)
+    )
+    picked = pick_up_rank_on_val(train_rows, val_rows)
+    spec = dict(picked.get("chosen") or {})
+    if not spec:
+        spec = dict(train_greedy)
+    greedy_val = (
+        score_up_rank_sleeve(
+            va, train_greedy, min_names=min_names, logit2=logit2, n_full=len(va)
+        )
+        if train_greedy
+        else {}
+    )
     val_s = score_up_rank_sleeve(
         va, spec, min_names=min_names, logit2=logit2, n_full=len(va)
     )
@@ -460,6 +650,34 @@ def evaluate_overnight_up_rank(
     train_s = score_up_rank_sleeve(
         tr, spec, min_names=min_names, logit2=logit2, n_full=len(tr)
     )
+    greedy_train_up = _as_float(train_greedy.get("up_pct"))
+    greedy_val_up = _as_float(greedy_val.get("up_pct"))
+    autopsy = {
+        "n_train": float(len(train_rows)),
+        "n_val_ok": picked.get("n_val_ok"),
+        "n_hit_60": picked.get("n_hit_60"),
+        "best_val_up": picked.get("best_val_up"),
+        "train_greedy_kind": train_greedy.get("kind"),
+        "train_greedy_q": _as_float(train_greedy.get("q")),
+        "train_greedy_abs_q": _as_float(train_greedy.get("abs_q")),
+        "train_greedy_train_up": greedy_train_up,
+        "train_greedy_val_up": greedy_val_up,
+        "train_greedy_cliff_pp": (
+            float(greedy_train_up - greedy_val_up)
+            if math.isfinite(greedy_train_up) and math.isfinite(greedy_val_up)
+            else float("nan")
+        ),
+        "select_split": "val",
+        "test_used": False,
+    }
+    fit = {
+        **fit,
+        "chosen": spec,
+        "train_greedy": train_greedy,
+        "select_split": "val",
+        "autopsy": autopsy,
+        "n_candidates": float(len(train_rows)),
+    }
     promo = decide_overnight_up_rank_promote(
         val_chosen=val_s,
         val_e=e_val or {},
@@ -473,7 +691,10 @@ def evaluate_overnight_up_rank(
             "test": test_s,
             "val_e": dict(e_val or {}),
             "test_e": dict(e_test or {}),
+            "train_greedy": train_greedy,
+            "train_greedy_val": greedy_val,
         },
+        "autopsy": autopsy,
         "promotion": promo,
         "note": fit.get("note"),
     }
