@@ -8,6 +8,7 @@ import pandas as pd
 from forecast.overnight_dynamic import (
     resolve_dynamic_a_steps,
     skip_encoder_stats,
+    train_step_budget,
 )
 from forecast.overnight_up_rank import (
     decide_overnight_up_rank_promote,
@@ -32,6 +33,12 @@ def test_resolve_dynamic_a_steps_keeps_tiny_ci_budget():
     assert resolve_dynamic_a_steps(80, n_train_dates=4000) == 400
     assert resolve_dynamic_a_steps(0, n_train_dates=4000) == 400
     assert resolve_dynamic_a_steps(0, n_train_dates=110) == 80
+    # CLI default requested=0 must not become a 1-step no-op
+    # (max(1, 0) == 1 was the train-loop footgun).
+    assert max(1, int(0)) == 1
+    assert train_step_budget(0, n_train_dates=4000) == 400
+    assert train_step_budget(0, n_train_dates=110) == 80
+    assert train_step_budget(6, n_train_dates=40) == 6
 
 
 def test_skip_encoder_stats_flags_unused_clone():
@@ -45,6 +52,11 @@ def test_skip_encoder_stats_flags_unused_clone():
     live = skip_encoder_stats(skip, skip + rng.normal(0.0, 0.4, size=50))
     assert live["unused"] is False
     assert live["resid_std"] > 0.1
+    # High corr with a material residual is aligned, not a skip clone.
+    aligned = skip_encoder_stats(skip, skip * 1.05)
+    assert aligned["near_skip"] is True
+    assert aligned["unused"] is False
+    assert aligned["resid_std"] > 1e-3
 
 
 def test_rank_score_pred_pos_gap_masks_down_forecasts():

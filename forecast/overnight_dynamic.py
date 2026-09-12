@@ -89,6 +89,9 @@ def resolve_dynamic_a_steps(
     80 steps on a multi-year liquid panel is a fraction of an epoch, so the
     residual head stays a skip clone and alpha=0 wins. Tests / planted synth
     (few dates) keep the requested budget.
+
+    The train loop MUST use this return value, not raw ``requested``.
+    ``max(1, requested)`` with the CLI default 0 is a 1-step no-op.
     """
     req = int(requested or 0)
     dates = max(0, int(n_train_dates))
@@ -102,6 +105,18 @@ def resolve_dynamic_a_steps(
     return req
 
 
+def train_step_budget(
+    requested: int,
+    n_train_dates: int,
+    *,
+    batch_size: int = 8,
+) -> int:
+    """AdamW steps the tiny encoder actually runs (never the raw CLI 0)."""
+    return max(1, int(resolve_dynamic_a_steps(
+        requested, n_train_dates, batch_size=batch_size
+    )))
+
+
 def skip_encoder_stats(skip: np.ndarray, encoder: np.ndarray) -> dict[str, Any]:
     """Diagnose an unused encoder (liquid alpha=0: corr~1, residual~0)."""
     s = np.asarray(skip, dtype=np.float64).reshape(-1)
@@ -113,6 +128,7 @@ def skip_encoder_stats(skip: np.ndarray, encoder: np.ndarray) -> dict[str, Any]:
         "resid_std": float("nan"),
         "resid_mae": float("nan"),
         "unused": True,
+        "near_skip": True,
         "reason": "no overlapping last-bar preds",
     }
     if n <= 2:
@@ -128,14 +144,20 @@ def skip_encoder_stats(skip: np.ndarray, encoder: np.ndarray) -> dict[str, Any]:
     s0, e0 = s - s.mean(), e - e.mean()
     denom = float(np.sqrt((s0 * s0).sum() * (e0 * e0).sum()))
     corr = float((s0 * e0).sum() / denom) if denom > 1e-12 else float("nan")
-    unused = bool(
-        (math.isfinite(corr) and abs(corr) >= UNUSED_CORR)
-        or (math.isfinite(resid_std) and resid_std < UNUSED_RESID_STD)
-    )
+    # Liquid alpha=0 was a skip clone (resid~0), not merely high corr.
+    # A live encoder can sit at corr=0.995 with resid_std~0.05 and still
+    # move the top-q sleeve; do not force alpha=0 on corr alone.
+    near_skip = bool(math.isfinite(corr) and abs(corr) >= UNUSED_CORR)
+    unused = bool(math.isfinite(resid_std) and resid_std < UNUSED_RESID_STD)
     if unused:
         reason = (
             f"encoder unused: corr={corr:+.4f} resid_std={resid_std:.3e} "
             "(alpha=0 is skip; not a blend)"
+        )
+    elif near_skip:
+        reason = (
+            f"encoder aligned with skip (corr={corr:+.4f}) but resid_std="
+            f"{resid_std:.3e} -- still blend on VAL"
         )
     else:
         reason = (
@@ -147,6 +169,7 @@ def skip_encoder_stats(skip: np.ndarray, encoder: np.ndarray) -> dict[str, Any]:
         "resid_std": resid_std,
         "resid_mae": resid_mae,
         "unused": unused,
+        "near_skip": near_skip,
         "reason": reason,
     }
 
@@ -524,7 +547,7 @@ def train_tiny_overnight_encoder(
     set_seed(42)
     bundle = build_datasets(data_cfg, log_fn=None)
     n_train_dates = int(len(bundle["datasets"]["train"]))
-    steps = resolve_dynamic_a_steps(int(max_steps), n_train_dates, batch_size=8)
+    steps = train_step_budget(int(max_steps), n_train_dates, batch_size=8)
     train_cfg = _tiny_train_cfg(steps, str(ckpt))
     if log_fn:
         log_fn(
@@ -585,7 +608,7 @@ def train_tiny_overnight_encoder(
             it = iter(train_loader)
             return next(it)
 
-    total = max(1, int(max_steps))
+    total = int(steps)
     for step in range(total):
         batch = _next_batch()
         x, y, mask, _scale = batch[0], batch[1], batch[2], batch[3]
@@ -730,7 +753,8 @@ def evaluate_overnight_dynamic_a(
     if log_fn:
         log_fn(
             "Dynamic A overnight residual: tiny encoder on vs off "
-            f"(steps={int(max_steps)}, d_model={TINY_D_MODEL}, n_layer={TINY_N_LAYER})"
+            f"(requested_steps={int(max_steps)}, d_model={TINY_D_MODEL}, "
+            f"n_layer={TINY_N_LAYER}; 0=auto)"
         )
     base = Path(ckpt_dir or "/tmp/overnight_dynamic_a")
     on = train_tiny_overnight_encoder(
