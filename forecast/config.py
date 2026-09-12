@@ -122,6 +122,7 @@ class DataConfig:
     fill_minutes: int = 0
     # Data Manager mmap panel feed. Empty mmap_manifest = auto
     # ``<data_dir>/_panel_cache/mmap_manifest.json`` when that file exists.
+    # Reads numpy_mmap_v1 (pointer + symbols list) or panel_mmap/v1.
     # Train CS batching reads memmaps; never cs_train_*.pt.
     mmap_manifest: str = ""
     use_mmap: bool = True

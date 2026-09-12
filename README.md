@@ -186,8 +186,10 @@ recent fine-tune schedule from `pretrain_finetune_cuts.json` (FT train gets
 session-rank recency, half-life 126; labels unchanged). Cut (0) skip-only FT
 did not beat live_locate +5.58 — do not promote that ckpt. Train CS batches
 read the Data Manager mmap feed (`data/_panel_cache/mmap_manifest.json`)
-when present (`load_manifest` / `load_symbol_mmap(..., mmap_mode="r")`);
-never `cs_train_*.pt`. `--pup-head` is the (2a) direct overnight-up P(up)
+when present (`load_manifest` / `load_symbol_mmap(..., mmap_mode="r")`).
+`numpy_mmap_v1` pointer files (`→ mmap_<hash>/manifest.json`, `symbols`
+as a list) are adapted in-place; the hashed float32 store is not rewritten.
+Never `cs_train_*.pt`. `--pup-head` is the (2a) direct overnight-up P(up)
 classifier (VAL overnight-up ≥60% at cover ≥5%; TEST report-only). PIT
 drops overnight labels where `data/_pit/factors/{SYM}_daily_factors.parquet`
 has `next_split_days==1`. Optional membership as-of:

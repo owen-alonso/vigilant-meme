@@ -219,7 +219,7 @@ Windows desktop: `--num-workers 0` (default). Do not pickle the 6.7GB CS / `data
 
 Cut (0) skip-only FT was Eval-NO (live_locate IR +0.723 / DD -1.127 vs +5.58 / -0.95). Do not promote that checkpoint. This cut wires the Data Manager mmap feed into CS batching and adds a **direct** overnight-up classifier — not a residual-skip rank grid (closed) and not a bigger Mamba.
 
-Manifest: `data/_panel_cache/mmap_manifest.json`. Load API: `load_manifest`, `load_symbol_mmap(..., mmap_mode="r")` → float32 features `[T, F]` memmap + labels. PIT (Data Manager): drop overnight labels where `next_split_days == 1` on `data/_pit/factors/{SYM}_daily_factors.parquet`. Optional membership as-of: `data/_pit/liquid_membership.json` (missing file is a no-op). The P(up) head / CS train path applies this mask; the live factors tape wins over mmap-cached `next_split_days`.
+Manifest: `data/_panel_cache/mmap_manifest.json`. Load API: `load_manifest`, `load_symbol_mmap(..., mmap_mode="r")` → float32 features `[T, F]` memmap + labels. The loader accepts Data Manager `numpy_mmap_v1` (pointer file → `mmap_<hash>/manifest.json`, `symbols` as a list) and the in-repo writer `panel_mmap/v1`. The adapter consumes the existing float32 store; do not rewrite the 121MiB cache. PIT (Data Manager): drop overnight labels where `next_split_days == 1` on `data/_pit/factors/{SYM}_daily_factors.parquet`. Optional membership as-of: `data/_pit/liquid_membership.json` (missing file is a no-op). The P(up) head / CS train path applies this mask; the live factors tape wins over mmap-cached `next_split_days`.
 
 ```bash
 # write mmap once (Data Manager / parquet → memmap). num_workers=0

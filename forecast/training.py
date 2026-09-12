@@ -1508,7 +1508,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--mmap-manifest",
         default="",
         help="Data Manager mmap_manifest.json (default: data/_panel_cache/"
-        "mmap_manifest.json when present). Never cs_train_*.pt.",
+        "mmap_manifest.json when present). Accepts numpy_mmap_v1 pointer "
+        "files and panel_mmap/v1. Never cs_train_*.pt.",
     )
     g.add_argument(
         "--no-mmap",

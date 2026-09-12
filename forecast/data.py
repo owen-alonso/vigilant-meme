@@ -1581,6 +1581,10 @@ def _build_datasets_from_mmap(
         log_fn(
             f"mmap feed {manifest_path}: {len(bases)} trading names "
             f"(no DataFrame rebuild, mmap_mode=r, num_workers=0)"
+            + (
+                f" schema={payload.get('schema')}"
+                + (" adapted" if payload.get("_adapted") else "")
+            )
             + (f" PIT factors={len(tape)} names" if tape else " PIT factors=none")
             + (
                 f" membership={membership.get('_path')}"
