@@ -120,6 +120,17 @@ class DataConfig:
     label_return: str = "close"
     # Minutes after the next open for ``open_fill``. 0 = unused. 15 ≈ 15/390.
     fill_minutes: int = 0
+    # Data Manager mmap panel feed. Empty mmap_manifest = auto
+    # ``<data_dir>/_panel_cache/mmap_manifest.json`` when that file exists.
+    # Reads numpy_mmap_v1 (pointer + symbols list) or panel_mmap/v1.
+    # Train CS batching reads memmaps; never cs_train_*.pt.
+    mmap_manifest: str = ""
+    use_mmap: bool = True
+    write_mmap: bool = False
+    mmap_cache_dir: str = ""
+    # PIT root (``data/_pit/``). Factors: ``_pit/factors/{SYM}_daily_factors.parquet``.
+    # Optional membership as-of: ``_pit/liquid_membership.json``. Empty = default.
+    pit_dir: str = ""
 
     def is_daily(self) -> bool:
         return self.interval == "daily"
@@ -157,6 +168,16 @@ class DataConfig:
             payload["label_return"] = "close"
         if "fill_minutes" not in payload:
             payload["fill_minutes"] = 0
+        if "mmap_manifest" not in payload:
+            payload["mmap_manifest"] = ""
+        if "use_mmap" not in payload:
+            payload["use_mmap"] = True
+        if "write_mmap" not in payload:
+            payload["write_mmap"] = False
+        if "mmap_cache_dir" not in payload:
+            payload["mmap_cache_dir"] = ""
+        if "pit_dir" not in payload:
+            payload["pit_dir"] = ""
         from forecast.overnight import fill_minutes_for, normalize_label_return
 
         payload["label_return"] = normalize_label_return(payload.get("label_return"))
@@ -363,6 +384,9 @@ class ForecastTrainConfig:
     time_upweight_halflife_sessions: float = 0.0
     # Which staged window this run used (``pretrain`` / ``finetune`` / empty).
     forecast_phase: str = ""
+    # (2a) direct overnight-up P(up) logistic head. Not a skip-rank grid.
+    pup_head: bool = False
+    pup_ridge: float = 1.0
     # Optional encoder warm-start (skip-only overwrites the linear skip anyway).
     init_checkpoint: str = ""
     # Winsorize raw y within date before the ridge (ignored when rank_target).

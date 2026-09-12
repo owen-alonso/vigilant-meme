@@ -162,6 +162,9 @@ python scripts/cs_regime_ablate.py --data-dir data --universe liquid
 python scripts/cs_shrink_ablate.py --data-dir data --universe liquid --also-labels
 python -m forecast.training --universe liquid --skip-only --label-return overnight
 python scripts/pretrain_finetune.py --data-dir data --universe liquid
+python -m forecast.panel_mmap --data-dir data --universe liquid --write
+python -m forecast.training --universe liquid --skip-only --label-return overnight --pup-head --num-workers 0
+python scripts/overnight_pup.py --data-dir data --universe liquid
 python scripts/cs_overnight.py --data-dir data --universe liquid
 python scripts/overnight_accuracy.py --data-dir data --universe liquid
 python scripts/ablate_cs.py
@@ -180,8 +183,19 @@ Overnight (`--label-return overnight`) replaces \(r_{t+1}\) with
 \(\log(\mathrm{open}_{t+1})-\log(\mathrm{close}_t)\). Next open is a **label**,
 never a feature. `scripts/pretrain_finetune.py` runs the historic pretrain →
 recent fine-tune schedule from `pretrain_finetune_cuts.json` (FT train gets
-session-rank recency, half-life 126; labels unchanged). VAL-gate the FT
-checkpoint on cost-aware `live_locate` IR, not hit-rate. Backtest
+session-rank recency, half-life 126; labels unchanged). Cut (0) skip-only FT
+did not beat live_locate +5.58 — do not promote that ckpt. Train CS batches
+read the Data Manager mmap feed (`data/_panel_cache/mmap_manifest.json`)
+when present (`load_manifest` / `load_symbol_mmap(..., mmap_mode="r")`).
+`numpy_mmap_v1` pointer files (`→ mmap_<hash>/manifest.json`, `symbols`
+as a list) are adapted in-place; the hashed float32 store is not rewritten.
+Never `cs_train_*.pt`. `--pup-head` is the (2a) direct overnight-up P(up)
+classifier (VAL overnight-up ≥60% at cover ≥5%; TEST report-only). PIT
+drops overnight labels where `data/_pit/factors/{SYM}_daily_factors.parquet`
+has `next_split_days==1`. Optional membership as-of:
+`data/_pit/liquid_membership.json`.
+VAL-gate the *book* on cost-aware `live_locate` IR vs +5.58 (report-only
+on the P(up) cut). Backtest
 `--holding overnight` flattens every open (MOC→MOO).
 `--live-costs` is the Owen-runnable pack (20 bp RT + name-level MOC/MOO +
 thin/vol impact + 5 bp borrow + 10 bp hedge). `--long-only` drops shorts and

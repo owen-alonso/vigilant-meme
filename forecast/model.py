@@ -74,6 +74,13 @@ class ReturnForecaster(nn.Module):
             nn.init.zeros_(self.skip.bias)
             self.skip.weight.requires_grad_(False)
             self.skip.bias.requires_grad_(False)
+        # (2a) direct P(overnight-up) logit. Zero until apply_pup_skip copies
+        # the TRAIN logistic. Not a residual skip and not a bigger Mamba.
+        self.up_skip = nn.Linear(config.n_features, 1)
+        nn.init.zeros_(self.up_skip.weight)
+        nn.init.zeros_(self.up_skip.bias)
+        self.up_skip.weight.requires_grad_(False)
+        self.up_skip.bias.requires_grad_(False)
 
     def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if features.dim() != 3:
@@ -101,6 +108,13 @@ class ReturnForecaster(nn.Module):
         else:
             log_sigma = torch.zeros_like(mean)
         return mean, log_sigma
+
+    def pup_logits(self, features: torch.Tensor) -> torch.Tensor:
+        """Last-bar or dense P(up) logits from the classification skip."""
+        return self.up_skip(features).squeeze(-1)
+
+    def pup_proba(self, features: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.pup_logits(features))
 
     @staticmethod
     def confidence_from_std(residual_std: torch.Tensor) -> torch.Tensor:
