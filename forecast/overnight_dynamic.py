@@ -43,6 +43,10 @@ TINY_D_MODEL = 32
 TINY_N_LAYER = 1
 TINY_D_STATE = 8
 DEFAULT_STEPS = 80
+MAX_AUTO_STEPS = 400
+LARGE_PANEL_DATES = 250
+UNUSED_CORR = 0.995
+UNUSED_RESID_STD = 1e-4
 VAL_CS_LIFT = 0.005
 
 
@@ -72,6 +76,79 @@ def apply_residual_pred(df: pd.DataFrame, pred: np.ndarray) -> pd.DataFrame:
         )
         out["implied_open_given_hedge"] = close * np.exp(pr + hedge)
     return out
+
+
+def resolve_dynamic_a_steps(
+    requested: int,
+    n_train_dates: int,
+    *,
+    batch_size: int = 8,
+) -> int:
+    """Keep tiny CI budgets; one-epoch-cap on liquid-scale CS panels.
+
+    80 steps on a multi-year liquid panel is a fraction of an epoch, so the
+    residual head stays a skip clone and alpha=0 wins. Tests / planted synth
+    (few dates) keep the requested budget.
+    """
+    req = int(requested or 0)
+    dates = max(0, int(n_train_dates))
+    batch = max(1, int(batch_size))
+    epoch = max(1, dates // batch)
+    auto = int(min(MAX_AUTO_STEPS, max(DEFAULT_STEPS, epoch)))
+    if req <= 0:
+        return auto
+    if dates > LARGE_PANEL_DATES:
+        return int(min(MAX_AUTO_STEPS, max(req, auto)))
+    return req
+
+
+def skip_encoder_stats(skip: np.ndarray, encoder: np.ndarray) -> dict[str, Any]:
+    """Diagnose an unused encoder (liquid alpha=0: corr~1, residual~0)."""
+    s = np.asarray(skip, dtype=np.float64).reshape(-1)
+    e = np.asarray(encoder, dtype=np.float64).reshape(-1)
+    n = int(min(s.size, e.size))
+    empty = {
+        "n": 0.0,
+        "corr": float("nan"),
+        "resid_std": float("nan"),
+        "resid_mae": float("nan"),
+        "unused": True,
+        "reason": "no overlapping last-bar preds",
+    }
+    if n <= 2:
+        return empty
+    s, e = s[:n], e[:n]
+    ok = np.isfinite(s) & np.isfinite(e)
+    if int(ok.sum()) <= 2:
+        return empty
+    s, e = s[ok], e[ok]
+    resid = e - s
+    resid_std = float(resid.std())
+    resid_mae = float(np.mean(np.abs(resid)))
+    s0, e0 = s - s.mean(), e - e.mean()
+    denom = float(np.sqrt((s0 * s0).sum() * (e0 * e0).sum()))
+    corr = float((s0 * e0).sum() / denom) if denom > 1e-12 else float("nan")
+    unused = bool(
+        (math.isfinite(corr) and abs(corr) >= UNUSED_CORR)
+        or (math.isfinite(resid_std) and resid_std < UNUSED_RESID_STD)
+    )
+    if unused:
+        reason = (
+            f"encoder unused: corr={corr:+.4f} resid_std={resid_std:.3e} "
+            "(alpha=0 is skip; not a blend)"
+        )
+    else:
+        reason = (
+            f"encoder differs from skip: corr={corr:+.4f} resid_std={resid_std:.3e}"
+        )
+    return {
+        "n": float(s.size),
+        "corr": corr,
+        "resid_std": resid_std,
+        "resid_mae": resid_mae,
+        "unused": unused,
+        "reason": reason,
+    }
 
 
 def blend_residual(skip: np.ndarray, encoder: np.ndarray, alpha: float) -> np.ndarray:
@@ -240,8 +317,12 @@ def format_dynamic_a_block(payload: Mapping[str, Any]) -> str:
         "VAL gates; TEST report-only. Live q20 unchanged. "
         "Cover floor 5% -- no handful-of-names cheat.",
         f"  chosen alpha={_as_float(blob.get('alpha')):.2f}  "
-        f"steps={int(_as_float(blob.get('max_steps'), 0.0))}  "
+        f"steps={int(_as_float(blob.get('effective_steps'), _as_float(blob.get('max_steps'), 0.0)))}  "
+        f"requested={int(_as_float(blob.get('max_steps'), 0.0))}  "
         f"aligned={int(_as_float(blob.get('n_aligned_val'), 0.0))} VAL rows",
+        f"  vs skip VAL corr={_as_float((blob.get('autopsy') or {}).get('corr')):+.4f}  "
+        f"resid_std={_as_float((blob.get('autopsy') or {}).get('resid_std')):.3e}  "
+        f"unused={bool((blob.get('autopsy') or {}).get('unused'))}",
         f"  health init  {format_dynamic_health_ascii(health_i)}",
         f"  health final {format_dynamic_health_ascii(health_f)}",
         f"  controller present={bool(on.get('controller_present'))}  "
@@ -440,9 +521,16 @@ def train_tiny_overnight_encoder(
     data_cfg = overnight_skip_data_config(data_dir, universe)
     ckpt = Path(ckpt_dir or "/tmp/overnight_dynamic_a")
     ckpt.mkdir(parents=True, exist_ok=True)
-    train_cfg = _tiny_train_cfg(max_steps, str(ckpt))
-    set_seed(train_cfg.seed)
+    set_seed(42)
     bundle = build_datasets(data_cfg, log_fn=None)
+    n_train_dates = int(len(bundle["datasets"]["train"]))
+    steps = resolve_dynamic_a_steps(int(max_steps), n_train_dates, batch_size=8)
+    train_cfg = _tiny_train_cfg(steps, str(ckpt))
+    if log_fn:
+        log_fn(
+            f"  dynamic_a steps {steps} (requested={int(max_steps)} "
+            f"train_dates={n_train_dates})"
+        )
     n_features = len(bundle.get("feature_names") or FEATURE_NAMES)
     model_cfg = _tiny_model_cfg(
         n_features, dynamic_weights=dynamic_weights, strength=strength
@@ -485,6 +573,7 @@ def train_tiny_overnight_encoder(
     last_grad = float("nan")
     best_ic = float("-inf")
     best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    last_state = best_state
     steps_done = 0
     it = iter(train_loader)
 
@@ -522,6 +611,7 @@ def train_tiny_overnight_encoder(
         last_grad = gnorm
         optimizer.step()
         steps_done = step + 1
+        last_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         if (step + 1) % int(train_cfg.eval_interval) == 0 or step + 1 == total:
             val = evaluate(model, val_loader, device, train_cfg, **cs_eval)
             ic = float(val.get("cs_ic", val.get("ic", float("nan"))))
@@ -543,7 +633,13 @@ def train_tiny_overnight_encoder(
                 f"{format_dynamic_health_ascii(model.collect_dynamic_health(controller_grad_norm=gnorm))}"
             )
 
-    model.load_state_dict(best_state)
+    skip_ic = float(skip_val.get("cs_ic", float("nan")))
+    # Liquid autopsy: CS IC never beats the frozen skip, so "best" is a skip
+    # clone and alpha=0 wins. Keep last weights when there is no IC lift.
+    if math.isfinite(best_ic) and math.isfinite(skip_ic) and best_ic <= skip_ic + 1e-4:
+        model.load_state_dict(last_state)
+    else:
+        model.load_state_dict(best_state)
     model.to(device)
     health_final = _probe_health(model, val_loader, device, after_training=True)
     health_final["controller_grad_norm"] = last_grad
@@ -572,6 +668,9 @@ def train_tiny_overnight_encoder(
         "skip_only_val_cs_ic": float(skip_val.get("cs_ic", float("nan"))),
         "skip_only_test_cs_ic": float(skip_test.get("cs_ic", float("nan"))),
         "steps": steps_done,
+        "requested_steps": int(max_steps),
+        "effective_steps": int(steps),
+        "n_train_dates": int(n_train_dates),
         "device": str(device),
         "preds": {"train": pred_train, "val": pred_val, "test": pred_test},
         "n_params": int(sum(p.numel() for p in model.parameters())),
@@ -671,11 +770,19 @@ def evaluate_overnight_dynamic_a(
     skip_scores = _score_split_frames(
         frames, skip_pred, min_names=min_names, e_q=e_q, e_tau=e_tau
     )
+    autopsy = skip_encoder_stats(skip_pred["val"], aligned["on"]["val"])
+    if log_fn:
+        log_fn(
+            f"  Dynamic A vs skip (VAL): corr={_as_float(autopsy.get('corr')):+.4f} "
+            f"resid_std={_as_float(autopsy.get('resid_std')):.3e} "
+            f"unused={bool(autopsy.get('unused'))}  {autopsy.get('reason')}"
+        )
     # VAL-only alpha pick on the ON encoder (TRAIN fit of E q is reused).
-    best_alpha = 1.0
+    best_alpha = 0.0 if bool(autopsy.get("unused")) else 1.0
     best_key = (-1e18, -1e18)
     alpha_rows: list[dict[str, Any]] = []
-    for alpha in BLEND_ALPHAS:
+    alpha_grid = (0.0,) if bool(autopsy.get("unused")) else BLEND_ALPHAS
+    for alpha in alpha_grid:
         blended = {
             split: blend_residual(skip_pred[split], aligned["on"][split], alpha)
             for split in ("train", "val", "test")
@@ -787,26 +894,32 @@ def evaluate_overnight_dynamic_a(
         val_off=off_pack,
         val_skip=skip_pack,
     )
+    dyn_blob = {
+        "promotion": promotion,
+        "on": on_pack,
+        "off": off_pack,
+        "skip": skip_pack,
+        "alpha": best_alpha,
+        "max_steps": max_steps,
+        "effective_steps": on.get("effective_steps"),
+        "n_aligned_val": n_hits["on"].get("val", 0),
+        "autopsy": autopsy,
+    }
     if log_fn:
-        log_fn(format_dynamic_a_block({"dynamic_a": {
-            "promotion": promotion,
-            "on": on_pack,
-            "off": off_pack,
-            "skip": skip_pack,
-            "alpha": best_alpha,
-            "max_steps": max_steps,
-            "n_aligned_val": n_hits["on"].get("val", 0),
-        }}))
+        log_fn(format_dynamic_a_block({"dynamic_a": dyn_blob}))
     return {
         "alpha": float(best_alpha),
         "q": float(use_q),
         "abs_tau": float(use_tau),
         "max_steps": int(max_steps),
+        "effective_steps": on.get("effective_steps"),
+        "n_train_dates": on.get("n_train_dates"),
         "n_aligned": n_hits,
         "n_aligned_val": int(n_hits["on"].get("val", 0)),
         "alpha_rows": [
             {k: v for k, v in row.items() if k != "scored"} for row in alpha_rows
         ],
+        "autopsy": autopsy,
         "on": on_pack,
         "off": off_pack,
         "skip": skip_pack,

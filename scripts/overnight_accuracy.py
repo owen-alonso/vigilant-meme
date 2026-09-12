@@ -38,7 +38,10 @@ Promote a new MAE default only if VAL % MAE beats residual×σ / zero-move /
 train-median by ≥0.5 bp and is not worse than the current default.
 IDEA M is sparse MAE: TRAIN affine_l1/huber on residual*sigma->r_on, then a
 TRAIN |pred| tau so small gaps predict 0 (zero-move). Same VAL % MAE gate.
---try-dynamic-a trains a tiny Dynamic A encoder (VAL-gated residual blend).
+--try-dynamic-a trains a tiny Dynamic A encoder (VAL-gated residual blend;
+steps 0 = auto one-epoch cap 400 on liquid-scale panels).
+IDEA N is a TRAIN-fit overnight-up rank sleeve (pred_r / P(up) / gap-filter)
+aimed at VAL 60% with cover >= 5%.
 """
 
 from __future__ import annotations
@@ -108,8 +111,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--dynamic-a-steps",
         type=int,
-        default=80,
-        help="AdamW steps for the tiny Dynamic A / off-ablation encoders",
+        default=0,
+        help="AdamW steps for the tiny Dynamic A encoder (0=auto: one epoch, cap 400)",
     )
     p.add_argument(
         "--dynamic-a-ckpt",

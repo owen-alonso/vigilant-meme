@@ -2318,6 +2318,12 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         ej_txt = format_ej_ls_block(payload)
         if ej_txt:
             lines.extend(["", ej_txt])
+    if payload.get("overnight_up_rank"):
+        from forecast.overnight_up_rank import format_overnight_up_rank_block
+
+        up_txt = format_overnight_up_rank_block(payload)
+        if up_txt:
+            lines.extend(["", up_txt])
     if payload.get("dynamic_a"):
         from forecast.overnight_dynamic import format_dynamic_a_block
 
@@ -5256,7 +5262,7 @@ def evaluate_overnight_accuracy(
     log_fn: Any | None = print,
     ablate: bool = True,
     try_dynamic_a: bool = False,
-    dynamic_a_steps: int = 80,
+    dynamic_a_steps: int = 0,
     dynamic_a_ckpt: str = "",
 ) -> dict[str, Any]:
     """PR #8 locked-TEST baseline plus train-only readouts gated on locked VAL.
@@ -6281,6 +6287,15 @@ def evaluate_overnight_accuracy(
         ),
     }
     payload["book_aligned_promotion"] = book_aligned_promotion
+    from forecast.overnight_up_rank import evaluate_overnight_up_rank
+
+    payload["overnight_up_rank"] = evaluate_overnight_up_rank(
+        {"train": tr, "val": va, "test": te},
+        min_names=min_names,
+        e_val=val_chosen_ba,
+        e_test=test_chosen_ba,
+        log_fn=log_fn,
+    )
     chosen_rel = relative_dir_fit.get("chosen") or {}
     rtau = float(chosen_rel.get("abs_tau") or 0.0)
     val_chosen_rel = score_relative_direction(
@@ -6643,7 +6658,11 @@ def evaluate_overnight_accuracy(
             f"promote_two_stage_mae="
             f"{bool(two_stage_mae_promotion.get('promote_two_stage_mae'))}  "
             f"promote_sparse_mae="
-            f"{bool(sparse_mae_promotion.get('promote_sparse_mae'))}"
+            f"{bool(sparse_mae_promotion.get('promote_sparse_mae'))}  "
+            f"promote_up_rank="
+            f"{bool((payload.get('overnight_up_rank') or {}).get('promotion', {}).get('promote_up_rank'))}  "
+            f"reached_60="
+            f"{bool((payload.get('overnight_up_rank') or {}).get('promotion', {}).get('reached_60'))}"
         )
     if try_dynamic_a:
         from forecast.overnight_dynamic import evaluate_overnight_dynamic_a

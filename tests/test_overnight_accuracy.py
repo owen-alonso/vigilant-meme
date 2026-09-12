@@ -426,6 +426,16 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert "promote_ej_ls" in ej_promo
     assert ej_promo["default_book_unchanged"] is True
     assert "PROMOTE E+J LIVE LS" in report
+    up_rank = payload["overnight_up_rank"]
+    assert up_rank["fit"]["fit_split"] == "train"
+    assert up_rank["promotion"]["gated_on"] == "val"
+    assert up_rank["promotion"]["live_book_unchanged"] is True
+    assert "promote_up_rank" in up_rank["promotion"]
+    assert "PROMOTE OVERNIGHT-UP RANK" in report
+    # Planted CS tape: some rank sleeve should clear 60% on locked VAL.
+    assert bool(up_rank["promotion"]["reached_60"]) is True
+    assert float((up_rank["compare"]["val"] or {}).get("up_pct") or 0.0) >= 60.0
+    assert float((up_rank["compare"]["val"] or {}).get("cover_full") or 0.0) >= 0.05
 
 
 def test_zero_move_direction_is_zero_not_nan():
