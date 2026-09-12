@@ -132,12 +132,56 @@ LIVE_LOCATE_BUNDLE: dict[str, Any] = {
     "locate_pctile": 0.30,
 }
 
-# VAL-gated experiment only — not the default live_locate skip.
+# Liquid VAL-promoted overnight live_locate (DESKTOP-6E207CF, tip df0f3d5).
+# Static defaults: VAL already cleared vs skip-HTB haircut=1.0
+# (IR +5.332 -> +5.579, DD -1.313 -> -0.944). TEST +1.366 / -3.429
+# report-only; TEST still prefers long-only -- do not flip CLI.
+LS_LIVE_Q = 0.20
+LS_LIVE_HAIRCUT = 0.50
+LS_LIVE_SHORT = 0.50
+
+# VAL-gated experiment only -- tighter short NAV than the live default.
 LS_HAIRCUT_EXPERIMENT: dict[str, Any] = {
     "quantile": 0.2,
     "locate_haircut": 0.5,
     "max_short_gross": 0.3,
 }
+
+
+def resolve_live_locate_knobs(
+    *,
+    quantile: float | None = None,
+    locate_haircut: float | None = None,
+    max_short_gross: float | None = None,
+    ls_haircut_experiment: bool = False,
+    long_only: bool = False,
+) -> dict[str, float]:
+    """Default overnight live_locate knobs. None means the liquid VAL spec."""
+    q = LS_LIVE_Q if quantile is None else float(quantile)
+    h = LS_LIVE_HAIRCUT if locate_haircut is None else float(locate_haircut)
+    s = LS_LIVE_SHORT if max_short_gross is None else float(max_short_gross)
+    if bool(ls_haircut_experiment) and not long_only:
+        if locate_haircut is None:
+            h = float(LS_HAIRCUT_EXPERIMENT["locate_haircut"])
+        if max_short_gross is None:
+            s = float(LS_HAIRCUT_EXPERIMENT["max_short_gross"])
+    return {
+        "quantile": q,
+        "locate_haircut": h,
+        "max_short_gross": s,
+    }
+
+
+def live_locate_cli_flags(
+    knobs: Mapping[str, Any] | None = None,
+) -> str:
+    """ASCII flags for the current (or given) live_locate knobs."""
+    k = resolve_live_locate_knobs() if knobs is None else knobs
+    return (
+        f"--quantile {float(k['quantile']):.2f} "
+        f"--locate-haircut {float(k['locate_haircut']):.2f} "
+        f"--max-short-gross {float(k['max_short_gross']):.2f}"
+    )
 
 LIVE_LONG_ONLY_BUNDLE: dict[str, Any] = {
     **LIVE_BUNDLE,

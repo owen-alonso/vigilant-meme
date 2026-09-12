@@ -634,6 +634,8 @@ def test_locate_vs_unconstrained_and_long_only_books():
         turnover_z=tz,
     )
     assert loc["locate_pctile"] == pytest.approx(0.3)
+    assert loc["locate_haircut"] == pytest.approx(0.50)
+    assert loc["max_short_gross"] == pytest.approx(0.50)
     assert loc["mean_shorts_blocked"] > 0
     assert loc["mean_short_nav"] <= ls["mean_short_nav"] + 1e-9
     assert lo["long_only"] is True
@@ -708,6 +710,21 @@ def test_backtest_live_costs_cli():
     args = build_arg_parser().parse_args(["--live-costs", "--holding", "overnight"])
     costs = cost_kwargs_from_args(args)
     assert costs["name"] == "live_locate"
+    assert args.quantile == pytest.approx(0.20)
+    assert args.locate_haircut is None
+    assert args.max_short_gross is None
+    from forecast.overnight import resolve_live_locate_knobs
+
+    knobs = resolve_live_locate_knobs(
+        quantile=args.quantile,
+        locate_haircut=args.locate_haircut,
+        max_short_gross=args.max_short_gross,
+        ls_haircut_experiment=bool(args.ls_haircut_experiment),
+        long_only=bool(args.long_only),
+    )
+    assert knobs["quantile"] == pytest.approx(0.20)
+    assert knobs["locate_haircut"] == pytest.approx(0.50)
+    assert knobs["max_short_gross"] == pytest.approx(0.50)
     assert costs["locate_pctile"] == pytest.approx(0.3)
     assert costs["moo_bps"] == pytest.approx(10.0)
     assert costs["moc_bps"] == pytest.approx(5.0)

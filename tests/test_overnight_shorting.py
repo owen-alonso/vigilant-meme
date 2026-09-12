@@ -16,8 +16,19 @@ from forecast.backtest import (
     ls_short_aligned_weights,
     sleeve_direction_from_weights,
 )
+from forecast.overnight import (
+    LS_LIVE_HAIRCUT,
+    LS_LIVE_Q,
+    LS_LIVE_SHORT,
+    live_locate_cli_flags,
+    resolve_live_locate_knobs,
+)
 from forecast.shorting import (
+    DESKTOP_COMMANDS,
     IR_LIFT,
+    LS_DEFAULT_HAIRCUT,
+    LS_DEFAULT_Q,
+    LS_DEFAULT_SHORT,
     SHORT_EXCESS_LIFT_PP,
     decide_conviction_live_promote,
     decide_ic_gate_promote,
@@ -184,13 +195,13 @@ def test_decide_ls_promote_ignores_test_and_requires_short_skill():
 def test_decide_ls_spec_promote_vs_vanilla_not_test():
     juicy_test = {"unlevered_net_ir": 9.9, "unlevered_max_dd": 0.0}
     vanilla = {
-        "name": "live_locate_q20_h1.0_s0.50",
+        "name": "live_locate_q20_h0.5_s0.50",
         "kind": "live_locate",
         "quantile": 0.20,
-        "locate_haircut": 1.0,
+        "locate_haircut": 0.5,
         "max_short_gross": 0.50,
-        "unlevered_net_ir": 5.33,
-        "unlevered_max_dd": -1.31,
+        "unlevered_net_ir": 5.579,
+        "unlevered_max_dd": -0.944,
     }
     empty = decide_ls_spec_promote({"best_ls": {}, "baseline_ls": vanilla})
     assert empty["promote_ls_spec"] is False
@@ -206,8 +217,8 @@ def test_decide_ls_spec_promote_vs_vanilla_not_test():
                 "quantile": 0.20,
                 "locate_haircut": 0.5,
                 "max_short_gross": 0.30,
-                "unlevered_net_ir": 5.50,
-                "unlevered_max_dd": -1.20,
+                "unlevered_net_ir": 5.80,
+                "unlevered_max_dd": -0.90,
             },
         }
     )
@@ -224,7 +235,7 @@ def test_decide_ls_spec_promote_vs_vanilla_not_test():
                 "quantile": 0.15,
                 "locate_haircut": 0.5,
                 "max_short_gross": 0.30,
-                "unlevered_net_ir": 5.60,
+                "unlevered_net_ir": 5.80,
                 "unlevered_max_dd": -1.50,
             },
         }
@@ -241,7 +252,7 @@ def test_decide_ls_spec_promote_vs_vanilla_not_test():
                 "quantile": 0.15,
                 "locate_haircut": 0.5,
                 "max_short_gross": 0.30,
-                "unlevered_net_ir": 5.60,
+                "unlevered_net_ir": 5.80,
                 "unlevered_max_dd": -1.50,
             },
             "rows": [
@@ -251,7 +262,7 @@ def test_decide_ls_spec_promote_vs_vanilla_not_test():
                     "quantile": 0.15,
                     "locate_haircut": 0.5,
                     "max_short_gross": 0.30,
-                    "unlevered_net_ir": 5.60,
+                    "unlevered_net_ir": 5.80,
                     "unlevered_max_dd": -1.50,
                 },
                 {
@@ -260,8 +271,8 @@ def test_decide_ls_spec_promote_vs_vanilla_not_test():
                     "quantile": 0.20,
                     "locate_haircut": 0.5,
                     "max_short_gross": 0.30,
-                    "unlevered_net_ir": 5.50,
-                    "unlevered_max_dd": -1.20,
+                    "unlevered_net_ir": 5.70,
+                    "unlevered_max_dd": -0.90,
                 },
                 dict(vanilla),
             ],
@@ -290,6 +301,70 @@ def test_decide_ls_spec_promote_vs_vanilla_not_test():
             }
         }
     ) == "live_locate"
+
+
+def test_live_locate_defaults_are_liquid_val_promoted():
+    """Static overnight --live-costs knobs = liquid VAL spec (not TEST)."""
+    from forecast.backtest import build_arg_parser
+
+    assert LS_LIVE_Q == pytest.approx(0.20)
+    assert LS_LIVE_HAIRCUT == pytest.approx(0.50)
+    assert LS_LIVE_SHORT == pytest.approx(0.50)
+    assert LS_DEFAULT_Q == pytest.approx(LS_LIVE_Q)
+    assert LS_DEFAULT_HAIRCUT == pytest.approx(LS_LIVE_HAIRCUT)
+    assert LS_DEFAULT_SHORT == pytest.approx(LS_LIVE_SHORT)
+    knobs = resolve_live_locate_knobs()
+    assert knobs["quantile"] == pytest.approx(0.20)
+    assert knobs["locate_haircut"] == pytest.approx(0.50)
+    assert knobs["max_short_gross"] == pytest.approx(0.50)
+    flags = live_locate_cli_flags()
+    assert "--quantile 0.20" in flags
+    assert "--locate-haircut 0.50" in flags
+    assert "--max-short-gross 0.50" in flags
+    assert "--quantile 0.20" in DESKTOP_COMMANDS
+    assert "--locate-haircut 0.50" in DESKTOP_COMMANDS
+    assert "--max-short-gross 0.50" in DESKTOP_COMMANDS
+    args = build_arg_parser().parse_args(["--live-costs", "--holding", "overnight"])
+    resolved = resolve_live_locate_knobs(
+        quantile=args.quantile,
+        locate_haircut=args.locate_haircut,
+        max_short_gross=args.max_short_gross,
+        ls_haircut_experiment=bool(args.ls_haircut_experiment),
+        long_only=bool(args.long_only),
+    )
+    assert resolved["quantile"] == pytest.approx(0.20)
+    assert resolved["locate_haircut"] == pytest.approx(0.50)
+    assert resolved["max_short_gross"] == pytest.approx(0.50)
+    exp = resolve_live_locate_knobs(ls_haircut_experiment=True)
+    assert exp["locate_haircut"] == pytest.approx(0.50)
+    assert exp["max_short_gross"] == pytest.approx(0.30)
+    same = decide_ls_spec_promote(
+        {
+            "best_ls": {
+                "name": "live_locate_q20_h0.5_s0.50",
+                "kind": "live_locate",
+                "quantile": 0.20,
+                "locate_haircut": 0.50,
+                "max_short_gross": 0.50,
+                "unlevered_net_ir": 5.579,
+                "unlevered_max_dd": -0.944,
+            },
+            "baseline_ls": {
+                "name": "live_locate_q20_h0.5_s0.50",
+                "kind": "live_locate",
+                "quantile": 0.20,
+                "locate_haircut": 0.50,
+                "max_short_gross": 0.50,
+                "unlevered_net_ir": 5.579,
+                "unlevered_max_dd": -0.944,
+            },
+        }
+    )
+    assert same["promote_ls_spec"] is False
+    assert same["spec"]["locate_haircut"] == pytest.approx(0.50)
+    assert "--locate-haircut 0.50" in same["cli_flags"]
+    DESKTOP_COMMANDS.encode("cp1252")
+    flags.encode("cp1252")
 
 
 def test_conviction_long_weights_matches_top_q_and_abs_floor():
@@ -1025,6 +1100,9 @@ def test_split_shorting_metrics_ls_has_borrow_and_short_nav():
     assert lo["mean_short_nav"] == pytest.approx(0.0, abs=1e-12)
     assert ls["borrow_bps"] > 0
     assert lo["borrow_bps"] == pytest.approx(0.0)
+    assert ls["quantile"] == pytest.approx(LS_DEFAULT_Q)
+    assert ls["locate_haircut"] == pytest.approx(LS_DEFAULT_HAIRCUT)
+    assert ls["max_short_gross"] == pytest.approx(LS_DEFAULT_SHORT)
     assert float((ls.get("cost_parts") or {}).get("borrow") or 0.0) > 0
     assert float((lo.get("cost_parts") or {}).get("borrow") or 0.0) == pytest.approx(0.0)
     grid = val_knob_grid(df, min_names=6, vol_target=0.0)
@@ -1068,10 +1146,21 @@ def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
     assert payload["ls_spec_promotion"]["gated_on"] == "val"
     assert "promote_ls_spec" in payload["ls_spec_promotion"]
     assert payload["ls_spec_promotion"]["default_book_unchanged_by_this_gate"] is True
+    knobs = payload["live_locate_default_knobs"]
+    assert knobs["quantile"] == pytest.approx(0.20)
+    assert knobs["locate_haircut"] == pytest.approx(0.50)
+    assert knobs["max_short_gross"] == pytest.approx(0.50)
+    assert knobs["source"] == "liquid_val_static"
+    val_ls = (payload["val"]["books"] or {}).get("live_locate") or {}
+    assert val_ls.get("quantile") == pytest.approx(0.20)
+    assert val_ls.get("locate_haircut") == pytest.approx(0.50)
+    assert val_ls.get("max_short_gross") == pytest.approx(0.50)
     assert "PROMOTE LS SPEC" in text
     assert "DEFAULT LIVE BOOK" in text
     assert "Do not flip CLI on TEST" in text
     assert "STOP 60%" in text
+    assert "static liquid VAL" in text
+    assert "--locate-haircut 0.50" in text
     text.encode("cp1252")
     assert payload["lo_refine_promotion"]["gated_on"] == "val"
     assert payload["ic_gate_fit"]["fit_split"] == "train"

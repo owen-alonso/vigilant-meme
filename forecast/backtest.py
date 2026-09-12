@@ -34,7 +34,11 @@ from forecast.overnight import (
     overnight_cost_breakdown,
     overnight_one_way_turnover,
     resolve_cost_bundle,
+    resolve_live_locate_knobs,
     LS_HAIRCUT_EXPERIMENT,
+    LS_LIVE_HAIRCUT,
+    LS_LIVE_Q,
+    LS_LIVE_SHORT,
 )
 from forecast.generate import (
     forecast_panel,
@@ -854,9 +858,9 @@ def book_pnl(
     thin_mult: float = 1.0,
     thin_pctile: float = 0.0,
     locate_pctile: float = 0.0,
-    locate_haircut: float = 1.0,
+    locate_haircut: float = LS_LIVE_HAIRCUT,
     locate_frac: float = 1.0,
-    max_short_gross: float = 0.5,
+    max_short_gross: float = LS_LIVE_SHORT,
     ex_post_gap_k: float = 0.0,
     turnover_z: pd.DataFrame | None = None,
     vol_level: pd.DataFrame | None = None,
@@ -1420,7 +1424,7 @@ def format_report(stats: dict[str, Any], *, checkpoint: Path, test_start: Any) -
         f"  impact_k {stats.get('impact_vol_k', 0):.1f}"
         f"  thin x{stats.get('thin_mult', 1):.1f}@{100 * float(stats.get('thin_pctile', 0) or 0):.0f}%",
         f"  locate     bottom {100 * float(stats.get('locate_pctile', 0) or 0):.0f}% turnover "
-        f"haircut={float(stats.get('locate_haircut', 1) or 0):.2f} "
+        f"haircut={float(stats.get('locate_haircut', LS_LIVE_HAIRCUT) or 0):.2f} "
         f"frac={float(stats.get('locate_frac', 1) or 0):.2f} "
         f"max_short={float(stats.get('max_short_gross', 0.5) or 0):.2f}"
         f"  (mean names/date {stats.get('mean_shorts_blocked', 0):.2f})",
@@ -1482,7 +1486,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--checkpoint", default="checkpoints/forecast/best.pt")
     p.add_argument("--data", default=None)
     p.add_argument("--symbols", default=None)
-    p.add_argument("--quantile", type=float, default=0.2)
+    p.add_argument(
+        "--quantile",
+        type=float,
+        default=LS_LIVE_Q,
+        help="top/bottom quantile (default 0.20 = liquid VAL live_locate)",
+    )
     p.add_argument(
         "--weighting",
         choices=("quantile", "rank"),
@@ -1513,7 +1522,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--live-costs",
         action="store_true",
         help="shorthand for --cost-bundle live_locate (honest LS) or live_long_only "
-        "with --long-only. Unconstrained shorts: --cost-bundle live.",
+        "with --long-only. Default LS knobs are liquid VAL: "
+        f"q={LS_LIVE_Q:.2f} / haircut={LS_LIVE_HAIRCUT:.2f} / "
+        f"short={LS_LIVE_SHORT:.2f}. Unconstrained shorts: --cost-bundle live.",
     )
     p.add_argument(
         "--open-auction-bps",
@@ -1694,7 +1705,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--locate-haircut",
         type=float,
         default=None,
-        help="1.0 skip HTB shorts (default); 0.5 haircut them to half size (causal turnover_z)",
+        help=(
+            f"{LS_LIVE_HAIRCUT:.2f} halves HTB shorts (liquid VAL default); "
+            "1.0 skips them (causal turnover_z)"
+        ),
     )
     p.add_argument(
         "--locate-frac",
@@ -1706,14 +1720,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-short-gross",
         type=float,
         default=None,
-        help="cap short NAV after locate (default 0.5 = dollar-neutral short leg)",
+        help=(
+            f"cap short NAV after locate (default {LS_LIVE_SHORT:.2f} = "
+            "liquid VAL live_locate)"
+        ),
     )
     p.add_argument(
         "--ls-haircut-experiment",
         action="store_true",
         help="VAL-gated experiment (NOT default): locate_haircut=0.5 and "
         "max_short_gross=0.3 on live_locate. Ignored with --long-only. "
-        "Default remains skip HTB shorts (haircut=1, short NAV 0.5).",
+        f"Default is haircut={LS_LIVE_HAIRCUT:.2f} / short NAV {LS_LIVE_SHORT:.2f} "
+        "(liquid VAL).",
     )
     p.add_argument(
         "--ex-post-gap-k",
@@ -1873,16 +1891,20 @@ def main(argv: list[str] | None = None) -> int:
         else None
     )
     ppy = 252.0 if data_cfg.is_daily() else (52.0 if data_cfg.interval == "weekly" else 12.0)
-    haircut = float(args.locate_haircut) if args.locate_haircut is not None else 1.0
-    short_cap = float(args.max_short_gross) if args.max_short_gross is not None else 0.5
+    knobs = resolve_live_locate_knobs(
+        quantile=getattr(args, "quantile", None),
+        locate_haircut=getattr(args, "locate_haircut", None),
+        max_short_gross=getattr(args, "max_short_gross", None),
+        ls_haircut_experiment=bool(getattr(args, "ls_haircut_experiment", False)),
+        long_only=bool(args.long_only),
+    )
+    haircut = float(knobs["locate_haircut"])
+    short_cap = float(knobs["max_short_gross"])
     if bool(getattr(args, "ls_haircut_experiment", False)) and not args.long_only:
-        if args.locate_haircut is None:
-            haircut = float(LS_HAIRCUT_EXPERIMENT["locate_haircut"])
-        if args.max_short_gross is None:
-            short_cap = float(LS_HAIRCUT_EXPERIMENT["max_short_gross"])
         print(
-            "NOTE: --ls-haircut-experiment is NOT the default live_locate skip "
-            f"(haircut={haircut:.2f}, max_short={short_cap:.2f}).",
+            "NOTE: --ls-haircut-experiment is NOT the default live_locate "
+            f"(haircut={haircut:.2f}, max_short={short_cap:.2f}; default is "
+            f"haircut={LS_LIVE_HAIRCUT:.2f} / short={LS_LIVE_SHORT:.2f}).",
             file=sys.stderr,
         )
     book_kw = dict(

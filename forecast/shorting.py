@@ -43,9 +43,13 @@ from forecast.overnight import (
     LIVE_LOCATE_BUNDLE,
     LIVE_LONG_ONLY_BUNDLE,
     LS_HAIRCUT_EXPERIMENT,
+    LS_LIVE_HAIRCUT,
+    LS_LIVE_Q,
+    LS_LIVE_SHORT,
     OVERNIGHT_FORMULA,
     PAPER_BUNDLE,
     formula_log_line,
+    live_locate_cli_flags,
 )
 
 # Sleeve excess is printed in percentage points. DIR_LIFT is a fraction.
@@ -55,10 +59,10 @@ IR_LIFT = 0.05
 # Long-only book: VAL IR lift vs live_long_only q20, and max-DD not much worse.
 LO_IR_LIFT = 0.05
 LO_DD_TOL = 0.05
-# Vanilla live_locate default used by split_shorting_metrics / backtest --live-costs.
-LS_DEFAULT_Q = 0.20
-LS_DEFAULT_HAIRCUT = 1.0
-LS_DEFAULT_SHORT = 0.50
+# Vanilla live_locate default = liquid VAL-promoted spec (static).
+LS_DEFAULT_Q = LS_LIVE_Q
+LS_DEFAULT_HAIRCUT = LS_LIVE_HAIRCUT
+LS_DEFAULT_SHORT = LS_LIVE_SHORT
 # TEST veto only: promoted VAL spec may not fall this far below q20 TEST IR.
 TEST_COLLAPSE = 0.05
 
@@ -133,9 +137,10 @@ python scripts/overnight_shorting.py --data-dir data --universe liquid \\
     --json checkpoints/forecast_ridge_overnight/shorting.json
 
 # Honest LS (live_locate locate/borrow). VAL default on liquid; TEST may prefer LO.
+# Static knobs = liquid VAL-promoted spec (q20 / haircut 0.50 / short 0.50).
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
-  --holding overnight --live-costs
-# If PROMOTE LS SPEC? YES, add the printed --quantile / --locate-haircut / --max-short-gross
+  --holding overnight --live-costs \\
+  --quantile 0.20 --locate-haircut 0.50 --max-short-gross 0.50
 # unconstrained shorts (old live; not the honest default)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --cost-bundle live --compare-long-only
@@ -256,10 +261,10 @@ def _run_overnight_book(
     overnight_r: pd.DataFrame | None = None,
     turnover_z: pd.DataFrame | None = None,
     vol_level: pd.DataFrame | None = None,
-    quantile: float = 0.2,
-    locate_haircut: float = 1.0,
+    quantile: float = LS_DEFAULT_Q,
+    locate_haircut: float = LS_DEFAULT_HAIRCUT,
     locate_frac: float = 1.0,
-    max_short_gross: float = 0.5,
+    max_short_gross: float = LS_DEFAULT_SHORT,
     weighting: str = "quantile",
     adv_floor_pctile: float = 0.0,
     long_size: str = "equal",
@@ -426,10 +431,12 @@ def val_knob_grid(
     baseline_ls = {}
     for r in ls_rows:
         if (
-            abs(_as_float(r.get("quantile"), 0.2) - LS_DEFAULT_Q) < 1e-12
-            and abs(_as_float(r.get("locate_haircut"), 1.0) - LS_DEFAULT_HAIRCUT)
+            abs(_as_float(r.get("quantile"), LS_DEFAULT_Q) - LS_DEFAULT_Q) < 1e-12
+            and abs(_as_float(r.get("locate_haircut"), LS_DEFAULT_HAIRCUT)
+            - LS_DEFAULT_HAIRCUT)
             < 1e-12
-            and abs(_as_float(r.get("max_short_gross"), 0.5) - LS_DEFAULT_SHORT)
+            and abs(_as_float(r.get("max_short_gross"), LS_DEFAULT_SHORT)
+            - LS_DEFAULT_SHORT)
             < 1e-12
         ):
             baseline_ls = dict(r)
@@ -3084,7 +3091,8 @@ def decide_ls_experiment(val: dict[str, Any], experiment_book: dict[str, Any]) -
             + (
                 f"Haircut 0.5 / short NAV 0.30 beats long-only on VAL "
                 f"(unlev net IR {ir_ls:+.3f} vs {ir_lo:+.3f}, delta {ir_delta:+.3f}). "
-                "Keep live_locate skip as the honest default until liquid VAL agrees."
+                "Keep live_locate q20/h0.5/s0.50 as the honest default until a "
+                "VAL spec beats it."
                 if beats
                 else (
                     f"Haircut 0.5 / short NAV 0.30 does not beat long-only on VAL "
@@ -3143,6 +3151,9 @@ def split_shorting_metrics(
                 overnight_r=r_on,
                 turnover_z=tz,
                 vol_level=vol,
+                quantile=LS_DEFAULT_Q,
+                locate_haircut=LS_DEFAULT_HAIRCUT,
+                max_short_gross=LS_DEFAULT_SHORT,
             )
     short20 = book.get("short_bottom20") or {}
     direction = scored.get("direction") or {}
@@ -3221,12 +3232,25 @@ def decide_ls_promote(val: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _ls_vanilla_label() -> str:
+    return (
+        f"q{int(round(100 * LS_DEFAULT_Q))}/"
+        f"h{LS_DEFAULT_HAIRCUT:.1f}/"
+        f"s{LS_DEFAULT_SHORT:.2f}"
+    )
+
+
 def _is_vanilla_ls_row(row: Mapping[str, Any]) -> bool:
     return (
         abs(_as_float(row.get("quantile"), LS_DEFAULT_Q) - LS_DEFAULT_Q) < 1e-12
-        and abs(_as_float(row.get("locate_haircut"), 1.0) - LS_DEFAULT_HAIRCUT)
+        and abs(
+            _as_float(row.get("locate_haircut"), LS_DEFAULT_HAIRCUT)
+            - LS_DEFAULT_HAIRCUT
+        )
         < 1e-12
-        and abs(_as_float(row.get("max_short_gross"), 0.5) - LS_DEFAULT_SHORT)
+        and abs(
+            _as_float(row.get("max_short_gross"), LS_DEFAULT_SHORT) - LS_DEFAULT_SHORT
+        )
         < 1e-12
     )
 
@@ -3236,7 +3260,7 @@ def decide_ls_spec_promote(
     *,
     val_ls_default: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """VAL-only refine of live_locate knobs vs vanilla q20 / haircut 1 / short 0.50.
+    """VAL-only refine of live_locate knobs vs vanilla q20 / haircut 0.5 / short 0.50.
 
     Scans every live_locate grid row (not just IR-max). A row that fails the
     DD gate does not veto a lower-IR row that clears both IR and DD.
@@ -3247,7 +3271,10 @@ def decide_ls_spec_promote(
     baseline = dict(grid.get("baseline_ls") or {})
     if not baseline and val_ls_default:
         baseline = {
-            "name": "live_locate_q20_h1.0_s0.50",
+            "name": (
+                f"live_locate_q{int(round(100 * LS_DEFAULT_Q))}"
+                f"_h{LS_DEFAULT_HAIRCUT:.1f}_s{LS_DEFAULT_SHORT:.2f}"
+            ),
             "kind": "live_locate",
             "quantile": LS_DEFAULT_Q,
             "locate_haircut": LS_DEFAULT_HAIRCUT,
@@ -3325,7 +3352,7 @@ def decide_ls_spec_promote(
         }
         reason = (
             f"PROMOTE live_locate spec {chosen.get('name')}: VAL unlev net IR "
-            f"{ir_best:+.3f} vs vanilla q20/h1/s0.50 {ir_base:+.3f} "
+            f"{ir_best:+.3f} vs vanilla {_ls_vanilla_label()} {ir_base:+.3f} "
             f"(delta {ir_delta:+.3f} >= {IR_LIFT:.2f}) and max DD "
             f"{dd_best:+.3f} vs {dd_base:+.3f} (n_pass={len(passing)}). "
             "TEST report-only. Does not flip LS vs long-only."
@@ -3333,11 +3360,11 @@ def decide_ls_spec_promote(
     elif not rows:
         reason = (
             "NO PROMOTE live_locate spec: empty VAL LS knob grid. "
-            "Keep vanilla q20 / haircut 1 / short 0.50."
+            f"Keep vanilla {_ls_vanilla_label()}."
         )
     elif not np.isfinite(ir_max_delta) or ir_max_delta < IR_LIFT:
         reason = (
-            "NO LIFT: no live_locate knob beats vanilla q20/h1/s0.50 by "
+            f"NO LIFT: no live_locate knob beats vanilla {_ls_vanilla_label()} by "
             f"{IR_LIFT:.2f} unlev net IR "
             f"(best {ir_max.get('name')} {ir_max_ir:+.3f} vs {ir_base:+.3f}, "
             f"delta {ir_max_delta:+.3f}). Keep vanilla live_locate."
@@ -3355,13 +3382,11 @@ def decide_ls_spec_promote(
     cli = (
         "python -m forecast.backtest "
         "--checkpoint checkpoints/forecast_ridge_overnight/best.pt "
-        "--holding overnight --live-costs"
-    )
-    if promote:
-        cli = (
-            f"{cli} --quantile {q:.2f} --locate-haircut {h:.2f} "
-            f"--max-short-gross {s:.2f}"
+        "--holding overnight --live-costs "
+        + live_locate_cli_flags(
+            {"quantile": q, "locate_haircut": h, "max_short_gross": s}
         )
+    )
     return {
         "promote_ls_spec": promote,
         "gated_on": "val",
@@ -4029,12 +4054,12 @@ def evaluate_overnight_shorting(
                 overnight_r=r_t,
                 turnover_z=tz_t,
                 vol_level=vol_t,
-                quantile=float(ls_spec.get("quantile") or LS_DEFAULT_Q),
-                locate_haircut=float(
-                    ls_spec.get("locate_haircut") or LS_DEFAULT_HAIRCUT
+                quantile=_as_float(ls_spec.get("quantile"), LS_DEFAULT_Q),
+                locate_haircut=_as_float(
+                    ls_spec.get("locate_haircut"), LS_DEFAULT_HAIRCUT
                 ),
-                max_short_gross=float(
-                    ls_spec.get("max_short_gross") or LS_DEFAULT_SHORT
+                max_short_gross=_as_float(
+                    ls_spec.get("max_short_gross"), LS_DEFAULT_SHORT
                 ),
             )
     lo_refine_promo = decide_lo_refine(
@@ -4104,6 +4129,12 @@ def evaluate_overnight_shorting(
         "sticky_promotion": sticky_promo,
         "ls_experiment": ls_exp,
         "ls_spec_promotion": ls_spec_promo,
+        "live_locate_default_knobs": {
+            "quantile": LS_DEFAULT_Q,
+            "locate_haircut": LS_DEFAULT_HAIRCUT,
+            "max_short_gross": LS_DEFAULT_SHORT,
+            "source": "liquid_val_static",
+        },
         "test_ls_spec": test_ls_spec,
         "test_prefers_book": report_test_prefers_book(test),
         "test_long_only_promoted": test_lo_promoted,
@@ -4135,6 +4166,9 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
         _split_block("LOCKED VAL (gate)", payload.get("val") or {}),
         "",
         f"DEFAULT LIVE BOOK (VAL) = {promo.get('default_book')}",
+        "  live_locate default knobs (static liquid VAL): "
+        f"q={LS_DEFAULT_Q:.2f} haircut={LS_DEFAULT_HAIRCUT:.2f} "
+        f"short={LS_DEFAULT_SHORT:.2f}",
         f"  VAL  live_locate    IR {_fmt(val_ls.get('unlevered_net_ir'), '+.3f')}  "
         f"maxDD {_fmt(val_ls.get('unlevered_max_dd'), '+.3f')}",
         f"  VAL  live_long_only IR {_fmt(val_lo.get('unlevered_net_ir'), '+.3f')}  "
