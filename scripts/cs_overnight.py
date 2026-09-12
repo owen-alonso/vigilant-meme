@@ -912,7 +912,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--try-dynamic-a",
         action="store_true",
-        help="Dynamic A tiny encoder; promote only if locked val AND test lift vs skip",
+        help="Dynamic A tiny encoder; promote only if locked VAL lifts vs skip (TEST report-only)",
     )
     p.add_argument("--encoder-steps", type=int, default=80)
     p.add_argument("--checkpoint-dir", default="checkpoints/forecast_overnight")
@@ -1158,25 +1158,23 @@ def main(argv: list[str] | None = None) -> int:
         )
         dyn_val = float(dyn.get("best_val_ic", float("nan")))
         dyn_test = float((dyn.get("test") or {}).get("cs_ic", float("nan")))
+        from forecast.overnight_dynamic import decide_dynamic_a_cs_promote
+
+        dyn_promo = decide_dynamic_a_cs_promote(
+            dyn_val=dyn_val,
+            skip_val=float(val["cs_ic"]),
+            dyn_test=dyn_test,
+            skip_test=float(test["cs_ic"]),
+            val_lift=VAL_LIFT,
+        )
         payload["dynamic_a"] = {
             "best_val_ic": dyn_val,
             "test": slim_cs_stats(dyn.get("test") or {}),
             "device": dyn.get("device"),
+            "dynamic_health": dyn.get("dynamic_health"),
+            "promotion": dyn_promo,
         }
-        val_lift = np.isfinite(dyn_val) and dyn_val >= float(val["cs_ic"]) + VAL_LIFT
-        test_lift = np.isfinite(dyn_test) and dyn_test >= float(test["cs_ic"]) + VAL_LIFT
-        if val_lift and test_lift:
-            print(
-                f"Dynamic A lifted val ({dyn_val:+.4f}) and test ({dyn_test:+.4f}) vs skip. "
-                "Still report as an ablation, not a bigger-Mamba default.",
-                flush=True,
-            )
-        else:
-            print(
-                f"NO PROMOTE Dynamic A: val={dyn_val:+.4f} test={dyn_test:+.4f} "
-                f"vs skip val={val['cs_ic']:+.4f} test={test['cs_ic']:+.4f}.",
-                flush=True,
-            )
+        print(dyn_promo["reason"], flush=True)
 
     live = next((r for r in payload["stress"] if r["name"] == "live"), None)
     live_flat = next((r for r in payload["stress"] if r["name"] == "live_flat"), None)

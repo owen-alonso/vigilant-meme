@@ -95,8 +95,11 @@ def forecast_panel(
             dates = _date_keys(pd.DataFrame({"datetime": rows["datetime"]}))
         if "vol_level" in rows.columns:
             vol = rows["vol_level"].to_numpy(dtype=np.float64)
+        close_t = (
+            rows["close"].to_numpy(dtype=np.float64) if "close" in rows.columns else None
+        )
         pred_log_return = apply_calibrate_spec(
-            pred_log_return, cal, dates=dates, vol_level=vol
+            pred_log_return, cal, dates=dates, vol_level=vol, close=close_t
         )
     close = rows["close"].to_numpy(dtype=np.float64)
 

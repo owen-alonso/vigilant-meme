@@ -69,6 +69,20 @@ python -m forecast.training --universe liquid --interval daily --skip-only \
 
 # locked TEST direction % + next-open MAE (PR #8 baseline + train-only readouts)
 # fit on TRAIN, promote on locked VAL, report locked TEST. Not live P&L.
+# cond_dir_blend = high-|pred| mix of left_tail_l1 ⊕ confidence_blend (TRAIN q,λ)
+# decile_reliability = keep residual*sigma only in TRAIN-reliable pred_r bins
+# cs_left_veto = always-up except CS-bottom ∩ TS left tail (TRAIN q, τ)
+# logistic_up = TRAIN logistic P(up|pred_r) with TRAIN-chosen τ
+# book_aligned = overnight up-rate of TRAIN-chosen top-q residual names vs uncond floor
+# conviction_live = optional --live-costs --long-only IR gate on that sleeve vs q20
+# sector_mae = TRAIN residual→overnight maps on sector-overnight skip; VAL % MAE gate
+# relative_dir = within-date sign(pred − CS median) vs sign(r_on − CS median); hit vs 50%
+# long-half up = pred > CS median absolute overnight-up vs floor / top-20% (VAL-gated)
+# rel_e_stack = H long-half ∩ E top-q / |pred|; VAL relative / abs-vs-E / live-IR gates
+# short_aligned = overnight down-rate of TRAIN bottom-q residual names vs down-floor / bot-20%
+# ej_ls = symmetric long-E / short-J live_locate vs q20 (paper zero-cost is report-only)
+# two_stage_mae = TRAIN residual→gap then gap→next-open $/% (or residual+DOW+vol ridge)
+# sparse_mae = TRAIN affine/huber only when |pred*sigma|>=τ; else zero-move
 python scripts/overnight_accuracy.py --data-dir data --universe liquid \
     --json checkpoints/forecast_ridge_overnight/accuracy.json \
     --calibrate-json checkpoints/forecast_ridge_overnight/overnight_calibrate.json
@@ -85,18 +99,56 @@ python scripts/cs_overnight.py --data-dir data --universe liquid --try-fill 15 -
 # optional weekly residual fallback if harsh MOO kills overnight
 python scripts/cs_overnight.py --data-dir data --universe liquid --try-weekly --no-lastbar-residual
 
-# live cost bundle (name-level MOC/MOO + thin/vol impact + borrow + hedge)
+# VAL-gated overnight LS vs long-only (TEST report-only). Cloud VM: --synthetic.
+python scripts/overnight_shorting.py --data-dir data --universe liquid \
+    --json checkpoints/forecast_ridge_overnight/shorting.json
+python scripts/overnight_shorting.py --synthetic
+
+# honest LS live_locate (locate + borrow) — default --live-costs; auto-prints long-only
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
-  --holding overnight --live-costs --compare-long-only
-# locate-gated shorts (bottom 30% CS turnover_z cannot be shorted)
+  --holding overnight --live-costs
+# unconstrained shorts (old live; not the honest default)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
-  --holding overnight --live-costs --locate-adv-pctile 0.3
-# long-only, no locate
+  --holding overnight --cost-bundle live --compare-long-only
+# long-only, no locate, borrow=0 — default live book after LS failed VAL
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --live-costs --long-only
+# VAL-promoted long-only spec on synthetic (rank vs q20); confirm on liquid VAL
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --long-only --weighting rank
+# long-only conviction / inv-vol resize (VAL-gated; default remains equal q20)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --long-only --long-size inv_vol --conf-pctile 0.5
 # optional liquid sleeve (top CS turnover tercile; same skip w; use a lower min-names)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
-  --holding overnight --live-costs --adv-floor-pctile 0.67 --min-names 8
+  --holding overnight --live-costs --long-only --adv-floor-pctile 0.67 --min-names 8
+# LS haircut experiment (NOT default): HTB shorts at half size, short NAV 0.30
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --ls-haircut-experiment
+# causal trailing overnight CS-IC trade gate (TRAIN-fit W,τ; default off)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --long-only --ic-gate-window 60 --ic-gate-tau 0.0
+# causal Friday / weekend weekday mask (VAL-gated; default always-on)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --long-only --weekday-mask flat_friday
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --long-only --weekday-mask weekend_only
+# sector-overnight residual is the default skip (--sector-residual).
+# SPY-only overnight residual baseline (A) for the VAL compare:
+python -m forecast.training --universe liquid --interval daily --skip-only \
+  --label-return overnight --no-sector-residual \
+  --checkpoint-dir checkpoints/forecast_ridge_overnight_spy
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight_spy/best.pt \
+  --holding overnight --live-costs --long-only
+# causal CS-dispersion stress gate (TRAIN-fit kind/W/τ; default off)
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
+  --holding overnight --live-costs --long-only --disp-gate-kind cc --disp-gate-window 1 --disp-gate-tau 0.02
+# overnight ⊕ close-to-close rank ensemble is TRAIN-chosen α, VAL-gated (α=1 default)
+# causal adaptive α_t (trailing CS IC of overnight vs c2c) is TRAIN W/rule, VAL-gated (default off)
+# sticky long-only enter/exit hysteresis is TRAIN-chosen, VAL-gated (default always-rebuild q20)
+# soft trailing CS-IC gross scale is TRAIN-chosen, VAL-gated (default off / full q20)
+python -m forecast.training --universe liquid --interval daily --skip-only \
+  --label-return close --checkpoint-dir checkpoints/forecast_ridge
 # harsh auction stress
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \
   --holding overnight --cost-bundle harsh
@@ -117,8 +169,8 @@ Overnight **live vs paper** (same flatten book, 15% causal vol):
 |---|---|
 | `paper` / `--cost-bps 10` | enter+exit 10 bp. Understates auction/locate. |
 | `live_flat` | 20 bp RT + 10 bp on the *exit half-notional* + 5 borrow + 10 hedge. First live-ish overlay. |
-| `live` (`--live-costs`) | 20 bp RT + **5 bp MOC + 10 bp MOO on full \|w\|**, ×2 on the bottom 30% CS `turnover_z`, + `8 * max(vol_level,0)` bp impact, + 5 borrow + 10 hedge. |
-| `live_locate` | `live` plus no shorts in the bottom 30% turnover (HTB proxy). Report IR with and without this gate. |
+| `live` | 20 bp RT + **5 bp MOC + 10 bp MOO on full \|w\|**, ×2 on the bottom 30% CS `turnover_z`, + `8 * max(vol_level,0)` bp impact, + 5 borrow + 10 hedge. Unconstrained shorts — not the honest default. |
+| `live_locate` (`--live-costs`) | `live` plus no shorts in the bottom 30% turnover (HTB proxy). Honest LS default. Report IR vs long-only on the same window. |
 | `live_long_only` | `live` with no shorts, borrow=0. Residual still assumes a liquid ETF hedge overlay. Long sleeve ADV participation is ~2× the 50/50 long sleeve. |
 | `harsh` | ugly MOO (30 bp), HTB, higher impact. If net IR dies, stop; next estimand is open+N fill or weekly residual — not bigger Mamba. |
 | `ex_post_gap` | sensitivity: extra `0.25 * \|overnight move\| * \|w\|`. Uses realized. Not the default. |

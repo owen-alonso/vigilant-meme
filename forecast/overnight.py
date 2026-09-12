@@ -132,6 +132,57 @@ LIVE_LOCATE_BUNDLE: dict[str, Any] = {
     "locate_pctile": 0.30,
 }
 
+# Liquid VAL-promoted overnight live_locate (DESKTOP-6E207CF, tip df0f3d5).
+# Static defaults: VAL already cleared vs skip-HTB haircut=1.0
+# (IR +5.332 -> +5.579, DD -1.313 -> -0.944). TEST +1.366 / -3.429
+# report-only; TEST still prefers long-only -- do not flip CLI.
+LS_LIVE_Q = 0.20
+LS_LIVE_HAIRCUT = 0.50
+LS_LIVE_SHORT = 0.50
+
+# VAL-gated experiment only -- tighter short NAV than the live default.
+LS_HAIRCUT_EXPERIMENT: dict[str, Any] = {
+    "quantile": 0.2,
+    "locate_haircut": 0.5,
+    "max_short_gross": 0.3,
+}
+
+
+def resolve_live_locate_knobs(
+    *,
+    quantile: float | None = None,
+    locate_haircut: float | None = None,
+    max_short_gross: float | None = None,
+    ls_haircut_experiment: bool = False,
+    long_only: bool = False,
+) -> dict[str, float]:
+    """Default overnight live_locate knobs. None means the liquid VAL spec."""
+    q = LS_LIVE_Q if quantile is None else float(quantile)
+    h = LS_LIVE_HAIRCUT if locate_haircut is None else float(locate_haircut)
+    s = LS_LIVE_SHORT if max_short_gross is None else float(max_short_gross)
+    if bool(ls_haircut_experiment) and not long_only:
+        if locate_haircut is None:
+            h = float(LS_HAIRCUT_EXPERIMENT["locate_haircut"])
+        if max_short_gross is None:
+            s = float(LS_HAIRCUT_EXPERIMENT["max_short_gross"])
+    return {
+        "quantile": q,
+        "locate_haircut": h,
+        "max_short_gross": s,
+    }
+
+
+def live_locate_cli_flags(
+    knobs: Mapping[str, Any] | None = None,
+) -> str:
+    """ASCII flags for the current (or given) live_locate knobs."""
+    k = resolve_live_locate_knobs() if knobs is None else knobs
+    return (
+        f"--quantile {float(k['quantile']):.2f} "
+        f"--locate-haircut {float(k['locate_haircut']):.2f} "
+        f"--max-short-gross {float(k['max_short_gross']):.2f}"
+    )
+
 LIVE_LONG_ONLY_BUNDLE: dict[str, Any] = {
     **LIVE_BUNDLE,
     "name": "live_long_only",
@@ -370,6 +421,68 @@ def row_cs_thin_mask(turnover_z: np.ndarray, pctile: float) -> np.ndarray:
     return out
 
 
+def apply_short_constraints(
+    weights: np.ndarray,
+    turnover_z: np.ndarray | None = None,
+    *,
+    locate_pctile: float = 0.0,
+    locate_haircut: float = 1.0,
+    locate_frac: float = 1.0,
+    max_short_gross: float = 0.5,
+    long_only: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Causal short constraints known at close t. Longs are not resized.
+
+    ``locate_pctile``: HTB proxy — bottom CS ``turnover_z`` shorts.
+    ``locate_haircut``: 1.0 zeros those shorts (skip); 0.5 halves them.
+    Remaining locatable shorts are rescaled toward ``0.5 * locate_frac`` NAV
+    (the original locate gate filled remaining shorts back to 0.5).
+    ``max_short_gross`` then caps short NAV. If every short is blocked the
+    date stays long-biased — that is the constraint, not a silent long-only
+    renormalization.
+    """
+    w = np.asarray(weights, dtype=np.float64).copy()
+    squeeze = w.ndim == 1
+    if squeeze:
+        w = w.reshape(1, -1)
+    blocked = np.zeros(w.shape[0], dtype=np.float64)
+    if long_only:
+        return (w[0] if squeeze else w), blocked
+    haircut = float(np.clip(locate_haircut, 0.0, 1.0))
+    frac = float(np.clip(locate_frac, 0.0, 1.0))
+    cap = max(0.0, float(max_short_gross))
+    target = min(cap, 0.5 * frac) if frac > 0 else 0.0
+    thin = None
+    if float(locate_pctile) > 0 and turnover_z is not None and haircut > 0:
+        thin = row_cs_thin_mask(_as_2d(turnover_z, w.shape), float(locate_pctile))
+    for i in range(w.shape[0]):
+        short = w[i] < 0
+        if thin is not None:
+            hit = short & thin[i]
+            blocked[i] = float(hit.sum())
+            if bool(hit.any()):
+                if haircut >= 1.0 - 1e-12:
+                    w[i, hit] = 0.0
+                else:
+                    w[i, hit] = w[i, hit] * (1.0 - haircut)
+        ss = float((-np.clip(w[i], None, 0.0)).sum())
+        # Original locate skip refills remaining locatable shorts to target NAV.
+        # A partial haircut must not inflate HTB names back to full size.
+        inflate = (
+            haircut >= 1.0 - 1e-12
+            and float(locate_pctile) > 0
+            and thin is not None
+        )
+        if ss > 1e-12 and target > 0 and (inflate or ss > target + 1e-12):
+            w[i] = np.where(w[i] < 0.0, w[i] * (target / ss), w[i])
+        elif ss > 1e-12 and target <= 0:
+            w[i] = np.where(w[i] < 0.0, 0.0, w[i])
+        ss = float((-np.clip(w[i], None, 0.0)).sum())
+        if cap > 0 and ss > cap + 1e-12:
+            w[i] = np.where(w[i] < 0.0, w[i] * (cap / ss), w[i])
+    return (w[0] if squeeze else w), blocked
+
+
 def apply_locate_gate(
     weights: np.ndarray,
     turnover_z: np.ndarray | None,
@@ -383,25 +496,15 @@ def apply_locate_gate(
     long-biased at 0.5 NAV — that is the locate constraint, not a silent
     long-only renormalization. Returns ``(weights, n_blocked_per_date)``.
     """
-    w = np.asarray(weights, dtype=np.float64).copy()
-    squeeze = w.ndim == 1
-    if squeeze:
-        w = w.reshape(1, -1)
-    blocked = np.zeros(w.shape[0], dtype=np.float64)
-    if long_only or float(pctile) <= 0 or turnover_z is None:
-        return (w[0] if squeeze else w), blocked
-    thin = row_cs_thin_mask(_as_2d(turnover_z, w.shape), float(pctile))
-    for i in range(w.shape[0]):
-        short = w[i] < 0
-        hit = short & thin[i]
-        blocked[i] = float(hit.sum())
-        if not bool(hit.any()):
-            continue
-        w[i, hit] = 0.0
-        ss = float((-np.clip(w[i], None, 0.0)).sum())
-        if ss > 1e-12:
-            w[i] = np.where(w[i] < 0.0, w[i] * (0.5 / ss), w[i])
-    return (w[0] if squeeze else w), blocked
+    return apply_short_constraints(
+        weights,
+        turnover_z,
+        locate_pctile=float(pctile),
+        locate_haircut=1.0,
+        locate_frac=1.0,
+        max_short_gross=0.5,
+        long_only=bool(long_only),
+    )
 
 
 def overnight_stress_costs(

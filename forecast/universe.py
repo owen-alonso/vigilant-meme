@@ -248,12 +248,21 @@ def universe_name_list(universe: str) -> tuple[str, ...]:
     )
 
 
+def synthetic_sector_etf(symbol: str) -> str | None:
+    """Planted ``S00``… names: first six → XLK, rest → XLF. None otherwise."""
+    raw = str(symbol).upper()
+    if len(raw) == 3 and raw[0] == "S" and raw[1:].isdigit():
+        return "XLK" if int(raw[1:]) < 6 else "XLF"
+    return None
+
+
 def hedge_symbol_for(symbol: str, *, sector_residual: bool, benchmark: str = "SPY") -> str:
     """Causal hedge ticker for residual labels. SPY if sector map or ETF is unused."""
     bench = str(benchmark or "SPY").upper()
     if not sector_residual:
         return bench
-    mapped = SECTOR_ETF_BY_SYMBOL.get(str(symbol).upper())
+    key = str(symbol).upper()
+    mapped = SECTOR_ETF_BY_SYMBOL.get(key) or synthetic_sector_etf(key)
     return mapped if mapped else bench
 
 
