@@ -161,6 +161,7 @@ python scripts/cs_year_ablate.py --data-dir data --universe liquid
 python scripts/cs_regime_ablate.py --data-dir data --universe liquid
 python scripts/cs_shrink_ablate.py --data-dir data --universe liquid --also-labels
 python -m forecast.training --universe liquid --skip-only --label-return overnight
+python scripts/pretrain_finetune.py --data-dir data --universe liquid
 python scripts/cs_overnight.py --data-dir data --universe liquid
 python scripts/overnight_accuracy.py --data-dir data --universe liquid
 python scripts/ablate_cs.py
@@ -177,7 +178,11 @@ y_t = \frac{r_{t+1} - \beta_t r^{\mathrm{hedge}}_{t+1}}{\sigma_t}
 
 Overnight (`--label-return overnight`) replaces \(r_{t+1}\) with
 \(\log(\mathrm{open}_{t+1})-\log(\mathrm{close}_t)\). Next open is a **label**,
-never a feature. Backtest `--holding overnight` flattens every open (MOC→MOO).
+never a feature. `scripts/pretrain_finetune.py` runs the historic pretrain →
+recent fine-tune schedule from `pretrain_finetune_cuts.json` (FT train gets
+session-rank recency, half-life 126; labels unchanged). VAL-gate the FT
+checkpoint on cost-aware `live_locate` IR, not hit-rate. Backtest
+`--holding overnight` flattens every open (MOC→MOO).
 `--live-costs` is the Owen-runnable pack (20 bp RT + name-level MOC/MOO +
 thin/vol impact + 5 bp borrow + 10 bp hedge). `--long-only` drops shorts and
 borrow (no locate). `--locate-adv-pctile 0.3` blocks shorts in the bottom

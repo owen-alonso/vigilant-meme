@@ -1,0 +1,51 @@
+{
+  "schema": "pretrain_finetune_cuts/v1",
+  "comment": "Authoritative historic pretrain -> recent fine-tune windows. Desktop copy lives at data/_panel_cache/pretrain_finetune_cuts.json; this file is the in-repo contract.",
+  "universe": "liquid",
+  "label_return": "overnight",
+  "skip_only": true,
+  "num_workers": 0,
+  "live_locate_defaults": {
+    "quantile": 0.2,
+    "locate_haircut": 0.5,
+    "max_short_gross": 0.5
+  },
+  "val_gate": {
+    "book": "live_locate",
+    "metric": "unlevered_net_ir",
+    "holding": "overnight",
+    "cost_bundle": "live_locate",
+    "split": "val",
+    "baseline_ir": 5.58,
+    "baseline_note": "prior overnight liquid live_locate cost-aware IR; not hit-rate",
+    "do_not_promote_from": ["test", "hit_rate", "overnight_up"]
+  },
+  "dynamic_weights": {
+    "kind": "time_upweight_recent",
+    "apply_to": "finetune_train",
+    "halflife_sessions": 126,
+    "rewrite_labels": false
+  },
+  "dynamic_a": {
+    "default": false,
+    "role": "training-time regime helper only; not an IR sleeve chase"
+  },
+  "pretrain": {
+    "start": "1993-01-29",
+    "train_end": "2022-09-08",
+    "val_end": "2023-09-08",
+    "test_end": "2023-09-11",
+    "early_stop_sessions": 252,
+    "time_upweight_recent": false,
+    "note": "frozen historic; train <2022-09-08; val ~252-session early-stop; ends before FT at 2023-09-11"
+  },
+  "finetune": {
+    "start": "2023-09-11",
+    "train_end": "2025-10-17",
+    "val_end": "2026-04-01",
+    "test_through": "2026-09-11",
+    "time_upweight_recent": true,
+    "halflife_sessions": 126,
+    "note": "rolling 3y; train <2025-10-17; val <2026-04-01; test through 2026-09-11; do not train into test"
+  }
+}

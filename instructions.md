@@ -67,6 +67,28 @@ Overnight live book (val-gate; do not retarget from test). Paper 10 bp flatten i
 python -m forecast.training --universe liquid --interval daily --skip-only \
   --label-return overnight --checkpoint-dir checkpoints/forecast_ridge_overnight
 
+# historic pretrain -> recent fine-tune from staged cuts (desktop Yahoo liquid)
+# reads data/_panel_cache/pretrain_finetune_cuts.json when present, else the in-repo schema
+# phase 1: train <2022-09-08, val 2022-09-08<=s<2023-09-08 (~252-session early-stop)
+# phase 2: train 2023-09-11<=s<2025-10-17, val <2026-04-01, test through 2026-09-11
+# FT train only: time_upweight_recent half-life 126 sessions (labels unchanged)
+# num_workers=0 — do not pickle the 6.7GB CS / panel cache on Windows
+python scripts/pretrain_finetune.py --data-dir data --universe liquid
+python -m forecast.training --universe liquid --interval daily --skip-only \
+  --label-return overnight --cuts-json data/_panel_cache/pretrain_finetune_cuts.json \
+  --phase pretrain --num-workers 0 \
+  --checkpoint-dir checkpoints/forecast_ridge_overnight_pretrain
+python -m forecast.training --universe liquid --interval daily --skip-only \
+  --label-return overnight --cuts-json data/_panel_cache/pretrain_finetune_cuts.json \
+  --phase finetune --num-workers 0 \
+  --checkpoint-dir checkpoints/forecast_ridge_overnight_finetune
+# VAL-gate FT on cost-aware live_locate IR (not hit-rate) vs prior overnight ~+5.58
+# TEST is report-only. Keep live_locate q20/h0.5/s0.50 unless VAL IR promotes.
+python scripts/overnight_shorting.py --data-dir data --universe liquid \
+    --json checkpoints/forecast_ridge_overnight_finetune/shorting.json
+python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight_finetune/best.pt \
+  --holding overnight --live-costs
+
 # locked TEST direction % + next-open MAE (PR #8 baseline + train-only readouts)
 # fit on TRAIN, promote on locked VAL, report locked TEST. Not live P&L.
 # cond_dir_blend = high-|pred| mix of left_tail_l1 ⊕ confidence_blend (TRAIN q,λ)
@@ -178,6 +200,21 @@ Overnight **live vs paper** (same flatten book, 15% causal vol):
 
 `--open-auction-bps` is the *legacy* extra on the exit half-notional. Prefer `--moc-bps` / `--moo-bps`. Open+N (`open15`) mixes `15/390` of next-session return into the **label**; do not silently train it as overnight `y`.
 
+### Historic pretrain → recent fine-tune (cut 2)
+
+Staged windows live in `forecast/pretrain_finetune_cuts.json` (copy to `data/_panel_cache/pretrain_finetune_cuts.json` on the desktop). Ends are exclusive except `test_through` (inclusive).
+
+| Phase | Train | Val (early-stop / `best.pt`) | Test |
+|---|---|---|---|
+| Pretrain (frozen, no recency) | `1993-01-29 <= s < 2022-09-08` | `2022-09-08 <= s < 2023-09-08` (~252 sessions) | ends before FT (`< 2023-09-11`) |
+| Fine-tune (rolling 3y) | `2023-09-11 <= s < 2025-10-17` | `2025-10-17 <= s < 2026-04-01` | through `2026-09-11` (do not train into test) |
+
+Fine-tune **train** only applies `time_upweight_recent` with half-life **126 sessions** (`w = 0.5 ** (sessions_from_latest / 126)`). Residual labels are unchanged. This is a sample-weight schedule, not Dynamic A. `--dynamic-weights` stays off unless you are using Dynamic A as a training-time regime helper — do not chase an IR sleeve with it. `--ridge-date-halflife` remains the calendar-day hook; the cuts file uses session rank.
+
+**VAL-gate** the FT checkpoint on **fine-tune val cost-aware IR** (`live_locate` / overnight `--live-costs`), not hit-rate, vs the prior overnight baseline (~**+5.58** liquid live_locate). TEST is report-only. Keep live_locate **q20 / haircut 0.50 / short 0.50** unless that VAL IR clearly promotes. Do not reopen the overnight-up 60% grid or expand the Mamba blend.
+
+Windows desktop: `--num-workers 0` (default). Do not pickle the 6.7GB CS / `data/_panel_cache/` panel per worker.
+
 ```bash
 # regime heads / surgical vol+CS-product drop / trailing readout window (all lost on val)
 python scripts/cs_regime_ablate.py --data-dir data --universe liquid
@@ -273,8 +310,12 @@ Default loss is **Huber on the mean only**. Read **`val_ic`**, not `val_loss`. O
 | `--stride` | `64` | How far the window slides. Smaller → more overlapping samples, more compute. |
 | `--min-context` | `64` | First this many bars of every window are **unsupervised**. The SSM is still warming up. |
 | `--min-session-bars` | `30` | Drop a day with fewer real prints than this. |
-| `--val-fraction` | `0.15` | Fraction of **sessions** for validation (end of the train era, not shuffled bars). |
-| `--test-fraction` | `0.15` | Fraction of sessions for test. Train gets the rest. |
+| `--val-fraction` | `0.15` | Fraction of **sessions** for validation (end of the train era, not shuffled bars). Ignored when `--train-end` / `--val-end` or `--cuts-json` pin dates. |
+| `--test-fraction` | `0.15` | Fraction of sessions for test. Train gets the rest. Ignored when date cuts are pinned. |
+| `--cuts-json` | off | `pretrain_finetune_cuts.json` (desktop `data/_panel_cache/`, else in-repo schema). Needs `--phase`. |
+| `--phase` | off | `pretrain` / `finetune` / `both`. Pins that phase's train/val/test window. |
+| `--train-end` / `--val-end` / `--test-end` | off | Exclusive YYYY-MM-DD cuts. `--test-through` is inclusive. |
+| `--time-upweight-recent` | off | Session-rank recency on **train** only. FT cuts use half-life 126. Does **not** rewrite labels. |
 | `--allow-stale-horizon` | off | Label bars whose `t+horizon` slot was a fill, not a print. **Not recommended** (stale zeros). |
 
 Not on `-h` but fixed in code (and stored in the checkpoint): vol EWM half-life = 390 bars, vol floor `1e-5`, z-score window = 5 sessions, feature clip = 8, warmup = 780 bars, max session gap = 4 days. Changing those in `DataConfig` without retraining makes `generate.py` lie, because generate rebuilds features from the **checkpoint’s** `data_config`.

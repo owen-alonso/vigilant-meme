@@ -1201,6 +1201,35 @@ def _arrays_with_valid(src: SymbolArrays, valid: np.ndarray) -> SymbolArrays:
     )
 
 
+def _parse_cut_ts(value: Any) -> pd.Timestamp | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    return pd.Timestamp(raw)
+
+
+def explicit_calendar_cuts(cfg: DataConfig) -> tuple[Any, Any, Any] | None:
+    """Return ``(train_end, val_end, test_end)`` when both train/val cuts are set.
+
+    Ends are exclusive timestamps. ``test_end`` may be None (no upper bound).
+    """
+    train_end = _parse_cut_ts(getattr(cfg, "train_end", ""))
+    val_end = _parse_cut_ts(getattr(cfg, "val_end", ""))
+    test_end = _parse_cut_ts(getattr(cfg, "test_end", ""))
+    if train_end is None and val_end is None and test_end is None:
+        return None
+    if train_end is None or val_end is None:
+        raise ValueError(
+            "explicit calendar cuts need both train_end and val_end "
+            "(YYYY-MM-DD, exclusive); test_end is optional"
+        )
+    if val_end <= train_end:
+        raise ValueError(f"val_end {val_end.date()} must be after train_end {train_end.date()}")
+    if test_end is not None and test_end < val_end:
+        raise ValueError(f"test_end {test_end.date()} must be >= val_end {val_end.date()}")
+    return train_end, val_end, test_end
+
+
 def global_session_cuts(
     panels: dict[str, pd.DataFrame],
     cfg: DataConfig,
@@ -1299,10 +1328,14 @@ def build_datasets(
             + (f" (held out of book: {','.join(sorted(dropped))})" if dropped else "")
         )
 
-    if cfg.global_calendar_split and cfg.is_calendar() and len(trade_panels) >= 1:
+    pinned = explicit_calendar_cuts(cfg)
+    if pinned is not None:
+        train_end, val_end, test_end = pinned
+    elif cfg.global_calendar_split and cfg.is_calendar() and len(trade_panels) >= 1:
         train_end, val_end = global_session_cuts(trade_panels, cfg)
+        test_end = None
     else:
-        train_end, val_end = None, None
+        train_end, val_end, test_end = None, None, None
 
     train_syms: list[SymbolArrays] = []
     val_syms: list[SymbolArrays] = []
@@ -1325,6 +1358,8 @@ def build_datasets(
             (panel["session"] >= sym_train_end) & (panel["session"] < sym_val_end)
         ).to_numpy()
         is_test = (panel["session"] >= sym_val_end).to_numpy()
+        if test_end is not None:
+            is_test = is_test & (panel["session"] < test_end).to_numpy()
         base = panel_to_arrays(panel, symbol)
         base_valid = panel["valid"].to_numpy(dtype=bool)
         train_syms.append(
@@ -1351,6 +1386,9 @@ def build_datasets(
                 "last": str(panel["datetime"].iloc[-1]),
                 "train_end": str(pd.Timestamp(sym_train_end).date()),
                 "val_end": str(pd.Timestamp(sym_val_end).date()),
+                "test_end": (
+                    str(pd.Timestamp(test_end).date()) if test_end is not None else ""
+                ),
                 "train_source_mix": train_mix,
                 "val_source_mix": val_mix,
                 "test_source_mix": test_mix,
@@ -1371,7 +1409,12 @@ def build_datasets(
                 f"{symbol}: {m['sessions']} sessions, {m['grid_bars']} grid bars, "
                 f"{m['traded_bars']} traded ({m['traded_bars'] / max(1, m['grid_bars']):.1%}), "
                 f"{m['valid_bars']} labelled | train<{m['train_end']} "
-                f"val<{m['val_end']} test>= {m['val_end']}"
+                f"val<{m['val_end']} test"
+                + (
+                    f"<{m['test_end']}"
+                    if m.get("test_end")
+                    else f">= {m['val_end']}"
+                )
             )
             if train_mix and test_mix:
                 train_top = max(train_mix, key=train_mix.get)
@@ -1428,10 +1471,11 @@ def build_datasets(
                 f"val={len(datasets['val'])} test={len(datasets['test'])} "
                 f"(min_names={cfg.cross_section_min_names})"
             )
-        if any(len(datasets[k]) == 0 for k in ("train", "val", "test")):
+        # Empty test is allowed (pretrain ends before FT; no locked test).
+        if len(datasets["train"]) == 0 or len(datasets["val"]) == 0:
             if log_fn:
                 log_fn(
-                    "cross-section empty on a split; falling back to last-bar sequences"
+                    "cross-section empty on train/val; falling back to last-bar sequences"
                 )
             use_cs = False
             datasets = None
@@ -1468,6 +1512,9 @@ def build_datasets(
         "universe": cfg.universe,
         "equities_only": bool(getattr(cfg, "equities_only", False)),
         "train_from": raw_from,
+        "train_end": str(getattr(cfg, "train_end", "") or ""),
+        "val_end": str(getattr(cfg, "val_end", "") or ""),
+        "test_end": str(getattr(cfg, "test_end", "") or ""),
         "n_trading_names": int(len(trade_panels)),
         "label_return": normalize_label_return(getattr(cfg, "label_return", "close")),
     }
@@ -1498,6 +1545,7 @@ def fit_ridge_readout(
     rank_target: bool = False,
     feature_mask_bool: np.ndarray | None = None,
     date_halflife: float = 0.0,
+    session_halflife: float = 0.0,
     y_winsor: float = 0.0,
     feat_winsor: float = 0.0,
     drop_disp_q: float = 0.0,
@@ -1526,6 +1574,7 @@ def fit_ridge_readout(
         rank_target=rank_target,
         feature_mask_bool=feature_mask_bool,
         date_halflife=date_halflife,
+        session_halflife=session_halflife,
         y_winsor=y_winsor,
         feat_winsor=feat_winsor,
         drop_disp_q=drop_disp_q,
