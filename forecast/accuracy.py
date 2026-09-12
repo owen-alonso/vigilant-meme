@@ -16,6 +16,7 @@ converts that to an implied overnight log-return ``pred * sigma`` (same as
 - book-aligned short sleeve overnight-down (TRAIN bottom-q / |pred| grid, VAL-gated)
 - symmetric long-E / short-J LS (paper zero-cost + live_locate vs q20)
 - two-stage next-open MAE (residual→gap, then gap→price using close_t)
+- sparse MAE (calibrate only when |pred*sigma| is large; else zero-move)
 
 Default recipe is the PR #5 overnight skip (rank-target ridge, ``no_long_ts``).
 PR #7 levers stay off unless a checkpoint documents them.
@@ -75,6 +76,10 @@ TWO_STAGE_MAE_MAPS = (
     "two_stage_l1_usd",
     "ridge_resid_dow_vol",
 )
+# IDEA M: sparse MAE — map only when |pred*sigma| >= τ, else zero-move.
+SPARSE_MAE_MAPS = ("sparse_l1", "sparse_huber")
+SPARSE_ABS_QS = (0.0, 0.30, 0.50, 0.70, 0.80, 0.90)
+SPARSE_COVER = 0.05
 # IDEA H: within-date relative direction vs 50%, and long-half overnight-up.
 REL_DIR_LIFT_PP = 0.50
 REL_DIR_Z = 1.0
@@ -2298,6 +2303,9 @@ def format_accuracy_report(payload: dict[str, Any]) -> str:
         two_txt = format_two_stage_mae_block(payload)
         if two_txt:
             lines.extend(["", two_txt])
+        sparse_txt = format_sparse_mae_block(payload)
+        if sparse_txt:
+            lines.extend(["", sparse_txt])
         rel_txt = format_relative_dir_block(payload)
         if rel_txt:
             lines.extend(["", rel_txt])
@@ -3057,6 +3065,241 @@ def decide_two_stage_mae_promote(
     }
 
 
+def apply_sparse_mae(
+    pred_r: np.ndarray,
+    a: float,
+    b: float,
+    tau: float,
+) -> np.ndarray:
+    """``a * pred_r + b`` when ``|pred_r| >= τ``, else 0 (zero-move)."""
+    p = np.asarray(pred_r, dtype=np.float64)
+    hat = float(a) * p + float(b)
+    small = np.isfinite(p) & (np.abs(p) < float(tau))
+    hat[small] = 0.0
+    hat[~np.isfinite(p)] = np.nan
+    return hat
+
+
+def fit_sparse_mae_maps(
+    df: pd.DataFrame,
+    *,
+    min_names: int,
+) -> dict[str, Any]:
+    """TRAIN-only affine_l1/huber + |pred*sigma| τ. Small gaps predict 0."""
+    empty = {
+        "fit_split": "train",
+        "hedge": "sector_overnight",
+        "maps": {},
+        "grid": [],
+        "note": (
+            "Fit residual*sigma → overnight gap on TRAIN (affine_l1 / huber). "
+            "Choose |pred| τ on TRAIN % MAE. Below τ predict 0 (zero-move). "
+            "Next open is never a feature."
+        ),
+    }
+    if df.empty or "pred_r" not in df.columns:
+        return empty
+    pred_r = df["pred_r"].to_numpy(dtype=np.float64)
+    r_on = df["r_on"].to_numpy(dtype=np.float64)
+    a_l1, b_l1 = fit_affine_l1(pred_r, r_on)
+    a_h, b_h = fit_affine_huber(pred_r, r_on)
+    abs_ok = pred_r[np.isfinite(pred_r)]
+    families = (
+        ("sparse_l1", float(a_l1), float(b_l1)),
+        ("sparse_huber", float(a_h), float(b_h)),
+    )
+    grid: list[dict[str, Any]] = []
+    maps: dict[str, Any] = {}
+    for name, a, b in families:
+        best_mae = float("inf")
+        best: dict[str, Any] | None = None
+        for q in SPARSE_ABS_QS:
+            if abs_ok.size == 0 or float(q) <= 0.0:
+                tau = 0.0
+            else:
+                tau = float(np.quantile(np.abs(abs_ok), float(q)))
+            keep = np.isfinite(pred_r) & (np.abs(pred_r) >= tau)
+            cover = float(keep.mean()) if pred_r.size else 0.0
+            if float(q) > 0.0 and cover < SPARSE_COVER:
+                continue
+            hat = apply_sparse_mae(pred_r, a, b, tau)
+            scored = slim_accuracy(_score_pred_r(df, hat, min_names))
+            row = {
+                "name": name,
+                "abs_q": float(q),
+                "tau": tau,
+                "cover": cover,
+                "a": a,
+                "b": b,
+                **scored,
+            }
+            grid.append(row)
+            mae = _as_float(scored.get("mae_pct"))
+            if np.isfinite(mae) and mae < best_mae:
+                best_mae = mae
+                best = {
+                    "kind": name,
+                    "a": a,
+                    "b": b,
+                    "tau": tau,
+                    "abs_q": float(q),
+                    "cover": cover,
+                    "train_mae_pct": mae,
+                }
+        maps[name] = best or {
+            "kind": name,
+            "a": a,
+            "b": b,
+            "tau": 0.0,
+            "abs_q": 0.0,
+            "cover": 1.0,
+            "train_mae_pct": float("nan"),
+        }
+    empty["maps"] = maps
+    empty["grid"] = grid
+    return empty
+
+
+def score_sparse_mae_map(
+    df: pd.DataFrame,
+    spec: Mapping[str, Any],
+    *,
+    min_names: int,
+) -> dict[str, float]:
+    if df.empty:
+        return slim_accuracy({"empty": True})
+    hat = apply_sparse_mae(
+        df["pred_r"].to_numpy(dtype=np.float64),
+        float(spec.get("a") or 0.0),
+        float(spec.get("b") or 0.0),
+        float(spec.get("tau") or 0.0),
+    )
+    out = slim_accuracy(_score_pred_r(df, hat, min_names))
+    keep = np.isfinite(df["pred_r"].to_numpy(dtype=np.float64)) & (
+        np.abs(df["pred_r"].to_numpy(dtype=np.float64)) >= float(spec.get("tau") or 0.0)
+    )
+    out["cover"] = float(keep.mean()) if len(df) else float("nan")
+    out["tau"] = float(spec.get("tau") or 0.0)
+    out["abs_q"] = float(spec.get("abs_q") or 0.0)
+    return out
+
+
+def decide_sparse_mae_promote(
+    *,
+    val_maps: dict[str, dict[str, Any]],
+    val_residual: dict[str, Any],
+    val_zero: dict[str, Any],
+    val_median: dict[str, Any],
+    val_current: dict[str, Any] | None,
+    current_name: str,
+    maps: dict[str, Any],
+) -> dict[str, Any]:
+    """VAL-only. Promote sparse MAE vs floors and current default."""
+    scored: list[tuple[str, dict[str, Any]]] = []
+    for name in SPARSE_MAE_MAPS:
+        row = dict(val_maps.get(name) or {})
+        mae = _as_float(row.get("mae_pct"))
+        if np.isfinite(mae):
+            scored.append((name, row))
+    resid = _as_float((val_residual or {}).get("mae_pct"))
+    zero = _as_float((val_zero or {}).get("mae_pct"))
+    median = _as_float((val_median or {}).get("mae_pct"))
+    floor = min(
+        [x for x in (resid, zero, median) if np.isfinite(x)],
+        default=float("nan"),
+    )
+    best_name = ""
+    best_row: dict[str, Any] = {}
+    best_mae = float("nan")
+    for name, row in scored:
+        mae = _as_float(row.get("mae_pct"))
+        if not np.isfinite(best_mae) or mae < best_mae:
+            best_mae = mae
+            best_name = name
+            best_row = row
+    margin = (
+        float(floor - best_mae)
+        if np.isfinite(floor) and np.isfinite(best_mae)
+        else float("nan")
+    )
+    floors_ok = bool(np.isfinite(margin) and margin >= MAE_LIFT)
+    cur_name = str(current_name or "residual_sigma")
+    cur_mae = _as_float((val_current or {}).get("mae_pct"))
+    if not np.isfinite(cur_mae):
+        cur_mae = resid
+    vs_current = (
+        float(cur_mae - best_mae)
+        if np.isfinite(cur_mae) and np.isfinite(best_mae)
+        else float("nan")
+    )
+    current_ok = bool(np.isfinite(vs_current) and vs_current >= -1e-15)
+    same = bool(best_name and best_name == cur_name)
+    promote = bool(best_name and floors_ok and current_ok and not same)
+    dir_pct = _as_float(best_row.get("dir_pct"))
+    resid_dir = _as_float((val_residual or {}).get("dir_pct"))
+    med_dir = _as_float((val_median or {}).get("dir_pct"))
+    dir_ok = bool(
+        np.isfinite(dir_pct)
+        and np.isfinite(resid_dir)
+        and np.isfinite(med_dir)
+        and dir_pct >= resid_dir + 100.0 * DIR_LIFT
+        and dir_pct >= med_dir + 100.0 * DIR_LIFT
+    )
+    spec = dict((maps or {}).get(best_name) or {}) if promote else {}
+    tau = _as_float((spec or best_row).get("tau"))
+    if not best_name:
+        reason = "NO PROMOTE: no finite VAL MAE among sparse MAE maps."
+    elif same and floors_ok:
+        reason = (
+            f"NO NEW MAE DEFAULT: {best_name} is already the accuracy default "
+            f"(VAL MAE% {100.0 * best_mae:.4f}, margin vs floors {1e4 * margin:+.2f} bp)."
+        )
+    elif not floors_ok:
+        reason = (
+            f"NO PROMOTE: best {best_name} VAL MAE% {100.0 * best_mae:.4f} vs "
+            f"residual {100.0 * resid:.4f} / zero {100.0 * zero:.4f} / "
+            f"median {100.0 * median:.4f} (margin {1e4 * margin:+.2f} bp "
+            f"< +{1e4 * MAE_LIFT:.1f} bp). Keep {cur_name}."
+        )
+    elif not current_ok:
+        reason = (
+            f"NO PROMOTE: {best_name} VAL MAE% {100.0 * best_mae:.4f} is worse "
+            f"than current default {cur_name} {100.0 * cur_mae:.4f} "
+            f"(delta {1e4 * vs_current:+.2f} bp). Keep {cur_name}."
+        )
+    else:
+        reason = (
+            f"PROMOTE sparse MAE default {best_name} τ={tau:.6f}: VAL MAE% "
+            f"{100.0 * best_mae:.4f} beats residual/zero/median by "
+            f"{1e4 * margin:+.2f} bp and is not worse than {cur_name} "
+            f"({1e4 * vs_current:+.2f} bp). Live q20 book unchanged."
+        )
+    return {
+        "promote_sparse_mae": promote,
+        "gated_on": "val",
+        "reason": reason,
+        "name": best_name if promote else cur_name,
+        "best_name": best_name,
+        "spec": spec,
+        "val_best": best_row,
+        "val_residual": dict(val_residual or {}),
+        "val_zero": dict(val_zero or {}),
+        "val_median": dict(val_median or {}),
+        "val_current": dict(val_current or {}),
+        "current_name": cur_name,
+        "val_mae_pct": best_mae,
+        "val_floor_mae_pct": floor,
+        "val_margin_bp": 1e4 * margin if np.isfinite(margin) else float("nan"),
+        "val_vs_current_bp": 1e4 * vs_current if np.isfinite(vs_current) else float("nan"),
+        "tau": tau,
+        "mae_lift": MAE_LIFT,
+        "dir_report_only": (not dir_ok),
+        "dir_clears_gates": dir_ok,
+        "hedge": "sector_overnight",
+        "live_book_unchanged": True,
+    }
+
+
 def _bin_index(x: np.ndarray, edges: np.ndarray, n_bins: int) -> np.ndarray:
     xv = np.asarray(x, dtype=np.float64)
     e = np.asarray(edges, dtype=np.float64)
@@ -3788,6 +4031,13 @@ def apply_calibrate_spec(
         keep = np.asarray([bool(v) for v in keep_raw], dtype=np.bool_)
         return apply_decile_reliability(
             p, edges, keep, float(params.get("b_up") or 0.0)
+        )
+    if kind in SPARSE_MAE_MAPS or kind in ("sparse_mae",):
+        return apply_sparse_mae(
+            p,
+            1.0 if params.get("a") is None else float(params["a"]),
+            0.0 if params.get("b") is None else float(params["b"]),
+            float(params.get("tau") or 0.0),
         )
     if kind in TWO_STAGE_MAE_MAPS or kind in (
         "two_stage_pct",
@@ -4762,6 +5012,65 @@ def format_two_stage_mae_block(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_sparse_mae_block(payload: dict[str, Any]) -> str:
+    promo = payload.get("sparse_mae_promotion") or {}
+    cmp = payload.get("sparse_mae_compare") or {}
+    fit = payload.get("sparse_mae_fit") or {}
+    if not promo and not cmp:
+        return ""
+    yes = bool(promo.get("promote_sparse_mae"))
+    val_maps = cmp.get("val") or {}
+    test_maps = cmp.get("test") or {}
+    lines = [
+        f"PROMOTE SPARSE MAE? {'YES' if yes else 'NO'}",
+        "  TRAIN affine_l1 / huber on residual*sigma → overnight gap. "
+        "TRAIN |pred| τ: below τ predict 0 (zero-move), else use the map. "
+        f"VAL % MAE must beat residual×σ AND zero-move AND train-median by "
+        f"≥{1e4 * MAE_LIFT:.1f} bp, and must not be worse than the current "
+        "MAE default. Dir report-only unless it also clears dir gates. "
+        "Live q20 book unchanged. Next open is never a feature.",
+        f"  hedge={fit.get('hedge') or promo.get('hedge')!r}  "
+        f"fit_split={fit.get('fit_split')!r}  "
+        f"current_default={promo.get('current_name')!r}",
+        "  VAL (gate):",
+        _fmt_mae_row("residual×σ", cmp.get("val_residual") or {}),
+        _fmt_mae_row("zero-move", cmp.get("val_zero") or {}),
+        _fmt_mae_row("train-median", cmp.get("val_median") or {}),
+    ]
+    for name in SPARSE_MAE_MAPS:
+        mark = " *" if name == promo.get("best_name") else ""
+        row = dict(val_maps.get(name) or {})
+        spec = ((fit.get("maps") or {}).get(name) or {})
+        lines.append(
+            _fmt_mae_row(name + mark, row)
+            + f"  τ={_as_float(spec.get('tau') if spec.get('tau') is not None else row.get('tau')):.6f}"
+            f"  abs_q={_as_float(spec.get('abs_q') if spec.get('abs_q') is not None else row.get('abs_q')):.2f}"
+            f"  cover {100.0 * _as_float(row.get('cover') if row.get('cover') is not None else spec.get('cover')):.1f}%"
+        )
+    if cmp.get("val_current") and str(promo.get("current_name") or "") not in SPARSE_MAE_MAPS:
+        lines.append(
+            _fmt_mae_row(
+                f"current {promo.get('current_name')}",
+                cmp.get("val_current") or {},
+            )
+        )
+    lines.extend(
+        [
+            f"  VAL best={promo.get('best_name')!r}  "
+            f"margin vs floors {_as_float(promo.get('val_margin_bp')):+.2f} bp  "
+            f"vs current {_as_float(promo.get('val_vs_current_bp')):+.2f} bp  "
+            f"(floors need ≥+{1e4 * MAE_LIFT:.1f} bp; current must not be worse)  "
+            f"dir_clears_gates={bool(promo.get('dir_clears_gates'))}",
+            "  TEST (report-only):",
+            _fmt_mae_row("residual×σ", cmp.get("test_residual") or {}),
+        ]
+    )
+    for name in SPARSE_MAE_MAPS:
+        lines.append(_fmt_mae_row(name, test_maps.get(name) or {}))
+    lines.append(f"  {promo.get('reason') or 'no decision'}")
+    return "\n".join(lines)
+
+
 def _fmt_rel_row(label: str, row: Mapping[str, Any] | None) -> str:
     r = dict(row or {})
     return (
@@ -5661,6 +5970,52 @@ def evaluate_overnight_accuracy(
             "test": default_pr_test,
         }
 
+    sparse_mae_fit = fit_sparse_mae_maps(tr, min_names=min_names)
+    sparse_maps = sparse_mae_fit.get("maps") or {}
+    sparse_mae_val = {
+        n: score_sparse_mae_map(va, spec, min_names=min_names)
+        for n, spec in sparse_maps.items()
+    }
+    sparse_mae_test = {
+        n: score_sparse_mae_map(te, spec, min_names=min_names)
+        for n, spec in sparse_maps.items()
+    }
+    sparse_mae_promotion = decide_sparse_mae_promote(
+        val_maps=sparse_mae_val,
+        val_residual=dict((by_ablate.get("residual_sigma") or {}).get("val") or {}),
+        val_zero=dict((by_ablate.get("zero_move") or {}).get("val") or {}),
+        val_median=dict((by_ablate.get("train_median_gap") or {}).get("val") or {}),
+        val_current=dict((by_ablate.get(default_name) or {}).get("val") or {}),
+        current_name=default_name,
+        maps=sparse_maps,
+    )
+    if sparse_mae_promotion.get("promote_sparse_mae"):
+        winner = str(sparse_mae_promotion.get("best_name") or default_name)
+        promotion["price"] = winner
+        promotion["accuracy_default"] = winner
+        default_name = winner
+        default_pr_test = apply_sparse_mae(
+            te["pred_r"].to_numpy(dtype=np.float64),
+            float((sparse_maps.get(winner) or {}).get("a") or 0.0),
+            float((sparse_maps.get(winner) or {}).get("b") or 0.0),
+            float((sparse_maps.get(winner) or {}).get("tau") or 0.0),
+        )
+        pred_r_by_name[winner] = {
+            "train": apply_sparse_mae(
+                train_pred_r,
+                float((sparse_maps.get(winner) or {}).get("a") or 0.0),
+                float((sparse_maps.get(winner) or {}).get("b") or 0.0),
+                float((sparse_maps.get(winner) or {}).get("tau") or 0.0),
+            ),
+            "val": apply_sparse_mae(
+                va["pred_r"].to_numpy(dtype=np.float64),
+                float((sparse_maps.get(winner) or {}).get("a") or 0.0),
+                float((sparse_maps.get(winner) or {}).get("b") or 0.0),
+                float((sparse_maps.get(winner) or {}).get("tau") or 0.0),
+            ),
+            "test": default_pr_test,
+        }
+
     payload["ablation"] = {
         "rows": rows,
         "calibrators": {
@@ -5689,6 +6044,11 @@ def evaluate_overnight_accuracy(
                 "hedge": "sector_overnight",
                 "fit_split": "train",
                 "maps": list(TWO_STAGE_MAE_MAPS),
+            },
+            "sparse_mae": {
+                "hedge": "sector_overnight",
+                "fit_split": "train",
+                "maps": list(SPARSE_MAE_MAPS),
             },
             "book_aligned": {
                 "q": float((book_aligned_fit.get("chosen") or {}).get("q") or 0.80),
@@ -5753,6 +6113,8 @@ def evaluate_overnight_accuracy(
     default_params = next((r["params"] for r in rows if r["name"] == default_name), {})
     if default_name in two_stage_maps:
         default_params = dict(two_stage_maps[default_name])
+    if default_name in sparse_maps:
+        default_params = dict(sparse_maps[default_name])
     payload["calibrate"] = {
         "name": default_name,
         "kind": str(default_params.get("kind") or default_name),
@@ -5841,6 +6203,15 @@ def evaluate_overnight_accuracy(
                 ),
             )
             for n, spec in two_stage_maps.items()
+        },
+        **{
+            n: apply_sparse_mae(
+                train_pred_r,
+                float(spec.get("a") or 0.0),
+                float(spec.get("b") or 0.0),
+                float(spec.get("tau") or 0.0),
+            )
+            for n, spec in sparse_maps.items()
         },
     }.get(default_name, train_pred_r)
     payload["confidence"] = _confidence_block(
@@ -5985,6 +6356,26 @@ def evaluate_overnight_accuracy(
         ),
     }
     payload["two_stage_mae_promotion"] = two_stage_mae_promotion
+    payload["sparse_mae_fit"] = sparse_mae_fit
+    payload["sparse_mae_compare"] = {
+        "hedge": "sector_overnight",
+        "val": sparse_mae_val,
+        "test": sparse_mae_test,
+        "val_residual": dict((by_ablate.get("residual_sigma") or {}).get("val") or {}),
+        "val_zero": dict((by_ablate.get("zero_move") or {}).get("val") or {}),
+        "val_median": dict((by_ablate.get("train_median_gap") or {}).get("val") or {}),
+        "val_current": dict((by_ablate.get(str(sparse_mae_promotion.get("current_name") or default_name)) or {}).get("val") or {}),
+        "test_residual": dict((by_ablate.get("residual_sigma") or {}).get("test") or {}),
+        "test_zero": dict((by_ablate.get("zero_move") or {}).get("test") or {}),
+        "test_median": dict((by_ablate.get("train_median_gap") or {}).get("test") or {}),
+        "current_name": str(sparse_mae_promotion.get("current_name") or default_name),
+        "note": (
+            "Sparse MAE: TRAIN affine_l1/huber, TRAIN |pred| τ, else zero-move. "
+            "VAL % MAE vs residual×σ / zero-move / train-median / current default. "
+            "Dir report-only unless it clears dir gates. Live q20 unchanged."
+        ),
+    }
+    payload["sparse_mae_promotion"] = sparse_mae_promotion
     from forecast.shorting import (
         compare_conviction_live,
         decide_conviction_live_promote,
@@ -6237,6 +6628,8 @@ def evaluate_overnight_accuracy(
             f"promote_ej_ls="
             f"{bool(ej_ls_promotion.get('promote_ej_ls'))}  "
             f"promote_two_stage_mae="
-            f"{bool(two_stage_mae_promotion.get('promote_two_stage_mae'))}"
+            f"{bool(two_stage_mae_promotion.get('promote_two_stage_mae'))}  "
+            f"promote_sparse_mae="
+            f"{bool(sparse_mae_promotion.get('promote_sparse_mae'))}"
         )
     return payload

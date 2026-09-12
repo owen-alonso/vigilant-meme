@@ -30,8 +30,11 @@ from forecast.accuracy import (
     decide_rel_e_stack_promote,
     decide_sector_mae_promote,
     decide_two_stage_mae_promote,
+    decide_sparse_mae_promote,
     apply_two_stage_map,
+    apply_sparse_mae,
     fit_two_stage_mae_maps,
+    fit_sparse_mae_maps,
     fit_book_aligned_on_train,
     fit_short_aligned_on_train,
     fit_relative_dir_on_train,
@@ -361,6 +364,14 @@ def test_synthetic_accuracy_ablation_is_causal_and_beats_or_matches_baseline(tmp
     assert ts_promo["live_book_unchanged"] is True
     assert "promote_two_stage_mae" in ts_promo
     assert "PROMOTE TWO-STAGE MAE" in report
+    sp_fit = payload["sparse_mae_fit"]
+    assert sp_fit["fit_split"] == "train"
+    assert set(sp_fit["maps"]) >= {"sparse_l1", "sparse_huber"}
+    sp_promo = payload["sparse_mae_promotion"]
+    assert sp_promo["gated_on"] == "val"
+    assert sp_promo["live_book_unchanged"] is True
+    assert "promote_sparse_mae" in sp_promo
+    assert "PROMOTE SPARSE MAE" in report
     rel_fit = payload["relative_dir_fit"]
     assert rel_fit["fit_split"] == "train"
     assert rel_fit["score_col"] == "pred"
@@ -819,6 +830,100 @@ def test_decide_two_stage_mae_promote_is_val_only():
         maps=maps,
     )
     assert floors_fail["promote_two_stage_mae"] is False
+    juicy = {"mae_pct": 0.001, "dir_pct": 80.0}
+    assert juicy["mae_pct"] < yes["val_mae_pct"]
+
+
+def test_fit_sparse_mae_maps_is_train_only():
+    import pandas as pd
+
+    rng = np.random.default_rng(4)
+    n = 120
+    pred_r = rng.normal(scale=0.01, size=n)
+    r_on = 0.8 * pred_r + rng.normal(scale=0.003, size=n)
+    close = 40.0 + rng.normal(scale=4.0, size=n)
+    nxt = close * np.exp(r_on)
+    dates = np.repeat(np.arange(20, dtype=np.int64), 6)
+    df = pd.DataFrame(
+        {
+            "symbol": np.array([f"S{i % 6:02d}" for i in range(n)]),
+            "pred": pred_r / 0.01,
+            "y": r_on / 0.01,
+            "scale": np.full(n, 0.01),
+            "pred_r": pred_r,
+            "r_on": r_on,
+            "close": close,
+            "next_open": nxt,
+            "date": dates,
+            "implied_open": close * np.exp(pred_r),
+            "implied_open_given_hedge": close * np.exp(pred_r),
+        }
+    )
+    spec = fit_sparse_mae_maps(df, min_names=3)
+    later = df.copy()
+    later["r_on"] = -0.8 * pred_r + rng.normal(scale=0.003, size=n)
+    later["next_open"] = later["close"] * np.exp(later["r_on"])
+    leaked = fit_sparse_mae_maps(later, min_names=3)
+    assert spec["fit_split"] == "train"
+    assert set(spec["maps"]) >= {"sparse_l1", "sparse_huber"}
+    a0 = float(spec["maps"]["sparse_l1"]["a"])
+    a1 = float(leaked["maps"]["sparse_l1"]["a"])
+    assert a0 * a1 < 0.0
+    hat = apply_sparse_mae(pred_r, a0, float(spec["maps"]["sparse_l1"]["b"]), 0.02)
+    assert float(np.mean(hat[np.abs(pred_r) < 0.02] == 0.0)) == 1.0
+
+
+def test_decide_sparse_mae_promote_is_val_only():
+    resid = {"mae_pct": 0.00600, "dir_pct": 51.0, "excess_pp": -3.0}
+    zero = {"mae_pct": 0.00700, "dir_pct": 0.0, "excess_pp": -50.0}
+    median = {"mae_pct": 0.00680, "dir_pct": 54.0, "excess_pp": 0.0}
+    maps = {
+        "sparse_l1": {"kind": "sparse_l1", "a": 0.8, "b": 0.0, "tau": 0.004},
+        "sparse_huber": {"kind": "sparse_huber", "a": 0.7, "b": 0.0, "tau": 0.003},
+    }
+    almost = {
+        "sparse_l1": {"mae_pct": 0.00590, "dir_pct": 52.0, "tau": 0.004},
+        "sparse_huber": {"mae_pct": 0.00588, "dir_pct": 53.0, "tau": 0.003},
+    }
+    no = decide_sparse_mae_promote(
+        val_maps=almost,
+        val_residual=resid,
+        val_zero=zero,
+        val_median=median,
+        val_current={"mae_pct": 0.00550, "dir_pct": 64.0},
+        current_name="ts_ridge_no_long_ts",
+        maps=maps,
+    )
+    assert no["promote_sparse_mae"] is False
+    assert no["gated_on"] == "val"
+    assert no["live_book_unchanged"] is True
+    yes = decide_sparse_mae_promote(
+        val_maps={
+            **almost,
+            "sparse_huber": {"mae_pct": 0.00545, "dir_pct": 52.0, "tau": 0.003},
+        },
+        val_residual=resid,
+        val_zero=zero,
+        val_median=median,
+        val_current={"mae_pct": 0.00550, "dir_pct": 64.0},
+        current_name="ts_ridge_no_long_ts",
+        maps=maps,
+    )
+    assert yes["promote_sparse_mae"] is True
+    assert yes["best_name"] == "sparse_huber"
+    floors_fail = decide_sparse_mae_promote(
+        val_maps={
+            "sparse_l1": {"mae_pct": 0.00597, "dir_pct": 52.0},
+            "sparse_huber": {"mae_pct": 0.00598, "dir_pct": 52.0},
+        },
+        val_residual=resid,
+        val_zero=zero,
+        val_median=median,
+        val_current={"mae_pct": 0.00650, "dir_pct": 64.0},
+        current_name="ts_ridge_no_long_ts",
+        maps=maps,
+    )
+    assert floors_fail["promote_sparse_mae"] is False
     juicy = {"mae_pct": 0.001, "dir_pct": 80.0}
     assert juicy["mae_pct"] < yes["val_mae_pct"]
 

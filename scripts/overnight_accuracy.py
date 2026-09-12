@@ -35,6 +35,8 @@ IDEA L is a two-stage TRAIN-only next-open MAE map (residual*sigma → gap,
 then gap → next-open $/% with close_t) plus a residual+DOW+vol ridge.
 Promote a new MAE default only if VAL % MAE beats residual×σ / zero-move /
 train-median by ≥0.5 bp and is not worse than the current default.
+IDEA M is sparse MAE: TRAIN affine_l1/huber on residual*sigma→r_on, then a
+TRAIN |pred| τ so small gaps predict 0 (zero-move). Same VAL % MAE gate.
 """
 
 from __future__ import annotations
