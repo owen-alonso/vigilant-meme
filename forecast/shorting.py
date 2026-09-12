@@ -12,7 +12,7 @@ Promote LS over long-only only on locked VAL. Locked TEST is report-only.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
@@ -55,6 +55,10 @@ IR_LIFT = 0.05
 # Long-only book: VAL IR lift vs live_long_only q20, and max-DD not much worse.
 LO_IR_LIFT = 0.05
 LO_DD_TOL = 0.05
+# Vanilla live_locate default used by split_shorting_metrics / backtest --live-costs.
+LS_DEFAULT_Q = 0.20
+LS_DEFAULT_HAIRCUT = 1.0
+LS_DEFAULT_SHORT = 0.50
 # TEST veto only: promoted VAL spec may not fall this far below q20 TEST IR.
 TEST_COLLAPSE = 0.05
 
@@ -77,6 +81,29 @@ PAPER_ZERO_BUNDLE: dict[str, Any] = {
     "name": "paper_zero",
     **{k: 0.0 for k in _BOOK_COST_KEYS},
 }
+
+_CP1252_REPLACEMENTS = (
+    ("\u03c4", "tau"),  # Greek tau
+    ("\u03b1", "alpha"),  # Greek alpha
+    ("\u2295", "+"),  # circled plus
+    ("\u2264", "<="),
+    ("\u2265", ">="),
+    ("\u2192", "->"),  # right arrow
+    ("\u2190", "<-"),
+)
+
+
+def _cp1252_safe(text: str) -> str:
+    """Windows console-safe (cp1252) print text. ASCII substitutes only."""
+    out = str(text)
+    for src, dst in _CP1252_REPLACEMENTS:
+        out = out.replace(src, dst)
+    try:
+        out.encode("cp1252")
+        return out
+    except UnicodeEncodeError:
+        return out.encode("cp1252", errors="replace").decode("cp1252")
+
 
 _SERIES_KEYS = {
     "net",
@@ -101,16 +128,18 @@ python -m forecast.training --universe liquid --interval daily --skip-only \\
   --label-return overnight --checkpoint-dir checkpoints/forecast_ridge_overnight
 
 # VAL-gated LS vs long-only (prints TEST report-only; promote on VAL only)
+# Overnight-up 60% is settled (STOP 60% / best_val_up=59.07%). This is the IR path.
 python scripts/overnight_shorting.py --data-dir data --universe liquid \\
     --json checkpoints/forecast_ridge_overnight/shorting.json
 
-# Honest LS (live_locate locate/borrow) vs long-only on the same scores
+# Honest LS (live_locate locate/borrow). VAL default on liquid; TEST may prefer LO.
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs
+# If PROMOTE LS SPEC? YES, add the printed --quantile / --locate-haircut / --max-short-gross
 # unconstrained shorts (old live; not the honest default)
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --cost-bundle live --compare-long-only
-# long-only live (no locate, borrow=0) — default live book after LS failed VAL
+# long-only live (no locate, borrow=0). TEST may prefer this; do not flip CLI on TEST.
 python -m forecast.backtest --checkpoint checkpoints/forecast_ridge_overnight/best.pt \\
   --holding overnight --live-costs --long-only
 # VAL-promoted long-only spec on synthetic (rank vs q20); TEST did not confirm
@@ -311,7 +340,13 @@ def val_knob_grid(
     vol_target: float = 0.15,
 ) -> dict[str, Any]:
     """VAL-only quantile / locate / short-gross grid. TEST never enters."""
-    empty = {"rows": [], "best": {}, "best_ls": {}, "lo_best": {}}
+    empty = {
+        "rows": [],
+        "best": {},
+        "best_ls": {},
+        "lo_best": {},
+        "baseline_ls": {},
+    }
     if df.empty:
         return empty
     pred = frame_to_wide(df, "pred")
@@ -388,10 +423,22 @@ def val_knob_grid(
     )
     lo_rows = [r for r in rows if r.get("kind") == "long_only"]
     ls_rows = [r for r in rows if r.get("kind") == "live_locate"]
+    baseline_ls = {}
+    for r in ls_rows:
+        if (
+            abs(_as_float(r.get("quantile"), 0.2) - LS_DEFAULT_Q) < 1e-12
+            and abs(_as_float(r.get("locate_haircut"), 1.0) - LS_DEFAULT_HAIRCUT)
+            < 1e-12
+            and abs(_as_float(r.get("max_short_gross"), 0.5) - LS_DEFAULT_SHORT)
+            < 1e-12
+        ):
+            baseline_ls = dict(r)
+            break
     return {
         "rows": rows,
         "best": dict(rows[0]) if rows else {},
         "best_ls": dict(ls_rows[0]) if ls_rows else {},
+        "baseline_ls": baseline_ls,
         "lo_best": dict(lo_rows[0]) if lo_rows else {},
         "experiment": dict(LS_HAIRCUT_EXPERIMENT),
     }
@@ -3174,6 +3221,178 @@ def decide_ls_promote(val: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _is_vanilla_ls_row(row: Mapping[str, Any]) -> bool:
+    return (
+        abs(_as_float(row.get("quantile"), LS_DEFAULT_Q) - LS_DEFAULT_Q) < 1e-12
+        and abs(_as_float(row.get("locate_haircut"), 1.0) - LS_DEFAULT_HAIRCUT)
+        < 1e-12
+        and abs(_as_float(row.get("max_short_gross"), 0.5) - LS_DEFAULT_SHORT)
+        < 1e-12
+    )
+
+
+def decide_ls_spec_promote(
+    grid: Mapping[str, Any] | dict[str, Any],
+    *,
+    val_ls_default: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """VAL-only refine of live_locate knobs vs vanilla q20 / haircut 1 / short 0.50.
+
+    Scans every live_locate grid row (not just IR-max). A row that fails the
+    DD gate does not veto a lower-IR row that clears both IR and DD.
+    Does not flip live_locate vs long-only (that is decide_ls_promote).
+    TEST never enters. Live CLI stays --live-costs (no --long-only) unless
+    decide_ls_promote keeps long-only.
+    """
+    baseline = dict(grid.get("baseline_ls") or {})
+    if not baseline and val_ls_default:
+        baseline = {
+            "name": "live_locate_q20_h1.0_s0.50",
+            "kind": "live_locate",
+            "quantile": LS_DEFAULT_Q,
+            "locate_haircut": LS_DEFAULT_HAIRCUT,
+            "max_short_gross": LS_DEFAULT_SHORT,
+            "unlevered_net_ir": val_ls_default.get("unlevered_net_ir"),
+            "unlevered_max_dd": val_ls_default.get("unlevered_max_dd"),
+            "mean_cost_unlev_bp": val_ls_default.get("mean_cost_unlev_bp"),
+            "mean_short_nav": val_ls_default.get("mean_short_nav"),
+        }
+    ir_max = dict(grid.get("best_ls") or {})
+    rows = [
+        dict(r)
+        for r in (grid.get("rows") or [])
+        if r.get("kind") == "live_locate"
+    ]
+    if not rows and ir_max:
+        rows = [ir_max]
+    ir_base = _as_float(baseline.get("unlevered_net_ir"))
+    dd_base = _as_float(baseline.get("unlevered_max_dd"))
+    passing: list[dict[str, Any]] = []
+    for row in rows:
+        if _is_vanilla_ls_row(row):
+            continue
+        ir = _as_float(row.get("unlevered_net_ir"))
+        dd = _as_float(row.get("unlevered_max_dd"))
+        if not (np.isfinite(ir) and np.isfinite(ir_base)):
+            continue
+        ir_d = float(ir - ir_base)
+        dd_ok = (
+            not (np.isfinite(dd) and np.isfinite(dd_base))
+            or float(dd - dd_base) >= -LO_DD_TOL
+        )
+        if ir_d >= IR_LIFT and dd_ok:
+            passing.append(row)
+    passing.sort(
+        key=lambda r: (
+            -_as_float(r.get("unlevered_net_ir"), default=-1e9),
+            -_as_float(r.get("unlevered_max_dd"), default=-1e9),
+            str(r.get("name")),
+        )
+    )
+    chosen = dict(passing[0]) if passing else {}
+    best = chosen or ir_max
+    ir_best = _as_float(best.get("unlevered_net_ir"))
+    dd_best = _as_float(best.get("unlevered_max_dd"))
+    ir_delta = (
+        float(ir_best - ir_base)
+        if np.isfinite(ir_best) and np.isfinite(ir_base)
+        else float("nan")
+    )
+    dd_delta = (
+        float(dd_best - dd_base)
+        if np.isfinite(dd_best) and np.isfinite(dd_base)
+        else float("nan")
+    )
+    default_spec = {
+        "quantile": LS_DEFAULT_Q,
+        "locate_haircut": LS_DEFAULT_HAIRCUT,
+        "max_short_gross": LS_DEFAULT_SHORT,
+    }
+    promote = bool(passing)
+    spec = dict(default_spec)
+    ir_max_ir = _as_float(ir_max.get("unlevered_net_ir"))
+    ir_max_dd = _as_float(ir_max.get("unlevered_max_dd"))
+    ir_max_delta = (
+        float(ir_max_ir - ir_base)
+        if np.isfinite(ir_max_ir) and np.isfinite(ir_base)
+        else float("nan")
+    )
+    if promote:
+        spec = {
+            "quantile": _as_float(chosen.get("quantile"), LS_DEFAULT_Q),
+            "locate_haircut": _as_float(chosen.get("locate_haircut"), LS_DEFAULT_HAIRCUT),
+            "max_short_gross": _as_float(chosen.get("max_short_gross"), LS_DEFAULT_SHORT),
+        }
+        reason = (
+            f"PROMOTE live_locate spec {chosen.get('name')}: VAL unlev net IR "
+            f"{ir_best:+.3f} vs vanilla q20/h1/s0.50 {ir_base:+.3f} "
+            f"(delta {ir_delta:+.3f} >= {IR_LIFT:.2f}) and max DD "
+            f"{dd_best:+.3f} vs {dd_base:+.3f} (n_pass={len(passing)}). "
+            "TEST report-only. Does not flip LS vs long-only."
+        )
+    elif not rows:
+        reason = (
+            "NO PROMOTE live_locate spec: empty VAL LS knob grid. "
+            "Keep vanilla q20 / haircut 1 / short 0.50."
+        )
+    elif not np.isfinite(ir_max_delta) or ir_max_delta < IR_LIFT:
+        reason = (
+            "NO LIFT: no live_locate knob beats vanilla q20/h1/s0.50 by "
+            f"{IR_LIFT:.2f} unlev net IR "
+            f"(best {ir_max.get('name')} {ir_max_ir:+.3f} vs {ir_base:+.3f}, "
+            f"delta {ir_max_delta:+.3f}). Keep vanilla live_locate."
+        )
+    else:
+        reason = (
+            f"NO PROMOTE live_locate spec: IR-best {ir_max.get('name')} lift "
+            f"{ir_max_delta:+.3f} but max DD {ir_max_dd:+.3f} vs vanilla "
+            f"{dd_base:+.3f} exceeds {LO_DD_TOL:.2f}, and no other row "
+            "clears both gates. Keep vanilla live_locate."
+        )
+    q = _as_float(spec.get("quantile"), LS_DEFAULT_Q)
+    h = _as_float(spec.get("locate_haircut"), LS_DEFAULT_HAIRCUT)
+    s = _as_float(spec.get("max_short_gross"), LS_DEFAULT_SHORT)
+    cli = (
+        "python -m forecast.backtest "
+        "--checkpoint checkpoints/forecast_ridge_overnight/best.pt "
+        "--holding overnight --live-costs"
+    )
+    if promote:
+        cli = (
+            f"{cli} --quantile {q:.2f} --locate-haircut {h:.2f} "
+            f"--max-short-gross {s:.2f}"
+        )
+    return {
+        "promote_ls_spec": promote,
+        "gated_on": "val",
+        "reason": reason,
+        "baseline": baseline,
+        "best": best,
+        "ir_max": ir_max,
+        "n_pass": len(passing),
+        "spec": spec,
+        "ir_delta": ir_delta,
+        "dd_delta": dd_delta,
+        "ir_lift": IR_LIFT,
+        "dd_tol": LO_DD_TOL,
+        "cli_flags": cli,
+        "default_book_unchanged_by_this_gate": True,
+    }
+
+
+def report_test_prefers_book(test: Mapping[str, Any]) -> str:
+    """Report-only: which live book has higher TEST unlev net IR."""
+    books = (test or {}).get("books") or {}
+    ir_ls = _as_float((books.get("live_locate") or {}).get("unlevered_net_ir"))
+    ir_lo = _as_float((books.get("live_long_only") or {}).get("unlevered_net_ir"))
+    if np.isfinite(ir_ls) and np.isfinite(ir_lo):
+        if ir_lo > ir_ls + 1e-12:
+            return "live_long_only"
+        if ir_ls > ir_lo + 1e-12:
+            return "live_locate"
+    return "tie_or_nan"
+
+
 def evaluate_overnight_shorting(
     data_dir: str,
     universe: str = "liquid",
@@ -3729,6 +3948,11 @@ def evaluate_overnight_shorting(
                 max_short_gross=float(LS_HAIRCUT_EXPERIMENT["max_short_gross"]),
             )
     ls_exp = decide_ls_experiment(val, exp_book)
+    ls_spec_promo = decide_ls_spec_promote(
+        grid,
+        val_ls_default=(val.get("books") or {}).get("live_locate") or {},
+    )
+    test_ls_spec: dict[str, Any] = {}
     test_lo_promoted = {}
     test_refine_base: dict[str, Any] = {}
     test_refine_best: dict[str, Any] = {}
@@ -3793,6 +4017,25 @@ def evaluate_overnight_shorting(
                 weighting="quantile",
                 long_size=str(best_ref.get("long_size") or "equal"),
                 conf_pctile=float(best_ref.get("conf_pctile") or 0.0),
+            )
+            ls_spec = ls_spec_promo.get("spec") or {}
+            test_ls_spec = _run_overnight_book(
+                pred_t,
+                y_t,
+                bundle=LIVE_LOCATE_BUNDLE,
+                long_only=False,
+                min_names=min_names,
+                vol_target=vol_target,
+                overnight_r=r_t,
+                turnover_z=tz_t,
+                vol_level=vol_t,
+                quantile=float(ls_spec.get("quantile") or LS_DEFAULT_Q),
+                locate_haircut=float(
+                    ls_spec.get("locate_haircut") or LS_DEFAULT_HAIRCUT
+                ),
+                max_short_gross=float(
+                    ls_spec.get("max_short_gross") or LS_DEFAULT_SHORT
+                ),
             )
     lo_refine_promo = decide_lo_refine(
         lo_refine, test_baseline=test_refine_base, test_best=test_refine_best
@@ -3860,6 +4103,9 @@ def evaluate_overnight_shorting(
         "sticky_compare": sticky_compare,
         "sticky_promotion": sticky_promo,
         "ls_experiment": ls_exp,
+        "ls_spec_promotion": ls_spec_promo,
+        "test_ls_spec": test_ls_spec,
+        "test_prefers_book": report_test_prefers_book(test),
         "test_long_only_promoted": test_lo_promoted,
         "test_long_only_refine_best": test_refine_best,
         "desktop_commands": DESKTOP_COMMANDS,
@@ -3870,17 +4116,49 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
     promo = payload.get("promotion") or {}
     lo_promo = payload.get("lo_promotion") or {}
     ls_exp = payload.get("ls_experiment") or {}
+    ls_spec = payload.get("ls_spec_promotion") or {}
+    test_pref = str(payload.get("test_prefers_book") or "tie_or_nan")
+    val_books = ((payload.get("val") or {}).get("books") or {})
+    test_books = ((payload.get("test") or {}).get("books") or {})
+    val_ls = val_books.get("live_locate") or {}
+    val_lo = val_books.get("live_long_only") or {}
+    test_ls = test_books.get("live_locate") or {}
+    test_lo = test_books.get("live_long_only") or {}
     lines = [
         "OVERNIGHT LONG-SHORT vs LONG-ONLY (VAL gate, TEST report-only)",
         f"  recipe: {payload.get('recipe')}  {payload.get('levers')}",
         f"  calendar: {payload.get('calendar_cuts')}",
         f"  train CS IC={_fmt(payload.get('train_cs_ic'), '+.4f')}",
+        "  Overnight-up 60% is settled (STOP 60% / best_val_up=59.07%). "
+        "This report is the cost-aware live IR path.",
         "",
         _split_block("LOCKED VAL (gate)", payload.get("val") or {}),
+        "",
+        f"DEFAULT LIVE BOOK (VAL) = {promo.get('default_book')}",
+        f"  VAL  live_locate    IR {_fmt(val_ls.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(val_ls.get('unlevered_max_dd'), '+.3f')}",
+        f"  VAL  live_long_only IR {_fmt(val_lo.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(val_lo.get('unlevered_max_dd'), '+.3f')}",
+        f"  TEST live_locate    IR {_fmt(test_ls.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(test_ls.get('unlevered_max_dd'), '+.3f')}  (report-only)",
+        f"  TEST live_long_only IR {_fmt(test_lo.get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt(test_lo.get('unlevered_max_dd'), '+.3f')}  (report-only)",
+        f"  TEST prefers {test_pref}. Do not flip CLI on TEST.",
         "",
         f"PROMOTE LS? {'YES' if promo.get('promote_ls') else 'NO'}",
         f"  default live book = {promo.get('default_book')}",
         f"  {promo.get('reason')}",
+        "",
+        f"PROMOTE LS SPEC? {'YES' if ls_spec.get('promote_ls_spec') else 'NO'}",
+        f"  spec = {ls_spec.get('spec')}",
+        f"  VAL vanilla {_fmt((ls_spec.get('baseline') or {}).get('unlevered_net_ir'), '+.3f')}  "
+        f"chosen {_fmt((ls_spec.get('best') or {}).get('unlevered_net_ir'), '+.3f')}  "
+        f"delta {_fmt(ls_spec.get('ir_delta'), '+.3f')}",
+        f"  TEST chosen spec IR {_fmt((payload.get('test_ls_spec') or {}).get('unlevered_net_ir'), '+.3f')}  "
+        f"maxDD {_fmt((payload.get('test_ls_spec') or {}).get('unlevered_max_dd'), '+.3f')}  "
+        "(report-only)",
+        f"  {ls_spec.get('reason')}",
+        f"  desktop: {ls_spec.get('cli_flags')}",
         "",
         f"PROMOTE LONG-ONLY KNOBS? {'YES' if lo_promo.get('promote_lo') else 'NO'}",
         f"  spec = {lo_promo.get('spec')}",
@@ -3951,7 +4229,7 @@ def format_shorting_report(payload: dict[str, Any]) -> str:
             DESKTOP_COMMANDS.rstrip(),
         ]
     )
-    return "\n".join(lines)
+    return _cp1252_safe("\n".join(lines))
 
 
 def _ic_gate_block(payload: dict[str, Any]) -> str:

@@ -44,7 +44,9 @@ from forecast.shorting import (
     fit_sticky_on_train,
     decide_lo_refine,
     decide_ls_promote,
+    decide_ls_spec_promote,
     evaluate_overnight_shorting,
+    report_test_prefers_book,
     format_shorting_report,
     frame_to_wide,
     split_shorting_metrics,
@@ -177,6 +179,117 @@ def test_decide_ls_promote_ignores_test_and_requires_short_skill():
     )
     assert yes["promote_ls"] is True
     assert yes["default_book"] == "live_locate"
+
+
+def test_decide_ls_spec_promote_vs_vanilla_not_test():
+    juicy_test = {"unlevered_net_ir": 9.9, "unlevered_max_dd": 0.0}
+    vanilla = {
+        "name": "live_locate_q20_h1.0_s0.50",
+        "kind": "live_locate",
+        "quantile": 0.20,
+        "locate_haircut": 1.0,
+        "max_short_gross": 0.50,
+        "unlevered_net_ir": 5.33,
+        "unlevered_max_dd": -1.31,
+    }
+    empty = decide_ls_spec_promote({"best_ls": {}, "baseline_ls": vanilla})
+    assert empty["promote_ls_spec"] is False
+    assert empty["gated_on"] == "val"
+    same = decide_ls_spec_promote({"best_ls": dict(vanilla), "baseline_ls": vanilla})
+    assert same["promote_ls_spec"] is False
+    lift = decide_ls_spec_promote(
+        {
+            "baseline_ls": vanilla,
+            "best_ls": {
+                "name": "live_locate_q20_h0.5_s0.30",
+                "kind": "live_locate",
+                "quantile": 0.20,
+                "locate_haircut": 0.5,
+                "max_short_gross": 0.30,
+                "unlevered_net_ir": 5.50,
+                "unlevered_max_dd": -1.20,
+            },
+        }
+    )
+    assert lift["promote_ls_spec"] is True
+    assert lift["spec"]["locate_haircut"] == 0.5
+    assert lift["spec"]["max_short_gross"] == 0.30
+    assert "locate-haircut 0.50" in lift["cli_flags"]
+    assert lift["gated_on"] == "val"
+    dd_fail = decide_ls_spec_promote(
+        {
+            "baseline_ls": vanilla,
+            "best_ls": {
+                "name": "live_locate_q15_h0.5_s0.30",
+                "quantile": 0.15,
+                "locate_haircut": 0.5,
+                "max_short_gross": 0.30,
+                "unlevered_net_ir": 5.60,
+                "unlevered_max_dd": -1.50,
+            },
+        }
+    )
+    assert dd_fail["promote_ls_spec"] is False
+    assert "max DD" in dd_fail["reason"]
+    # IR-max failing DD must not veto a lower-IR row that clears both gates.
+    second = decide_ls_spec_promote(
+        {
+            "baseline_ls": vanilla,
+            "best_ls": {
+                "name": "live_locate_q15_h0.5_s0.30",
+                "kind": "live_locate",
+                "quantile": 0.15,
+                "locate_haircut": 0.5,
+                "max_short_gross": 0.30,
+                "unlevered_net_ir": 5.60,
+                "unlevered_max_dd": -1.50,
+            },
+            "rows": [
+                {
+                    "name": "live_locate_q15_h0.5_s0.30",
+                    "kind": "live_locate",
+                    "quantile": 0.15,
+                    "locate_haircut": 0.5,
+                    "max_short_gross": 0.30,
+                    "unlevered_net_ir": 5.60,
+                    "unlevered_max_dd": -1.50,
+                },
+                {
+                    "name": "live_locate_q20_h0.5_s0.30",
+                    "kind": "live_locate",
+                    "quantile": 0.20,
+                    "locate_haircut": 0.5,
+                    "max_short_gross": 0.30,
+                    "unlevered_net_ir": 5.50,
+                    "unlevered_max_dd": -1.20,
+                },
+                dict(vanilla),
+            ],
+        }
+    )
+    assert second["promote_ls_spec"] is True
+    assert second["spec"]["quantile"] == pytest.approx(0.20)
+    assert second["spec"]["locate_haircut"] == pytest.approx(0.5)
+    assert second["spec"]["max_short_gross"] == pytest.approx(0.30)
+    assert second["n_pass"] == 1
+    # TEST juiciness must not enter the gate.
+    assert juicy_test["unlevered_net_ir"] > lift["best"]["unlevered_net_ir"]
+    assert report_test_prefers_book(
+        {
+            "books": {
+                "live_locate": {"unlevered_net_ir": 1.27},
+                "live_long_only": {"unlevered_net_ir": 1.74},
+            }
+        }
+    ) == "live_long_only"
+    assert report_test_prefers_book(
+        {
+            "books": {
+                "live_locate": {"unlevered_net_ir": 5.33},
+                "live_long_only": {"unlevered_net_ir": 3.75},
+            }
+        }
+    ) == "live_locate"
 
 
 def test_conviction_long_weights_matches_top_q_and_abs_floor():
@@ -952,6 +1065,14 @@ def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
     assert payload["promotion"]["short_excess_pp"] == pytest.approx(val_xs)
     assert payload["lo_promotion"]["gated_on"] == "val"
     assert payload["ls_experiment"]["promote_as_default"] is False
+    assert payload["ls_spec_promotion"]["gated_on"] == "val"
+    assert "promote_ls_spec" in payload["ls_spec_promotion"]
+    assert payload["ls_spec_promotion"]["default_book_unchanged_by_this_gate"] is True
+    assert "PROMOTE LS SPEC" in text
+    assert "DEFAULT LIVE BOOK" in text
+    assert "Do not flip CLI on TEST" in text
+    assert "STOP 60%" in text
+    text.encode("cp1252")
     assert payload["lo_refine_promotion"]["gated_on"] == "val"
     assert payload["ic_gate_fit"]["fit_split"] == "train"
     assert payload["ic_gate_promotion"]["gated_on"] == "val"
