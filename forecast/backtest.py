@@ -12,7 +12,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -554,8 +554,105 @@ def last_sticky_held(
     return held
 
 
+def sticky_ls_step(
+    scores: pd.Series,
+    held_long: set[Any] | frozenset[Any] | None,
+    held_short: set[Any] | frozenset[Any] | None,
+    *,
+    q_enter: float,
+    q_exit: float,
+    min_names: int = 8,
+) -> tuple[pd.Series, set[Any], set[Any]]:
+    """Dollar-neutral sticky LS: long top / short bottom with the same hysteresis.
+
+    Each sleeve is equal-weight at 0.5 gross (same as quantile LS). Enter the
+    top/bottom ``q_enter``; keep a name while it stays in the top/bottom
+    ``q_exit``. Ranks use only today's scores. Empty sleeve = flat on that
+    side (caller still keeps the date in IR).
+    """
+    s = scores.dropna()
+    w = pd.Series(0.0, index=s.index, dtype=np.float64)
+    n = int(s.size)
+    if n < max(2, int(min_names)):
+        return w, set(), set()
+    qe = as_quantile_frac(q_enter)
+    qx = as_quantile_frac(q_exit)
+    if qe <= 0 or qx <= qe:
+        return w, set(), set()
+    qe = min(0.49, max(0.05, qe))
+    qx = min(0.90, max(qe + 1e-9, qx))
+    k_enter = max(1, int(math.floor(n * qe)))
+    k_exit = max(k_enter + 1, int(math.floor(n * qx)))
+    order = s.sort_values()
+    enter_long = set(order.index[-k_enter:])
+    keep_long = set(order.index[-k_exit:])
+    enter_short = set(order.index[:k_enter])
+    keep_short = set(order.index[:k_exit])
+    prev_l = set(held_long or ()) & set(s.index)
+    prev_s = set(held_short or ()) & set(s.index)
+    new_long = (prev_l & keep_long) | enter_long
+    new_short = (prev_s & keep_short) | enter_short
+    both = new_long & new_short
+    if both:
+        # Bands can overlap on a tiny book; prefer today's enter sleeve.
+        new_long -= both - enter_long
+        new_short -= both - enter_short
+        still = new_long & new_short
+        new_short -= still
+    if new_long:
+        wt = 0.5 / float(len(new_long))
+        for name in new_long:
+            w.loc[name] = wt
+    if new_short:
+        wt = 0.5 / float(len(new_short))
+        for name in new_short:
+            w.loc[name] = -wt
+    return w, new_long, new_short
+
+
+def last_sticky_held_ls(
+    pred: pd.DataFrame,
+    *,
+    q_enter: float,
+    q_exit: float,
+    min_names: int,
+) -> dict[str, set[Any]]:
+    """Causal LS sticky warm-start: ``{"long": set, "short": set}``."""
+    held_long: set[Any] = set()
+    held_short: set[Any] = set()
+    empty = {"long": set(), "short": set()}
+    if pred is None or pred.empty:
+        return empty
+    for ts in pred.index:
+        row = pred.loc[ts]
+        if int(row.dropna().size) < int(min_names):
+            continue
+        _w, held_long, held_short = sticky_ls_step(
+            row,
+            held_long,
+            held_short,
+            q_enter=q_enter,
+            q_exit=q_exit,
+            min_names=min_names,
+        )
+    return {"long": held_long, "short": held_short}
+
+
+def _parse_sticky_held0(
+    held0: Any,
+) -> tuple[set[Any], set[Any]]:
+    """Accept a long-only set, ``(long, short)``, or ``{"long","short"}``."""
+    if held0 is None:
+        return set(), set()
+    if isinstance(held0, Mapping):
+        return set(held0.get("long") or ()), set(held0.get("short") or ())
+    if isinstance(held0, (tuple, list)) and len(held0) == 2:
+        return set(held0[0] or ()), set(held0[1] or ())
+    return set(held0), set()
+
+
 def name_membership_churn(weights: pd.DataFrame) -> dict[str, float]:
-    """Night-to-night long-set Hamming fraction (not flatten one-way cost turn)."""
+    """Night-to-night |w|>0 Hamming fraction (not flatten one-way cost turn)."""
     empty = {
         "mean_name_churn": float("nan"),
         "mean_n_held": float("nan"),
@@ -563,7 +660,7 @@ def name_membership_churn(weights: pd.DataFrame) -> dict[str, float]:
     }
     if weights is None or weights.empty:
         return empty
-    held = weights.gt(1e-12)
+    held = weights.abs().gt(1e-12)
     prev = held.shift(1)
     prev = prev.where(prev.notna(), False).astype(bool)
     delta = (held.astype("int8") - prev.astype("int8")).abs().sum(axis=1)
@@ -976,8 +1073,11 @@ def book_pnl(
     disp_on = disp_trail is not None and np.isfinite(disp_tau)
     sticky_qe = as_quantile_frac(sticky_q_enter)
     sticky_qx = as_quantile_frac(sticky_q_exit)
-    sticky_on = bool(long_only and sticky_qe > 0 and sticky_qx > sticky_qe)
-    sticky_held: set[Any] = set(sticky_held0 or ()) if sticky_on else set()
+    sticky_on = bool(sticky_qe > 0 and sticky_qx > sticky_qe)
+    sticky_held: set[Any] = set()
+    sticky_held_short: set[Any] = set()
+    if sticky_on:
+        sticky_held, sticky_held_short = _parse_sticky_held0(sticky_held0)
     for ts in dates:
         pair_all = pd.concat(
             [pred.loc[ts], realized.loc[ts]], axis=1, keys=["p", "r"]
@@ -994,10 +1094,19 @@ def book_pnl(
                 pair_all = pair_all.loc[finite & (tzrow >= cut)]
         if len(pair_all) < int(min_names):
             continue
-        if sticky_on:
+        if sticky_on and long_only:
             w, sticky_held = sticky_long_step(
                 pair_all["p"],
                 sticky_held,
+                q_enter=sticky_qe,
+                q_exit=sticky_qx,
+                min_names=int(min_names),
+            )
+        elif sticky_on:
+            w, sticky_held, sticky_held_short = sticky_ls_step(
+                pair_all["p"],
+                sticky_held,
+                sticky_held_short,
                 q_enter=sticky_qe,
                 q_exit=sticky_qx,
                 min_names=int(min_names),

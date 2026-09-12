@@ -54,9 +54,13 @@ from forecast.shorting import (
     decide_sticky_promote,
     fit_sticky_on_train,
     decide_lo_refine,
+    COST_BOOK_LO,
+    COST_BOOK_LS,
+    compare_date_gate_books,
     decide_ls_promote,
     decide_ls_spec_promote,
     evaluate_overnight_shorting,
+    fit_ic_gate_on_train,
     report_test_prefers_book,
     format_shorting_report,
     frame_to_wide,
@@ -574,6 +578,7 @@ def test_decide_ic_gate_promote_is_val_only_and_needs_coverage():
     assert yes["promote_ic_gate"] is True
     assert yes["gated_on"] == "val"
     assert yes["fit_split"] == "train"
+    assert yes["cost_book"] == COST_BOOK_LS
     # TEST numbers are not arguments — cannot flip the call.
     assert juicy_test["unlevered_net_ir"] > yes["ir_gated"]
 
@@ -604,6 +609,7 @@ def test_decide_ic_scale_promote_is_val_only():
     )
     assert yes["promote_ic_scale"] is True
     assert yes["gated_on"] == "val"
+    assert yes["cost_book"] == COST_BOOK_LS
     assert yes["spec"]["s_max"] == 1.25
     assert juicy_test["unlevered_net_ir"] > yes["ir_scaled"]
 
@@ -649,6 +655,7 @@ def test_decide_weekday_promote_is_val_only_and_needs_coverage():
     )
     assert yes["promote_weekday"] is True
     assert yes["gated_on"] == "val"
+    assert yes["cost_book"] == COST_BOOK_LS
     assert yes["spec"]["weekday_mask"] == "flat_friday"
     assert juicy_test["unlevered_net_ir"] > yes["ir_gated"]
 
@@ -711,6 +718,7 @@ def test_decide_disp_gate_promote_is_val_only_and_needs_coverage():
     assert yes["promote_disp_gate"] is True
     assert yes["gated_on"] == "val"
     assert yes["fit_split"] == "train"
+    assert yes["cost_book"] == COST_BOOK_LS
     assert juicy_test["unlevered_net_ir"] > yes["ir_gated"]
 
     thin = decide_disp_gate_promote(
@@ -999,6 +1007,7 @@ def test_decide_sticky_promote_is_val_only():
     )
     assert yes["promote_sticky"] is True
     assert yes["gated_on"] == "val"
+    assert yes["cost_book"] == COST_BOOK_LS
     assert yes["spec"]["q_enter"] == 0.15
     assert juicy_test["unlevered_net_ir"] > yes["ir_sticky"]
 
@@ -1038,9 +1047,111 @@ def test_fit_sticky_on_train_requires_exit_gt_enter():
     )
     fit = fit_sticky_on_train(frame, min_names=6, vol_target=0.15)
     assert fit["fit_split"] == "train"
+    assert fit["cost_book"] == COST_BOOK_LS
     assert fit["chosen"]
     assert float(fit["chosen"]["q_exit"]) > float(fit["chosen"]["q_enter"])
     assert {round(float(r["q_enter"]), 2) for r in fit["rows"]} <= set(STICKY_ENTERS)
+    fit_lo = fit_sticky_on_train(
+        frame, min_names=6, vol_target=0.15, cost_book=COST_BOOK_LO
+    )
+    assert fit_lo["cost_book"] == COST_BOOK_LO
+
+
+def test_fit_ic_gate_on_train_records_cost_book():
+    n_days, n_names = 40, 8
+    dates = np.repeat(np.arange(n_days, dtype=np.int64) + 18000, n_names)
+    names = np.tile([f"S{i}" for i in range(n_names)], n_days)
+    ranks = np.tile(np.linspace(-1.0, 1.0, n_names), n_days)
+    frame = pd.DataFrame(
+        {
+            "symbol": names,
+            "date": dates,
+            "pred": ranks,
+            "y": ranks,
+            "r_on": ranks * 0.01,
+            "turnover_z": -ranks,
+            "vol_level": np.full(len(dates), 0.2),
+        }
+    )
+    ls = fit_ic_gate_on_train(frame, min_names=6, vol_target=0.0)
+    lo = fit_ic_gate_on_train(
+        frame, min_names=6, vol_target=0.0, cost_book=COST_BOOK_LO
+    )
+    assert ls["fit_split"] == "train"
+    assert ls["cost_book"] == COST_BOOK_LS
+    assert lo["cost_book"] == COST_BOOK_LO
+    assert ls["baseline"]["name"] == "live_locate_q20"
+    assert lo["baseline"]["name"] == "live_long_only_q20"
+
+
+def test_compare_date_gate_books_is_val_only_and_does_not_use_test():
+    ls = {
+        "ic_gate_promotion": {
+            "promote_ic_gate": True,
+            "ir_delta": 0.10,
+            "dd_delta": 0.01,
+            "reason": "PROMOTE IC",
+            "spec": {"window": 60, "tau": 0.0},
+        },
+        "ic_scale_promotion": {
+            "promote_ic_scale": False,
+            "ir_delta": 0.01,
+            "dd_delta": 0.0,
+        },
+        "disp_gate_promotion": {
+            "promote_disp_gate": False,
+            "ir_delta": -0.02,
+            "dd_delta": 0.0,
+        },
+        "weekday_promotion": {
+            "promote_weekday": False,
+            "ir_delta": 0.0,
+            "dd_delta": 0.0,
+        },
+        "sticky_promotion": {
+            "promote_sticky": False,
+            "ir_delta": 0.02,
+            "dd_delta": -0.01,
+        },
+    }
+    lo = {
+        "ic_gate_promotion": {
+            "promote_ic_gate": False,
+            "ir_delta": 0.01,
+            "dd_delta": 0.0,
+        },
+        "ic_scale_promotion": {
+            "promote_ic_scale": True,
+            "ir_delta": 0.12,
+            "dd_delta": 0.0,
+        },
+        "disp_gate_promotion": {
+            "promote_disp_gate": False,
+            "ir_delta": 0.0,
+            "dd_delta": 0.0,
+        },
+        "weekday_promotion": {
+            "promote_weekday": True,
+            "ir_delta": 0.08,
+            "dd_delta": 0.02,
+        },
+        "sticky_promotion": {
+            "promote_sticky": False,
+            "ir_delta": 0.0,
+            "dd_delta": 0.0,
+        },
+    }
+    juicy_test = {"promote_ic_gate": True, "ir_delta": 9.9}
+    out = compare_date_gate_books(ls, lo)
+    assert out["primary_book"] == COST_BOOK_LS
+    assert out["ir_status"] == "provisional_pending_label_audit"
+    assert out["n_promote_live_locate"] == 1
+    assert out["n_promote_long_only"] == 2
+    by_gate = {r["gate"]: r for r in out["rows"]}
+    assert by_gate["ic"]["live_locate_promote"] is True
+    assert by_gate["ic"]["long_only_promote"] is False
+    assert by_gate["weekday"]["long_only_promote"] is True
+    assert juicy_test["ir_delta"] > by_gate["ic"]["live_locate_ir_delta"]
 
 
 def test_synthetic_names_map_to_sector_etfs_and_etfs_are_not_book_names():
@@ -1165,14 +1276,33 @@ def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
     assert payload["lo_refine_promotion"]["gated_on"] == "val"
     assert payload["ic_gate_fit"]["fit_split"] == "train"
     assert payload["ic_gate_promotion"]["gated_on"] == "val"
+    assert payload["ic_gate_promotion"]["cost_book"] == COST_BOOK_LS
+    assert payload["ic_gate_promotion_long_only"]["cost_book"] == COST_BOOK_LO
+    assert payload["date_gate_primary_book"] == COST_BOOK_LS
+    assert payload["ir_status"] == "provisional_pending_label_audit"
+    cmp_ = payload["gate_book_compare"]
+    assert cmp_["primary_book"] == COST_BOOK_LS
+    assert {r["gate"] for r in cmp_["rows"]} == {
+        "ic",
+        "ic_scale",
+        "disp",
+        "weekday",
+        "sticky",
+    }
     assert payload["ic_scale_fit"]["fit_split"] == "train"
     assert payload["ic_scale_promotion"]["gated_on"] == "val"
+    assert payload["ic_scale_promotion"]["cost_book"] == COST_BOOK_LS
     assert "PROMOTE IC-SCALE" in text
+    assert "DATE GATES on live_locate" in text
+    assert "provisional" in text.lower()
     assert payload["weekday_promotion"]["gated_on"] == "val"
+    assert payload["weekday_promotion"]["cost_book"] == COST_BOOK_LS
     assert payload["sector_promotion"]["gated_on"] == "val"
     assert payload["sector_compare"]["n_sector_hedges"] > 0
     assert payload["disp_gate_fit"]["fit_split"] == "train"
     assert payload["disp_gate_promotion"]["gated_on"] == "val"
+    assert payload["disp_gate_promotion"]["cost_book"] == COST_BOOK_LS
+    assert payload["disp_gate_promotion_long_only"]["cost_book"] == COST_BOOK_LO
     assert "PROMOTE IC-GATE" in text
     assert "PROMOTE WEEKDAY MASK" in text
     assert "PROMOTE SECTOR-OVERNIGHT" in text
@@ -1192,6 +1322,8 @@ def test_synthetic_overnight_short_sleeve_has_skill(tmp_path: Path):
     assert "PROMOTE ADAPTIVE OVERNIGHT" in text
     assert payload["sticky_fit"]["fit_split"] == "train"
     assert payload["sticky_promotion"]["gated_on"] == "val"
+    assert payload["sticky_promotion"]["cost_book"] == COST_BOOK_LS
+    assert payload["sticky_promotion_long_only"]["cost_book"] == COST_BOOK_LO
     chosen_st = payload["sticky_fit"].get("chosen") or {}
     if chosen_st:
         assert float(chosen_st["q_enter"]) in set(STICKY_ENTERS)
