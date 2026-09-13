@@ -409,6 +409,13 @@ class ForecastTrainConfig:
     ridge_year_stable: str = ""
     # ListNet (softmax CE) within date. 0 keeps RankNet-only ranking.
     listnet_loss_weight: float = 0.0
+    # (2b) cost-aware RankNet + IR-proxy aligned to live_locate after costs.
+    # Off by default — do not change the parked Huber / rank-target skip.
+    cost_rank_loss: bool = False
+    cost_rank_weight: float = 1.0
+    ir_proxy_weight: float = 0.5
+    # When True, location_loss_weight is treated as 0 (Huber replaced).
+    cost_rank_replace_huber: bool = False
     # Residual-std head. Trained by gaussian NLL, or by sigma_aux_weight when
     # the mean loss is Huber/MSE. Default 0 matches heteroscedastic=False.
     sigma_aux_weight: float = 0.0
@@ -445,6 +452,8 @@ def validate_loss_head(model_cfg: ForecastModelConfig, train_cfg: ForecastTrainC
         "sign_loss_weight",
         "rank_loss_weight",
         "listnet_loss_weight",
+        "cost_rank_weight",
+        "ir_proxy_weight",
         "pred_std_weight",
         "ridge_skip",
         "skip_lr_mult",

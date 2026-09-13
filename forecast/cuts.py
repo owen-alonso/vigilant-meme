@@ -333,19 +333,22 @@ def val_gate_commands(
     data_dir: str = "data",
     universe: str = "liquid",
     baseline_ir: float = 5.58,
+    baseline_dd: float = -0.95,
 ) -> str:
     """Desktop Yahoo liquid commands to VAL-gate FT on cost-aware live_locate IR."""
     ckpt = checkpoint_dir.rstrip("/")
     return (
         "# VAL-gate the FT checkpoint on cost-aware IR (live_locate), not hit-rate.\n"
         "# Promote only if FT VAL unlevered net IR beats the prior overnight "
-        f"baseline (~+{baseline_ir:.2f} liquid live_locate).\n"
-        "# TEST is report-only. Do not reopen overnight-up 60% or expand Mamba.\n"
+        f"baseline (~+{baseline_ir:.2f} / DD ~{baseline_dd:+.2f} liquid live_locate)\n"
+        "# by +0.05 IR and DD not worse by >0.05. TEST is report-only.\n"
+        "# Do not reopen overnight-up 60% or expand Mamba.\n"
         "# Keep live_locate q20 / haircut 0.50 / short 0.50 unless VAL IR promotes.\n"
         f"python scripts/overnight_shorting.py --data-dir {data_dir} --universe {universe} \\\n"
         f"    --json {ckpt}/shorting.json\n"
         f"python -m forecast.backtest --checkpoint {ckpt}/best.pt \\\n"
         "    --holding overnight --live-costs\n"
-        "# Look at VAL live_locate unlevered_net_ir (DATE GATES / books.live_locate).\n"
+        "# Look at VAL live_locate unlevered_net_ir and unlevered_max_dd "
+        "(DATE GATES / books.live_locate).\n"
         "# Do not flip LS vs long-only off TEST. Reported IR is provisional.\n"
     )

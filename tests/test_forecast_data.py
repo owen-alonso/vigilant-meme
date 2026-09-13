@@ -531,6 +531,9 @@ def test_weekly_cli_uses_week_scale_context():
     assert model_cfg.dt_min == pytest.approx(0.05)
     assert train_cfg.ic_loss_weight == pytest.approx(2.0)
     assert train_cfg.rank_loss_weight == pytest.approx(1.0)
+    assert train_cfg.cost_rank_loss is False
+    assert train_cfg.cost_rank_weight == pytest.approx(1.0)
+    assert train_cfg.ir_proxy_weight == pytest.approx(0.5)
     assert train_cfg.early_stop_evals == 24
     assert train_cfg.ridge_skip == pytest.approx(10.0)
     assert train_cfg.ridge_rank_target is True

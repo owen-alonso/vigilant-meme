@@ -104,6 +104,11 @@ def masked_loss(
     mask: torch.Tensor,
     cfg: ForecastTrainConfig,
     date_ids: torch.Tensor | None = None,
+    *,
+    scale: torch.Tensor | None = None,
+    features: torch.Tensor | None = None,
+    feature_mean: np.ndarray | None = None,
+    feature_std: np.ndarray | None = None,
 ) -> torch.Tensor:
     """Loss over labelled bars only. Returns a zero-grad-safe scalar."""
     weights = mask.to(mean.dtype)
@@ -135,7 +140,12 @@ def masked_loss(
         aux = 0.5 * (inv_var * resid_sq) + log_sigma
         per_bar = per_bar + cfg.sigma_aux_weight * aux
     location = (per_bar * weights).sum() / denom
-    total = cfg.location_loss_weight * location
+    loc_w = float(cfg.location_loss_weight)
+    if bool(getattr(cfg, "cost_rank_loss", False)) and bool(
+        getattr(cfg, "cost_rank_replace_huber", False)
+    ):
+        loc_w = 0.0
+    total = loc_w * location
     if cfg.ic_loss_weight > 0:
         ic_term = masked_correlation_loss(
             mean, target, mask, winsor=cfg.ic_winsor, date_ids=date_ids
@@ -160,6 +170,22 @@ def masked_loss(
         scale_term = masked_pred_std_loss(mean, target, mask)
         if torch.isfinite(scale_term):
             total = total + cfg.pred_std_weight * scale_term
+    if bool(getattr(cfg, "cost_rank_loss", False)):
+        from forecast.cost_rank import cost_rank_terms
+
+        cost_term = cost_rank_terms(
+            mean,
+            target,
+            mask,
+            cfg,
+            date_ids=date_ids,
+            scale=scale,
+            features=features,
+            feature_mean=feature_mean,
+            feature_std=feature_std,
+        )
+        if torch.isfinite(cost_term):
+            total = total + cost_term
     return total
 
 
@@ -593,7 +619,16 @@ def evaluate(
             mean, log_sigma = model(x)
         mean = mean.float()
         loss = masked_loss(
-            mean, log_sigma.float(), y, mask, train_cfg, date_ids=date_ids
+            mean,
+            log_sigma.float(),
+            y,
+            mask,
+            train_cfg,
+            date_ids=date_ids,
+            scale=scale,
+            features=x,
+            feature_mean=getattr(train_cfg, "_feature_mean", None),
+            feature_std=getattr(train_cfg, "_feature_std", None),
         )
         weight = float(mask.to(mean.dtype).sum())
         if weight > 0 and math.isfinite(float(loss)):
@@ -716,6 +751,10 @@ def apply_ridge_skip(
         bundle["feature_mean"],
         bundle["feature_std"],
     )
+    if bool(getattr(train_cfg, "cost_rank_loss", False)) and y.size:
+        from forecast.cost_rank import apply_cost_adjusted_target
+
+        y = apply_cost_adjusted_target(y, bundle["train_symbols"])
     min_names = int(bundle.get("cs_min_names", 8))
     stable = str(getattr(train_cfg, "ridge_year_stable", "") or "")
     if stable in ("train", "train_val"):
@@ -726,6 +765,10 @@ def apply_ridge_skip(
                 bundle["feature_mean"],
                 bundle["feature_std"],
             )
+            if bool(getattr(train_cfg, "cost_rank_loss", False)) and yv.size:
+                from forecast.cost_rank import apply_cost_adjusted_target
+
+                yv = apply_cost_adjusted_target(yv, bundle["val_symbols"])
         keep = year_stable_mask(
             x,
             y,
@@ -879,6 +922,9 @@ def _train(
     bundle = build_datasets(data_cfg, log_fn=log_fn)
     datasets = bundle["datasets"]
     model_cfg.n_features = len(bundle["feature_names"])
+    # Denormalize last-bar vol/turnover for (2b) cost terms. Not a knob.
+    train_cfg._feature_mean = bundle["feature_mean"]
+    train_cfg._feature_std = bundle["feature_std"]
 
     model = ReturnForecaster(model_cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
@@ -903,6 +949,7 @@ def _train(
             f"session_hl={float(getattr(train_cfg, 'time_upweight_halflife_sessions', 0.0) or 0.0)} "
             f"num_workers={train_cfg.num_workers} "
             f"pup_head={bool(getattr(train_cfg, 'pup_head', False))} "
+            f"cost_rank_loss={bool(getattr(train_cfg, 'cost_rank_loss', False))} "
             f"mmap={bundle.get('mmap_manifest') or bundle.get('mmap') or 'off'}"
         )
         log_fn(formula_log_line(
@@ -934,6 +981,10 @@ def _train(
         from forecast.pup import format_pup_block
 
         log_fn(format_pup_block(pup_payload))
+    if bool(getattr(train_cfg, "cost_rank_loss", False)) and log_fn:
+        from forecast.cost_rank import format_cost_rank_block
+
+        log_fn(format_cost_rank_block(train_cfg))
     if log_fn and not bundle.get("cross_section"):
         log_fn(
             "NOTE: cross-section dataset is off "
@@ -1142,12 +1193,15 @@ def _train(
 
             batch = next(data_iter)
             x, y, mask = batch[0], batch[1], batch[2]
+            scale = batch[3] if len(batch) > 3 else None
             date_ids = batch[4] if len(batch) > 4 else None
             # non_blocking pairs with pin_memory: the H2D copy overlaps the
             # optimizer bookkeeping instead of stalling the step.
             x, y, mask = (
                 t.to(device, non_blocking=True) for t in (x, y, mask)
             )
+            if scale is not None:
+                scale = scale.to(device, non_blocking=True)
             if date_ids is not None:
                 date_ids = date_ids.to(device, non_blocking=True)
 
@@ -1155,7 +1209,16 @@ def _train(
             with autocast_context(device, train_cfg.precision):
                 mean, log_sigma = model(x)
             loss = masked_loss(
-                mean.float(), log_sigma.float(), y, mask, train_cfg, date_ids=date_ids
+                mean.float(),
+                log_sigma.float(),
+                y,
+                mask,
+                train_cfg,
+                date_ids=date_ids,
+                scale=scale,
+                features=x,
+                feature_mean=getattr(train_cfg, "_feature_mean", None),
+                feature_std=getattr(train_cfg, "_feature_std", None),
             )
             if not torch.isfinite(loss):
                 raise RuntimeError(f"non-finite loss at step {step}")
@@ -1538,6 +1601,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="ridge on the P(up) logistic slopes (bias unpenalized)",
+    )
+    g.add_argument(
+        "--cost-rank-loss",
+        action="store_true",
+        help="(2b) cost-aware RankNet + IR-proxy aligned to live_locate "
+        "after costs. Augments Huber; skip target becomes net residual. "
+        "Does not change live_locate knobs.",
+    )
+    g.add_argument(
+        "--cost-rank-replace-huber",
+        action="store_true",
+        help="with --cost-rank-loss, drop Huber/MSE location term (replace, not augment)",
+    )
+    g.add_argument(
+        "--cost-rank-weight",
+        type=float,
+        default=t.cost_rank_weight,
+        help="weight on cost-adjusted pairwise RankNet (requires --cost-rank-loss)",
+    )
+    g.add_argument(
+        "--ir-proxy-weight",
+        type=float,
+        default=t.ir_proxy_weight,
+        help="weight on soft q20 live_locate IR proxy (requires --cost-rank-loss)",
     )
 
     g = p.add_argument_group("model")
@@ -1943,6 +2030,10 @@ def configs_from_cli(
         checkpoint_dir=args.checkpoint_dir,
         pup_head=bool(getattr(args, "pup_head", False)),
         pup_ridge=float(getattr(args, "pup_ridge", 1.0) or 1.0),
+        cost_rank_loss=bool(getattr(args, "cost_rank_loss", False)),
+        cost_rank_weight=float(getattr(args, "cost_rank_weight", 1.0) or 0.0),
+        ir_proxy_weight=float(getattr(args, "ir_proxy_weight", 0.5) or 0.0),
+        cost_rank_replace_huber=bool(getattr(args, "cost_rank_replace_huber", False)),
         early_stop_evals=args.early_stop_evals,
         lr_plateau_evals=args.lr_plateau_evals,
         lr_plateau_factor=args.lr_plateau_factor,
@@ -2016,11 +2107,13 @@ def run_pretrain_finetune_schedule(
         data_dir=str(data_cfg.data_dir),
         universe=str(data_cfg.universe or cuts.universe or "liquid"),
         baseline_ir=float((cuts.val_gate or {}).get("baseline_ir") or 5.58),
+        baseline_dd=float((cuts.val_gate or {}).get("baseline_dd") or -0.95),
     )
     summaries["val_gate"] = {
         "book": (cuts.val_gate or {}).get("book", "live_locate"),
         "metric": (cuts.val_gate or {}).get("metric", "unlevered_net_ir"),
         "baseline_ir": float((cuts.val_gate or {}).get("baseline_ir") or 5.58),
+        "baseline_dd": float((cuts.val_gate or {}).get("baseline_dd") or -0.95),
         "commands": gate,
     }
     if log_fn:

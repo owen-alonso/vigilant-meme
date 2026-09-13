@@ -29,8 +29,8 @@ TARGET_UP_PCT = 60.0
 # Settled skip-rank VAL (closed grid). Honest autopsy if (2a) misses 60%.
 HONEST_SKIP_RANK_VAL_UP = 59.07
 PUP_RIDGE = 1.0
-# (2b) follows; do not implement a cost-IR loss here.
-COST_RANK_LOSS = "deferred_2b"
+# (2b) lives in forecast.cost_rank (--cost-rank-loss). Not this head.
+COST_RANK_LOSS = "live_locate_rank_ir"
 
 
 def _as_float(value: Any, default: float = float("nan")) -> float:
@@ -368,6 +368,7 @@ def evaluate_pup(
         "book_gate": {
             "metric": "live_locate_unlevered_net_ir",
             "baseline_ir": 5.58,
+            "baseline_dd": -0.95,
             "role": "report-only for this cut (hit-rate gate is separate)",
         },
         "cost_rank_loss": COST_RANK_LOSS,
