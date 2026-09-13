@@ -164,7 +164,9 @@ python -m forecast.training --universe liquid --skip-only --label-return overnig
 python scripts/pretrain_finetune.py --data-dir data --universe liquid
 python -m forecast.panel_mmap --data-dir data --universe liquid --write
 python -m forecast.training --universe liquid --skip-only --label-return overnight --pup-head --num-workers 0
+python -m forecast.training --universe liquid --skip-only --label-return overnight --cost-rank-loss --num-workers 0
 python scripts/overnight_pup.py --data-dir data --universe liquid
+python scripts/overnight_shorting.py --synthetic
 python scripts/cs_overnight.py --data-dir data --universe liquid
 python scripts/overnight_accuracy.py --data-dir data --universe liquid
 python scripts/ablate_cs.py
@@ -190,12 +192,15 @@ when present (`load_manifest` / `load_symbol_mmap(..., mmap_mode="r")`).
 `numpy_mmap_v1` pointer files (`→ mmap_<hash>/manifest.json`, `symbols`
 as a list) are adapted in-place; the hashed float32 store is not rewritten.
 Never `cs_train_*.pt`. `--pup-head` is the (2a) direct overnight-up P(up)
-classifier (VAL overnight-up ≥60% at cover ≥5%; TEST report-only). PIT
+classifier (parked: FT-val 51.79% @ 5.9% cover). `--cost-rank-loss` is
+(2b): RankNet + IR-proxy on live_locate *net* residual (skip target
+becomes `y - cost/σ`). PIT
 drops overnight labels where `data/_pit/factors/{SYM}_daily_factors.parquet`
 has `next_split_days==1`. Optional membership as-of:
 `data/_pit/liquid_membership.json`.
-VAL-gate the *book* on cost-aware `live_locate` IR vs +5.58 (report-only
-on the P(up) cut). Backtest
+VAL-gate the *book* on cost-aware `live_locate` IR/DD vs **+5.58 / −0.95**
+(lift ≥0.05 IR, DD not worse by >0.05; else keep q20/h0.5/s0.50). TEST
+report-only. Backtest
 `--holding overnight` flattens every open (MOC→MOO).
 `--live-costs` is the Owen-runnable pack (20 bp RT + name-level MOC/MOO +
 thin/vol impact + 5 bp borrow + 10 bp hedge). `--long-only` drops shorts and

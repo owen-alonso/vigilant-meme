@@ -69,6 +69,7 @@ def test_in_repo_cuts_match_authoritative_windows():
     assert cuts.val_gate["book"] == "live_locate"
     assert cuts.val_gate["metric"] == "unlevered_net_ir"
     assert float(cuts.val_gate["baseline_ir"]) == pytest.approx(5.58)
+    assert float(cuts.val_gate["baseline_dd"]) == pytest.approx(-0.95)
 
 
 def test_parse_iso_date_rejects_garbage():
@@ -493,5 +494,6 @@ def test_val_gate_commands_point_at_ft_live_locate():
     assert "overnight_shorting.py" in text
     assert "live-costs" in text
     assert "5.58" in text
+    assert "-0.95" in text or "0.95" in text
     assert "hit-rate" in text.lower() or "not hit-rate" in text
     assert "forecast_ridge_overnight_finetune" in text

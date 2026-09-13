@@ -242,7 +242,47 @@ python -m forecast.backtest --checkpoint checkpoints/forecast_pup_overnight/best
   --holding overnight --live-costs
 ```
 
-Promote P(up) only if locked VAL overnight-up ≥ 60% at cover ≥ 5% of the full frame. One sleeve rule (rank P(up), cover floor) — no overnight-up q-grid. If it misses, report the honest lift vs skip-rank 59.07%. (2b) cost-aware ranking / IR loss can follow; it does not block (2a).
+Promote P(up) only if locked VAL overnight-up ≥ 60% at cover ≥ 5% of the full frame. One sleeve rule (rank P(up), cover floor) — no overnight-up q-grid. If it misses, report the honest lift vs skip-rank 59.07%.
+
+### (2b) cost-aware ranking / IR-aligned loss
+
+(2a) P(up) is parked (Eval-NO: FT-val overnight-up 51.79% @ 5.9% cover). Do not reopen that hit-rate grid. This cut trains the **residual book** so RankNet / the skip target match **live_locate selection after costs**, not Huber-on-gross-residual.
+
+`--cost-rank-loss` (opt-in; defaults unchanged):
+
+1. Skip fit uses **cost-adjusted residual** `y_net = y - cost_side / σ` (live_locate RT + thin-scaled MOC/MOO + vol impact + borrow on shorts). Rank-target ridge then ranks *net* contribution.
+2. AdamW mixes **tail-weighted RankNet on `y_net`** and a **soft q20 LS IR proxy** (`-mean(net)/std(net)` after locate haircut 0.50 / short NAV 0.50).
+3. Huber stays on unless `--cost-rank-replace-huber` (location weight → 0).
+
+Does **not** change default live_locate knobs. VAL-gate the book on liquid **live_locate unlevered net IR vs +5.58** and **max DD vs −0.95**. Promote knobs only if IR lifts by **≥ 0.05** and DD is not worse by **> 0.05**. TEST is report-only — never retarget TEST. mmap CS path, `num_workers=0`, no `cs_train_*.pt`. PIT `next_split_days==1` still drops overnight labels.
+
+```bash
+# synth CI (cloud; no Yahoo tape)
+python -m forecast.training --universe synthetic --interval daily --skip-only \
+  --label-return overnight --cost-rank-loss --num-workers 0 \
+  --checkpoint-dir checkpoints/forecast_cost_rank_synth
+python scripts/overnight_shorting.py --synthetic \
+    --json checkpoints/forecast_cost_rank_synth/shorting.json
+
+# DESKTOP Yahoo liquid — mmap + PIT + (2b). Do not load cs_train_*.pt.
+python -m forecast.training --universe liquid --interval daily --skip-only \
+  --label-return overnight --cost-rank-loss --num-workers 0 \
+  --mmap-manifest data/_panel_cache/mmap_manifest.json \
+  --checkpoint-dir checkpoints/forecast_cost_rank_overnight
+# optional: replace Huber instead of augmenting
+python -m forecast.training --universe liquid --interval daily \
+  --label-return overnight --cost-rank-loss --cost-rank-replace-huber \
+  --num-workers 0 --mmap-manifest data/_panel_cache/mmap_manifest.json \
+  --checkpoint-dir checkpoints/forecast_cost_rank_overnight_adamw
+
+# Eval: VAL live_locate IR/DD vs +5.58 / -0.95. TEST report-only.
+python scripts/overnight_shorting.py --data-dir data --universe liquid \
+    --json checkpoints/forecast_cost_rank_overnight/shorting.json
+python -m forecast.backtest --checkpoint checkpoints/forecast_cost_rank_overnight/best.pt \
+  --holding overnight --live-costs
+# Read VAL books.live_locate.unlevered_net_ir / unlevered_max_dd.
+# Promote knobs only if IR >= 5.58+0.05 and DD >= -0.95-0.05. Else keep q20/h0.5/s0.50.
+```
 
 ```bash
 # regime heads / surgical vol+CS-product drop / trailing readout window (all lost on val)
@@ -373,6 +413,10 @@ Not on `-h` but fixed in code (and stored in the checkpoint): vol EWM half-life 
 | `--lr` | `0.001` | Peak AdamW LR. Warmup is 5% of total steps, then cosine down to 10% of `--lr` (not CLI flags). |
 | `--weight-decay` | `0.01` | L2 on most weights. Biases, norms, `A_log`, and `D` are excluded. Grad clip is **1.0** (not a flag). |
 | `--loss` | `huber` | `huber` (default, robust), `mse` (squares outliers), `gaussian` (mean + log-sigma NLL; needs `--heteroscedastic`). |
+| `--cost-rank-loss` | off | (2b) RankNet on live_locate-cost-adjusted residual + soft q20 IR proxy. Opt-in. |
+| `--cost-rank-replace-huber` | off | With `--cost-rank-loss`, drop the Huber/MSE location term. |
+| `--cost-rank-weight` | `1.0` | Weight on the cost-aware RankNet term. |
+| `--ir-proxy-weight` | `0.5` | Weight on the soft live_locate IR proxy. |
 | `--precision` | `bf16` | Autocast: `bf16`, `fp16` (GPU + GradScaler), `fp32`. CPU `fp16` falls back. |
 | `--seed` | `42` | Python / NumPy / PyTorch seed. |
 | `--eval-interval` | `250` | Validate (and maybe write `best.pt`) every N steps. |
@@ -380,7 +424,7 @@ Not on `-h` but fixed in code (and stored in the checkpoint): vol EWM half-life 
 | `--num-workers` | `0` | DataLoader workers. Keep `0` on Windows unless you know you need more. Do not pickle mmap / `cs_train_*.pt`. |
 | `--mmap-manifest` | auto | `data/_panel_cache/mmap_manifest.json` when present. CS batches read memmaps. |
 | `--write-mmap` | off | After a parquet build, write the mmap cache and train from it. |
-| `--pup-head` | off | (2a) direct overnight-up P(up) logistic. Not a sleeve grid. |
+| `--pup-head` | off | (2a) direct overnight-up P(up) logistic. Not a sleeve grid. Parked (Eval-NO). |
 | `--pit-dir` | `data/_pit` | Factors: `<pit>/factors/{SYM}_daily_factors.parquet` (`next_split_days==1` drops overnight labels). Optional `<pit>/liquid_membership.json`. |
 | `--checkpoint-dir` | `checkpoints/forecast` | `best.pt`, `last.pt`, `summary.json`. Relative paths are under the **repo root**. |
 | `--early-stop-evals` | `8` | Stop if val IC does not improve for this many evals. |
