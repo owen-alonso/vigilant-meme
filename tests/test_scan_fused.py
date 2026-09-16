@@ -42,6 +42,7 @@ def _make_inputs(batch, seq_len, d_inner, d_state, *, dynamic, seed=0):
     [
         (2, 7, 4, 3),      # tiny, odd everything
         (2, 64, 48, 16),   # mid, non-pow2 D
+        (2, 128, 128, 16), # daily expanded (d_model=64, expand=2)
         (3, 130, 256, 16), # odd L, training-like D/N
     ],
 )
@@ -55,7 +56,7 @@ def test_fused_forward_matches_reference(shape, dynamic):
 
 
 @pytest.mark.parametrize("dynamic", [False, True])
-@pytest.mark.parametrize("shape", [(2, 33, 24, 8), (2, 64, 48, 16)])
+@pytest.mark.parametrize("shape", [(2, 33, 24, 8), (2, 64, 48, 16), (2, 128, 128, 16)])
 def test_fused_backward_matches_reference(shape, dynamic):
     inputs_ref = _make_inputs(*shape, dynamic=dynamic, seed=1)
     inputs_fused = tuple(t.detach().clone() for t in inputs_ref)

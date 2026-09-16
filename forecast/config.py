@@ -13,6 +13,7 @@ from mamba_lm.config_utils import filter_dataclass_fields
 
 Precision = Literal["fp32", "fp16", "bf16"]
 LossName = Literal["huber", "mse", "gaussian"]
+CSFeatureNorm = Literal["off", "z", "rank"]
 
 # Regular US equity trading session, matching the bars in data/.
 SESSION_START_MINUTE = 9 * 60 + 30  # 09:30
@@ -83,8 +84,19 @@ class DataConfig:
     residual_target: bool = True
     beta_halflife: int = 63
     # Cross-section batches when at least this many names print on a date.
+<<<<<<< Updated upstream
     # 30 keeps the ridge off sparse 1970s panels; 8 is the absolute floor in tests.
     cross_section_min_names: int = 30
+=======
+    cross_section_min_names: int = 8
+    # Restate name-specific features against the same-date cross-section:
+    # 'z' subtracts the per-date mean and divides by the per-date std, 'rank'
+    # replaces the value with its per-date percentile. Only ~70% of each
+    # feature's variance is within-date, so 'off' leaves a market-wide factor
+    # in the inputs that cannot help a within-date ranking. Uses only bar-t
+    # values of other names, the same information peer_ret_1 already carries.
+    cs_feature_norm: CSFeatureNorm = "off"
+>>>>>>> Stashed changes
     # Weekly mixed adjusted/raw files have lag-1 autocorr << 0. Set True to skip.
     allow_mixed_prices: bool = False
     # Restrict loaded parquets to a train-era-locked list or all.
@@ -238,12 +250,15 @@ def interval_model_kwargs(interval: str) -> dict[str, Any]:
             "d_state": 8,
         }
     if interval == "daily":
+        # ~67k params at 25 features: large enough to fit a residual on top of
+        # the frozen ridge skip, small enough to stay under ~4 GB at B≈900.
         return {
             "dt_min": 1e-3,
             "dt_max": 0.1,
-            "d_model": 32,
-            "n_layer": 1,
-            "d_state": 8,
+            "d_model": 64,
+            "n_layer": 2,
+            "d_state": 16,
+            "dropout": 0.1,
         }
     return {"dt_min": 1e-3, "dt_max": 0.1}
 
@@ -252,15 +267,20 @@ def interval_model_kwargs(interval: str) -> dict[str, Any]:
 class ForecastModelConfig:
     """Mamba backbone sized for continuous financial features."""
 
+<<<<<<< Updated upstream
     n_features: int = 44
     d_model: int = 96
     n_layer: int = 4
+=======
+    n_features: int = 25
+    d_model: int = 64
+    n_layer: int = 2
+>>>>>>> Stashed changes
     d_state: int = 16
     expand: int = 2
     d_conv: int = 4
-    # Stem dropout sits on the only residual that could carry ``ret_*``.
-    # Off by default so the linear skip (and the identity Mamba path) survive.
-    dropout: float = 0.0
+    # Dropout after the backbone (not on the stem). The linear skip is separate.
+    dropout: float = 0.1
     # Residual-std head. Trained by gaussian NLL, or by sigma_aux_weight when
     # the mean loss is Huber/MSE. generate.py maps it to a confidence score.
     heteroscedastic: bool = False
@@ -302,7 +322,10 @@ class ForecastModelConfig:
 @dataclass
 class ForecastTrainConfig:
     batch_size: int = 16
-    epochs: int = 8
+    # Concatenated CS windows per step (names x dates). 0 disables. Caps the
+    # fused-scan h buffer on fat later-year dates (~100 names x 16 dates).
+    max_cs_windows: int = 1024
+    epochs: int = 12
     max_steps: int | None = None
     lr: float = 1e-3
     weight_decay: float = 0.01
@@ -314,17 +337,25 @@ class ForecastTrainConfig:
     # optimizer does not trade rank agreement for MSE.
     location_loss_weight: float = 0.4
     # Mix 1 - Pearson over the pooled labelled batch (same IC val reports).
-    ic_loss_weight: float = 2.0
+    ic_loss_weight: float = 2.5
     # Clip pred/target to +/- this many vol units before Pearson / IC loss.
     ic_winsor: float = 3.0
     # Direction on moves larger than sign_min_abs (volatility units).
     sign_loss_weight: float = 0.4
     sign_min_abs: float = 0.25
     # Pairwise RankNet on labelled bars in the batch (Spearman-like).
+<<<<<<< Updated upstream
     # Default matches the CS ranking objective; do not raise ic_loss_weight.
     rank_loss_weight: float = 1.0
     # Match pred std to target std so Pearson cannot explode |pred|.
+=======
+    rank_loss_weight: float = 1.0
+    # Match pred std to ``pred_std_target_frac *`` labelled target std.
+    # MSE-optimal scale is |IC| * sigma_y, so this should track expected IC
+    # (~0.03-0.05 CS). 0.15 is ~3x too large and forces negative R².
+>>>>>>> Stashed changes
     pred_std_weight: float = 0.5
+    pred_std_target_frac: float = 0.04
     # Closed-form ridge readout copied into the linear skip at step 0.
     # 0 keeps Xavier init.
     ridge_skip: float = 10.0
@@ -378,6 +409,8 @@ class ForecastTrainConfig:
     seed: int = 42
     log_interval: int = 25
     eval_interval: int = 250
+    # 0: CrossSection windows are cached in RAM. Extra workers pickle that
+    # cache per process on Windows and raise RAM without feeding the GPU.
     num_workers: int = 0
     checkpoint_dir: str = "checkpoints/forecast"
     # 0 = never stop. Default stops after N evals with no new best val IC.
@@ -413,6 +446,8 @@ def validate_loss_head(model_cfg: ForecastModelConfig, train_cfg: ForecastTrainC
     ):
         if getattr(train_cfg, name) < 0:
             raise ValueError(f"{name} must be >= 0")
+    if train_cfg.pred_std_target_frac < 0:
+        raise ValueError("pred_std_target_frac must be >= 0")
     if train_cfg.ic_winsor <= 0:
         raise ValueError("ic_winsor must be > 0")
     if train_cfg.sign_min_abs < 0:

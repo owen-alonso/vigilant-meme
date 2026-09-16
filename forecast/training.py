@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 import time
 from pathlib import Path
@@ -46,8 +45,12 @@ from forecast.config import (
 )
 from forecast.data import FEATURE_NAMES, build_datasets, collate_forecast
 from forecast.model import ReturnForecaster
+<<<<<<< Updated upstream
 from forecast.overnight import formula_log_line, parse_label_spec
 from forecast.ridge import feature_mask, labelled_rows, walk_forward_predict, cs_stats
+=======
+from mamba_lm.diagnostics import clear_ssm_diagnostics
+>>>>>>> Stashed changes
 from mamba_lm.model import format_dynamic_diagnostics
 from mamba_lm.paths import anchor_to_repo
 from mamba_lm.reporting import clip_grad_norm_unique
@@ -104,9 +107,8 @@ def masked_loss(
 ) -> torch.Tensor:
     """Loss over labelled bars only. Returns a zero-grad-safe scalar."""
     weights = mask.to(mean.dtype)
-    denom = weights.sum()
-    if float(denom) <= 0:
-        return mean.new_tensor(float("nan"))
+    labelled = weights.sum()
+    denom = labelled.clamp(min=1e-6)
 
     loc_mean, loc_target = mean, target
     if cfg.cs_center_loss:
@@ -133,19 +135,26 @@ def masked_loss(
         per_bar = per_bar + cfg.sigma_aux_weight * aux
     location = (per_bar * weights).sum() / denom
     total = cfg.location_loss_weight * location
+    # Aux terms already return 0 on empty groups. nan_to_num stays on-device;
+    # a Python torch.isfinite here synchronized the GPU on every step.
     if cfg.ic_loss_weight > 0:
-        ic_term = masked_correlation_loss(
-            mean, target, mask, winsor=cfg.ic_winsor, date_ids=date_ids
+        total = total + cfg.ic_loss_weight * torch.nan_to_num(
+            masked_correlation_loss(
+                mean, target, mask, winsor=cfg.ic_winsor, date_ids=date_ids
+            ),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
         )
-        if torch.isfinite(ic_term):
-            total = total + cfg.ic_loss_weight * ic_term
     if cfg.sign_loss_weight > 0:
-        sign_term = masked_sign_loss(
-            mean, target, mask, min_abs=cfg.sign_min_abs
+        total = total + cfg.sign_loss_weight * torch.nan_to_num(
+            masked_sign_loss(mean, target, mask, min_abs=cfg.sign_min_abs),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
         )
-        if torch.isfinite(sign_term):
-            total = total + cfg.sign_loss_weight * sign_term
     if cfg.rank_loss_weight > 0:
+<<<<<<< Updated upstream
         rank_term = masked_pairwise_rank_loss(mean, target, mask, date_ids=date_ids)
         if torch.isfinite(rank_term):
             total = total + cfg.rank_loss_weight * rank_term
@@ -153,11 +162,24 @@ def masked_loss(
         list_term = masked_listnet_loss(mean, target, mask, date_ids=date_ids)
         if torch.isfinite(list_term):
             total = total + float(cfg.listnet_loss_weight) * list_term
+=======
+        total = total + cfg.rank_loss_weight * torch.nan_to_num(
+            masked_pairwise_rank_loss(mean, target, mask, date_ids=date_ids),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+>>>>>>> Stashed changes
     if cfg.pred_std_weight > 0:
-        scale_term = masked_pred_std_loss(mean, target, mask)
-        if torch.isfinite(scale_term):
-            total = total + cfg.pred_std_weight * scale_term
-    return total
+        total = total + cfg.pred_std_weight * torch.nan_to_num(
+            masked_pred_std_loss(
+                mean, target, mask, target_frac=cfg.pred_std_target_frac
+            ),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+    return torch.where(labelled > 0, total, total.new_tensor(float("nan")))
 
 
 def _expand_date_ids(
@@ -177,9 +199,67 @@ def _pearson_1d(pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     yc = y - y.mean()
     var_p = (pc * pc).sum()
     var_y = (yc * yc).sum()
-    if float(var_p.detach()) <= 1e-8 or float(var_y.detach()) <= 1e-8:
-        return pred.new_zeros(())
-    return (pc * yc).sum() / torch.sqrt(var_p * var_y).clamp(min=1e-8)
+    denom = torch.sqrt(var_p * var_y).clamp(min=1e-8)
+    rho = (pc * yc).sum() / denom
+    ok = (var_p > 1e-8) & (var_y > 1e-8)
+    return torch.where(ok, rho, pred.new_zeros(()))
+
+
+def _pooled_pearson_loss(
+    pred: torch.Tensor, y: torch.Tensor, mask: torch.Tensor
+) -> torch.Tensor:
+    weights = mask.to(dtype=pred.dtype).reshape(-1)
+    pred_f = pred.reshape(-1)
+    y_f = y.reshape(-1)
+    wsum = weights.sum().clamp(min=1e-8)
+    mu_p = (pred_f * weights).sum() / wsum
+    mu_y = (y_f * weights).sum() / wsum
+    pc = (pred_f - mu_p) * weights
+    yc = (y_f - mu_y) * weights
+    cov = (pc * yc).sum()
+    var_p = (pc * pc).sum()
+    var_y = (yc * yc).sum()
+    denom = torch.sqrt(var_p * var_y).clamp(min=1e-8)
+    rho = cov / denom
+    ok = (wsum >= 2) & (var_p > 1e-8) & (var_y > 1e-8)
+    return torch.where(ok, 1.0 - rho, pred.new_zeros(()))
+
+
+def _grouped_pearson_mean(
+    pred: torch.Tensor, y: torch.Tensor, keys: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mean Pearson across groups with at least 3 points. No Python loop.
+
+    Returns ``(mean_rho, n_valid_groups)``. ``n_valid_groups == 0`` means the
+    caller should fall back to pooled Pearson.
+    """
+    zero = pred.new_zeros(())
+    if pred.numel() < 3:
+        return zero, zero
+    uniq, inv = keys.unique(return_inverse=True)
+    n_g = uniq.numel()
+    if n_g <= 0:
+        return zero, zero
+    ones = pred.new_ones(pred.shape)
+    count = pred.new_zeros(n_g).scatter_add_(0, inv, ones)
+    sum_p = pred.new_zeros(n_g).scatter_add_(0, inv, pred)
+    sum_y = pred.new_zeros(n_g).scatter_add_(0, inv, y)
+    safe = count.clamp(min=1.0)
+    mu_p = sum_p / safe
+    mu_y = sum_y / safe
+    pc = pred - mu_p[inv]
+    yc = y - mu_y[inv]
+    cov = pred.new_zeros(n_g).scatter_add_(0, inv, pc * yc)
+    var_p = pred.new_zeros(n_g).scatter_add_(0, inv, pc * pc)
+    var_y = pred.new_zeros(n_g).scatter_add_(0, inv, yc * yc)
+    valid = (count >= 3) & (var_p > 1e-8) & (var_y > 1e-8)
+    rho = cov / torch.sqrt(var_p * var_y).clamp(min=1e-8)
+    # NaN * 0 is still NaN; zero invalid groups before the mean.
+    rho = torch.where(valid, rho, rho.new_zeros(rho.shape))
+    w = valid.to(dtype=pred.dtype)
+    wsum = w.sum()
+    grouped = (rho * w).sum() / wsum.clamp(min=1.0)
+    return grouped, wsum
 
 
 def masked_correlation_loss(
@@ -195,38 +275,12 @@ def masked_correlation_loss(
     pred = mean.clamp(-cap, cap)
     y = target.clamp(-cap, cap)
     dates = _expand_date_ids(date_ids, mask)
-    if dates is not None:
-        sel = mask.bool()
-        p = pred[sel]
-        yy = y[sel]
-        keys = dates[sel]
-        rhos: list[torch.Tensor] = []
-        for key in keys.unique():
-            m = keys == key
-            if int(m.sum()) < 3:
-                continue
-            rho = _pearson_1d(p[m], yy[m])
-            if torch.isfinite(rho):
-                rhos.append(rho)
-        if rhos:
-            return 1.0 - torch.stack(rhos).mean()
-    weights = mask.to(dtype=mean.dtype).reshape(-1)
-    pred_f = pred.reshape(-1)
-    y_f = y.reshape(-1)
-    wsum = weights.sum()
-    if float(wsum.detach()) < 2:
-        return mean.new_zeros(())
-    mu_p = (pred_f * weights).sum() / wsum
-    mu_y = (y_f * weights).sum() / wsum
-    pc = (pred_f - mu_p) * weights
-    yc = (y_f - mu_y) * weights
-    cov = (pc * yc).sum()
-    var_p = (pc * pc).sum()
-    var_y = (yc * yc).sum()
-    if float(var_p.detach()) <= 1e-8 or float(var_y.detach()) <= 1e-8:
-        return mean.new_zeros(())
-    rho = cov / torch.sqrt(var_p * var_y).clamp(min=1e-8)
-    return 1.0 - rho
+    pooled = _pooled_pearson_loss(pred, y, mask)
+    if dates is None:
+        return pooled
+    sel = mask.bool()
+    grouped, n_groups = _grouped_pearson_mean(pred[sel], y[sel], dates[sel])
+    return torch.where(n_groups > 0, 1.0 - grouped, pooled)
 
 
 def masked_sign_loss(
@@ -237,21 +291,28 @@ def masked_sign_loss(
     min_abs: float = 0.25,
 ) -> torch.Tensor:
     """BCE on the sign of labelled moves larger than ``min_abs`` vol units."""
-    weights = mask.to(dtype=mean.dtype) * (target.abs() >= float(min_abs)).to(
-        dtype=mean.dtype
-    )
+    labelled = mask.to(dtype=mean.dtype)
+    weights = labelled * (target.abs() >= float(min_abs)).to(dtype=mean.dtype)
     denom = weights.sum()
-    if float(denom.detach()) <= 0:
-        return mean.new_zeros(())
     labels = (target > 0).to(dtype=mean.dtype)
-    # Sign BCE on raw logits wants |mean| -> inf. Divide by batch std so
-    # this term only rotates predictions, matching Pearson.
-    labelled = mask.bool()
-    scale = mean.detach()[labelled].std(unbiased=False).clamp(min=1.0)
+    # Sign BCE on raw logits wants |mean| -> inf. Divide by labelled std so
+    # this term only rotates predictions, matching Pearson. Weighted std
+    # avoids a boolean gather (data-dependent shape -> CPU sync).
+    wsum = labelled.sum().clamp(min=1.0)
+    loc = (mean.detach() * labelled).sum() / wsum
+    var = ((mean.detach() - loc).pow(2) * labelled).sum() / wsum
+    scale = var.sqrt().clamp(min=1.0)
     per_bar = F.binary_cross_entropy_with_logits(
         mean / scale, labels, reduction="none"
     )
-    return (per_bar * weights).sum() / denom
+    loss = (per_bar * weights).sum() / denom.clamp(min=1e-6)
+    return torch.where(denom > 0, loss, mean.new_zeros(()))
+
+
+# RankNet pairs are per date, not over the whole concatenated CS batch.
+# A 16-date x 100-name step is ~1.6k labelled bars; a dense [n, n] graph is
+# ~2.5M cells plus autograd, and the size changes every step (fragmentation).
+_RANKNET_MAX_NAMES = 256
 
 
 def masked_listnet_loss(
@@ -298,9 +359,63 @@ def _ranknet(pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     diff_p = unit.unsqueeze(0) - unit.unsqueeze(1)
     diff_y = y.unsqueeze(0) - y.unsqueeze(1)
     valid = diff_y.abs() > 1e-6
-    if not bool(valid.any()):
-        return pred.new_zeros(())
-    return F.softplus(-diff_p * diff_y.sign())[valid].mean()
+    w = valid.to(dtype=pred.dtype)
+    per = F.softplus(-diff_p * diff_y.sign())
+    return (per * w).sum() / w.sum().clamp(min=1.0)
+
+
+def _pack_by_group(
+    values: torch.Tensor,
+    keys: torch.Tensor,
+    *,
+    max_n_cap: int = _RANKNET_MAX_NAMES,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Scatter 1-d ``values`` into ``[n_groups, max_n]`` with a validity mask."""
+    uniq, inv = keys.unique(return_inverse=True)
+    n_g = uniq.numel()
+    n = values.numel()
+    counts = torch.bincount(inv, minlength=n_g)
+    max_n = int(counts.max().clamp(min=1).item())
+    if max_n_cap > 0:
+        max_n = min(max_n, int(max_n_cap))
+    order = inv.argsort(stable=True)
+    starts = values.new_zeros(n_g, dtype=torch.long)
+    if n_g > 1:
+        starts[1:] = counts.cumsum(0)[:-1]
+    inv_sorted = inv[order]
+    intra_sorted = torch.arange(n, device=values.device, dtype=torch.long) - starts[
+        inv_sorted
+    ]
+    intra = torch.empty(n, dtype=torch.long, device=values.device)
+    intra[order] = intra_sorted
+    keep = intra < max_n
+    packed = values.new_zeros(n_g, max_n)
+    packed[inv[keep], intra[keep]] = values[keep]
+    valid = torch.zeros(n_g, max_n, dtype=torch.bool, device=values.device)
+    valid[inv[keep], intra[keep]] = True
+    return packed, valid
+
+
+def _ranknet_packed(
+    pred: torch.Tensor, y: torch.Tensor, valid: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mean per-group RankNet over padded groups ``[G, N]``. Detached scale."""
+    p = pred.detach()
+    count = valid.sum(dim=-1).clamp(min=1).to(dtype=pred.dtype)
+    group_mean = (p * valid.to(dtype=pred.dtype)).sum(dim=-1, keepdim=True) / count.unsqueeze(-1)
+    var = (((p - group_mean) * valid.to(dtype=pred.dtype)) ** 2).sum(dim=-1) / count
+    scale = var.sqrt().clamp(min=1.0).unsqueeze(-1)
+    unit = pred / scale
+    diff_p = unit.unsqueeze(2) - unit.unsqueeze(1)
+    diff_y = y.unsqueeze(2) - y.unsqueeze(1)
+    pair = valid.unsqueeze(2) & valid.unsqueeze(1) & (diff_y.abs() > 1e-6)
+    per = F.softplus(-diff_p * diff_y.sign())
+    w = pair.to(dtype=pred.dtype)
+    pair_w = w.sum(dim=(1, 2))
+    g_loss = (per * w).sum(dim=(1, 2)) / pair_w.clamp(min=1.0)
+    ok = (pair_w > 0).to(dtype=pred.dtype)
+    n_ok = ok.sum()
+    return (g_loss * ok).sum() / n_ok.clamp(min=1.0), n_ok
 
 
 def masked_pairwise_rank_loss(
@@ -316,19 +431,15 @@ def masked_pairwise_rank_loss(
     sel = mask.bool()
     pred = mean[sel]
     y = target[sel]
-    if dates is not None:
-        keys = dates[sel]
-        parts: list[torch.Tensor] = []
-        for key in keys.unique():
-            m = keys == key
-            if int(m.sum()) < 2:
-                continue
-            parts.append(_ranknet(pred[m], y[m]))
-        if parts:
-            return torch.stack(parts).mean()
-    n = int(pred.numel())
-    if n < 2:
+    if pred.numel() < 2:
         return mean.new_zeros(())
+    if dates is not None:
+        packed_p, valid = _pack_by_group(pred, dates[sel])
+        packed_y, _valid_y = _pack_by_group(y, dates[sel])
+        grouped, n_ok = _ranknet_packed(packed_p, packed_y, valid)
+        # Do not fall back to pooled RankNet: that ranks across dates.
+        return torch.where(n_ok > 0, grouped, mean.new_zeros(()))
+    n = int(pred.numel())
     if n > max_points:
         idx = torch.randperm(n, device=pred.device)[:max_points]
         pred = pred[idx]
@@ -340,14 +451,17 @@ def masked_pred_std_loss(
     mean: torch.Tensor,
     target: torch.Tensor,
     mask: torch.Tensor,
+    *,
+    target_frac: float = 1.0,
 ) -> torch.Tensor:
-    """Keep predicted vol close to labelled target vol."""
+    """Match predicted vol to ``target_frac`` of labelled target vol."""
     sel = mask.bool()
-    if int(sel.sum()) < 2:
-        return mean.new_zeros(())
     pred = mean[sel]
     y = target[sel]
-    return (pred.std(unbiased=False) - y.std(unbiased=False).detach()).pow(2)
+    if pred.numel() < 2:
+        return mean.new_zeros(())
+    want = y.std(unbiased=False).detach() * float(target_frac)
+    return (pred.std(unbiased=False) - want).pow(2)
 
 
 def _pearson(a: np.ndarray, b: np.ndarray) -> float:
@@ -494,12 +608,97 @@ def mean_cs_stats(
     }
 
 
+def mean_book_hit(
+    pred: np.ndarray,
+    target: np.ndarray,
+    dates: np.ndarray,
+    *,
+    quantile: float = 0.2,
+    min_names: int = 3,
+    spread_pct: float | None = None,
+) -> float:
+    """Fraction of dates the top/bottom quantile residual book makes money.
+
+    This is the diversified 'right % of the time' — not single-name direction.
+    ``spread_pct`` (e.g. 50) keeps only dates whose cross-sectional pred std
+    is at or above that percentile, i.e. skip quiet days.
+    """
+    if pred.size == 0 or dates.size != pred.size:
+        return float("nan")
+    rows: list[tuple[float, float]] = []
+    for key in np.unique(dates):
+        sel = dates == key
+        if int(sel.sum()) < min_names:
+            continue
+        p = pred[sel]
+        y = target[sel]
+        n = int(p.size)
+        if n < 5:
+            lo = int(np.argmin(p))
+            hi = int(np.argmax(p))
+            pnl = float(y[hi] - y[lo])
+        else:
+            k = max(1, int(round(n * float(quantile))))
+            order = np.argsort(p)
+            pnl = float(y[order[-k:]].mean() - y[order[:k]].mean())
+        if np.isfinite(pnl):
+            rows.append((float(np.std(p)), 1.0 if pnl > 0.0 else 0.0))
+    if not rows:
+        return float("nan")
+    if spread_pct is None:
+        return float(np.mean([h for _s, h in rows]))
+    thresh = float(np.percentile([s for s, _h in rows], float(spread_pct)))
+    kept = [h for s, h in rows if s >= thresh]
+    if not kept:
+        return float("nan")
+    return float(np.mean(kept))
+
+
 def selection_score(metrics: dict[str, float]) -> float:
     """Checkpoint / early-stop score: mean CS IC when it exists, else last-bar Pearson."""
     cs = metrics.get("cs_ic", float("nan"))
     if np.isfinite(cs):
         return float(cs)
     return float(metrics.get("ic", float("nan")))
+
+
+def _trim_cs_windows(
+    batch: tuple[torch.Tensor, ...], max_windows: int
+) -> tuple[torch.Tensor, ...]:
+    """Drop trailing whole dates so a CS collate stays under ``max_windows``.
+
+    One DataLoader item is every name on a date. ``batch_size=16`` of late
+    universe dates can be ~1.6k windows; fused scan saves ``h`` as
+    ``[B, L, D, N]`` per layer. Keeping complete dates preserves RankNet / IC.
+    """
+    x = batch[0]
+    n = int(x.size(0))
+    if max_windows < 1 or n <= max_windows or len(batch) < 5:
+        return batch
+    dates = batch[4]
+    keys = dates[:, 0] if dates.dim() > 1 else dates
+    change = torch.ones(n, dtype=torch.bool)
+    change[1:] = keys[1:] != keys[:-1]
+    starts = torch.nonzero(change, as_tuple=False).view(-1)
+    bounds = torch.cat([starts, starts.new_tensor([n])])
+    keep_end = bounds[bounds <= max_windows]
+    cut = int(keep_end[-1].item()) if keep_end.numel() else 0
+    if cut < 2:
+        cut = min(n, max_windows)
+    if cut >= n:
+        return batch
+    return tuple(t[:cut] for t in batch)
+
+
+def _batch_to_device(
+    batch: tuple[torch.Tensor, ...], device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """H2D copy with non_blocking so pinned host memory can overlap compute."""
+    x, y, mask, scale = (
+        t.to(device, non_blocking=True) for t in (batch[0], batch[1], batch[2], batch[3])
+    )
+    date_ids = batch[4].to(device, non_blocking=True) if len(batch) > 4 else None
+    return x, y, mask, scale, date_ids
 
 
 # --------------------------------------------------------------------------
@@ -569,55 +768,66 @@ def evaluate(
     cs_min_names: int = 3,
 ) -> dict[str, float]:
     model.eval()
-    preds: list[np.ndarray] = []
-    targets: list[np.ndarray] = []
-    scales: list[np.ndarray] = []
-    date_list: list[np.ndarray] = []
-    weighted_loss = 0.0
-    total_weight = 0.0
+    pred_parts: list[torch.Tensor] = []
+    target_parts: list[torch.Tensor] = []
+    scale_parts: list[torch.Tensor] = []
+    date_parts: list[torch.Tensor] = []
+    loss_num = torch.zeros((), device=device, dtype=torch.float32)
+    loss_den = torch.zeros((), device=device, dtype=torch.float32)
 
     for i, batch in enumerate(loader):
         if max_batches is not None and i >= max_batches:
             break
-        x, y, mask, scale = batch[0], batch[1], batch[2], batch[3]
-        date_ids = batch[4] if len(batch) > 4 else None
-        x, y, mask, scale = (
-            t.to(device, non_blocking=True) for t in (x, y, mask, scale)
-        )
-        if date_ids is not None:
-            date_ids = date_ids.to(device, non_blocking=True)
+        x, y, mask, scale, date_ids = _batch_to_device(batch, device)
         with autocast_context(device, train_cfg.precision):
             mean, log_sigma = model(x)
         mean = mean.float()
         loss = masked_loss(
             mean, log_sigma.float(), y, mask, train_cfg, date_ids=date_ids
         )
-        weight = float(mask.to(mean.dtype).sum())
-        if weight > 0 and math.isfinite(float(loss)):
-            weighted_loss += float(loss) * weight
-            total_weight += weight
+        w = mask.to(dtype=torch.float32).sum()
+        finite = torch.isfinite(loss.detach())
+        loss_num = loss_num + torch.where(
+            finite, loss.detach().float() * w, w.new_zeros(())
+        )
+        loss_den = loss_den + torch.where(finite, w, w.new_zeros(()))
         sel = mask.bool()
-        preds.append(mean[sel].cpu().numpy())
-        targets.append(y[sel].cpu().numpy())
-        scales.append(scale[sel].cpu().numpy())
+        pred_parts.append(mean[sel].detach().cpu())
+        target_parts.append(y[sel].detach().cpu())
+        scale_parts.append(scale[sel].detach().cpu())
         if date_ids is not None:
             d = date_ids
             if d.dim() == 1 and d.size(0) == mask.size(0):
                 d = d.unsqueeze(-1).expand_as(mask)
-            date_list.append(d[sel].cpu().numpy())
+            date_parts.append(d[sel].detach().cpu())
 
     model.train()
-    pred_np = np.concatenate(preds) if preds else np.empty(0)
-    tgt_np = np.concatenate(targets) if targets else np.empty(0)
-    scale_np = np.concatenate(scales) if scales else np.empty(0)
+    if pred_parts:
+        pred_np = torch.cat(pred_parts).cpu().numpy()
+        tgt_np = torch.cat(target_parts).cpu().numpy()
+        scale_np = torch.cat(scale_parts).cpu().numpy()
+    else:
+        pred_np = np.empty(0)
+        tgt_np = np.empty(0)
+        scale_np = np.empty(0)
     metrics = compute_metrics(pred_np, tgt_np, scale_np, winsor=train_cfg.ic_winsor)
+<<<<<<< Updated upstream
     if date_list:
         dates_np = np.concatenate(date_list)
         metrics.update(
             mean_cs_stats(pred_np, tgt_np, dates_np, min_names=int(cs_min_names))
+=======
+    if date_parts:
+        dates_np = torch.cat(date_parts).cpu().numpy()
+        metrics["cs_ic"] = mean_cs_ic(pred_np, tgt_np, dates_np)
+        metrics["book_hit"] = mean_book_hit(pred_np, tgt_np, dates_np)
+        metrics["book_hit_wide"] = mean_book_hit(
+            pred_np, tgt_np, dates_np, spread_pct=50.0
+>>>>>>> Stashed changes
         )
     metrics["select"] = selection_score(metrics)
-    metrics["loss"] = weighted_loss / total_weight if total_weight > 0 else float("nan")
+    den = float(loss_den)
+    metrics["loss"] = float(loss_num) / den if den > 0 else float("nan")
     return metrics
 
 
@@ -640,6 +850,7 @@ def _tag_skip_lr_mult(
     optimizer.param_groups = new_groups
 
 
+<<<<<<< Updated upstream
 def walk_forward_split_metrics(
     bundle: dict[str, Any],
     train_cfg: ForecastTrainConfig,
@@ -695,6 +906,43 @@ def walk_forward_split_metrics(
             row[split] = cs_stats(pred[sel], y[sel], d[sel], min_names=min_names)
         out[name] = row
     return out
+=======
+def _undecay_residual_readout(
+    optimizer: torch.optim.Optimizer, model: ReturnForecaster
+) -> None:
+    """Keep head / mixer out_proj out of AdamW decay.
+
+    Both start at 0 so the skip *is* the model. Decay pins them at 0 and
+    blocks the SSM residual.
+    """
+    ids = {
+        id(p)
+        for n, p in model.named_parameters()
+        if p.requires_grad and (n.startswith("head.") or n.endswith("out_proj.weight"))
+    }
+    if not ids:
+        return
+    extra: list[torch.nn.Parameter] = []
+    for group in optimizer.param_groups:
+        if float(group.get("weight_decay", 0.0)) == 0.0:
+            continue
+        keep = [p for p in group["params"] if id(p) not in ids]
+        extra.extend(p for p in group["params"] if id(p) in ids)
+        group["params"] = keep
+    if extra:
+        optimizer.add_param_group(
+            {
+                "params": extra,
+                "weight_decay": 0.0,
+                "lr_mult": 1.0,
+            }
+        )
+
+
+def reset_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
+    """Drop Adam moments after restoring best.pt (stale m/v at a new point)."""
+    optimizer.state.clear()
+>>>>>>> Stashed changes
 
 
 def apply_ridge_skip(
@@ -768,7 +1016,12 @@ def _fmt(metrics: dict[str, float]) -> str:
         f"loss={metrics['loss']:.5f} ic={metrics['ic']:+.4f} "
         f"spearman={spearman:+.4f} raw={raw:+.4f} "
         f"cs_ic={metrics.get('cs_ic', float('nan')):+.4f} "
+<<<<<<< Updated upstream
         f"cs_sp={cs_sp:+.4f} cs_t={cs_t:+.2f} cs_dates={int(cs_n) if np.isfinite(cs_n) else 0} "
+=======
+        f"book={metrics.get('book_hit', float('nan')):.3f} "
+        f"wide={metrics.get('book_hit_wide', float('nan')):.3f} "
+>>>>>>> Stashed changes
         f"r2={metrics['r2']:+.5f} dir={metrics['direction']:.4f} "
         f"pred_std={metrics['pred_std_bps']:.2f}bps n={int(metrics['n'])}"
     )
@@ -806,6 +1059,10 @@ def _train(
     log_fn: Any | None = print,
 ) -> dict[str, Any]:
     device = device or select_device()
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
     set_seed(train_cfg.seed)
     validate_loss_head(model_cfg, train_cfg)
 
@@ -819,13 +1076,21 @@ def _train(
         log_fn(
             f"device={device} params={n_params:,} features={model_cfg.n_features} "
             f"seq_len={data_cfg.seq_len} horizon={data_cfg.horizon} "
+<<<<<<< Updated upstream
             f"label_return={getattr(data_cfg, 'label_return', 'close')} "
+=======
+            f"cs_feature_norm={data_cfg.cs_feature_norm} "
+>>>>>>> Stashed changes
             f"linear_skip={model_cfg.linear_skip} "
             f"dynamic_weights={model_cfg.dynamic_weights} "
             f"loss={train_cfg.loss} ic_loss_weight={train_cfg.ic_loss_weight} "
             f"ridge_skip={train_cfg.ridge_skip} "
+<<<<<<< Updated upstream
             f"ridge_rank_target={train_cfg.ridge_rank_target} "
             f"ridge_objective={getattr(train_cfg, 'ridge_objective', 'ridge')} "
+=======
+            f"max_cs_windows={train_cfg.max_cs_windows} "
+>>>>>>> Stashed changes
             f"heteroscedastic={model_cfg.heteroscedastic}"
         )
         log_fn(formula_log_line(
@@ -999,6 +1264,7 @@ def _train(
         model, lr=train_cfg.lr, weight_decay=train_cfg.weight_decay
     )
     _tag_skip_lr_mult(optimizer, model, train_cfg.skip_lr_mult)
+    _undecay_residual_readout(optimizer, model)
     use_scaler = train_cfg.precision == "fp16" and device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=use_scaler)
 
@@ -1009,7 +1275,9 @@ def _train(
     evals_without_gain = 0
     lr_scale = 1.0
     data_iter = cycle_loader(train_loader)
-    running: list[float] = []
+    pending = next(data_iter)
+    loss_acc: torch.Tensor | None = None
+    n_acc = 0
     model.train()
 
     last_completed = 0
@@ -1020,16 +1288,9 @@ def _train(
             for group in optimizer.param_groups:
                 group["lr"] = lr * float(group.get("lr_mult", 1.0))
 
-            batch = next(data_iter)
-            x, y, mask = batch[0], batch[1], batch[2]
-            date_ids = batch[4] if len(batch) > 4 else None
-            # non_blocking pairs with pin_memory: the H2D copy overlaps the
-            # optimizer bookkeeping instead of stalling the step.
-            x, y, mask = (
-                t.to(device, non_blocking=True) for t in (x, y, mask)
+            x, y, mask, _scale, date_ids = _batch_to_device(
+                _trim_cs_windows(pending, train_cfg.max_cs_windows), device
             )
-            if date_ids is not None:
-                date_ids = date_ids.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, train_cfg.precision):
@@ -1046,19 +1307,32 @@ def _train(
                 if log_fn:
                     log_fn(f"step {step + 1}: non-finite gradients, skipping optimizer step")
                 scaler.update()
+                pending = next(data_iter)
                 continue
             grad_norm = clip_grad_norm_unique(model, train_cfg.grad_clip)
             scaler.step(optimizer)
             scaler.update()
-            running.append(float(loss.detach()))
             last_completed = step + 1
+            # Host fetch of the next cached window overlaps the optimizer
+            # kernels. Logging .item() below is the first CPU sync in a
+            # normal step, and only every log_interval.
+            pending = next(data_iter)
+            if loss_acc is None:
+                loss_acc = loss.detach()
+                n_acc = 1
+            else:
+                loss_acc = loss_acc + loss.detach()
+                n_acc += 1
 
             if (step + 1) % train_cfg.log_interval == 0 or step == 0:
                 elapsed = max(time.perf_counter() - t0, 1e-8)
+                mean_loss = float(loss_acc / max(n_acc, 1))
+                loss_acc = None
+                n_acc = 0
                 if log_fn:
                     msg = (
                         f"step {step + 1:6d}/{total_steps}  "
-                        f"loss={np.mean(running[-train_cfg.log_interval:]):.5f}  "
+                        f"loss={mean_loss:.5f}  "
                         f"grad={grad_norm:.3f}  lr={lr:.2e}  "
                         f"{(step + 1) / elapsed:.2f} it/s"
                     )
@@ -1066,7 +1340,14 @@ def _train(
                     extra_diag = format_dynamic_diagnostics(diag)
                     if extra_diag:
                         msg += f"  {extra_diag}"
+                    with torch.no_grad():
+                        skip_bar = model.skip(x).squeeze(-1)
+                        sel = mask.bool()
+                        if bool(sel.any()):
+                            resid = mean.detach()[sel] - skip_bar[sel]
+                            msg += f"  resid_rms={float(resid.pow(2).mean().sqrt()):.4f}"
                     log_fn(msg)
+                    clear_ssm_diagnostics()
 
             if (step + 1) % train_cfg.eval_interval == 0 or step + 1 == total_steps:
                 val = evaluate(model, val_loader, device, train_cfg, **cs_eval)
@@ -1117,6 +1398,7 @@ def _train(
                         load_forecast_checkpoint(
                             best_path, map_location=device, model=model
                         )
+                        reset_optimizer_state(optimizer)
                 if stop:
                     break
     except KeyboardInterrupt:
@@ -1254,6 +1536,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="score every labelled bar instead of unique last-bar dates",
     )
     g.add_argument(
+        "--cs-feature-norm",
+        default=d.cs_feature_norm,
+        choices=("off", "z", "rank"),
+        help="restate name-specific features against the same-date cross-section",
+    )
+    g.add_argument(
         "--no-global-split",
         action="store_true",
         help="split each symbol on its own session count (legacy)",
@@ -1330,7 +1618,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--n-layer", type=int, default=None)
     g.add_argument("--d-state", type=int, default=None)
     g.add_argument("--expand", type=int, default=m.expand)
-    g.add_argument("--dropout", type=float, default=m.dropout)
+    g.add_argument("--dropout", type=float, default=None)
     g.add_argument("--dynamic-weights", action="store_true")
     g.add_argument("--dynamic-strength", type=float, default=m.dynamic_strength)
     g.add_argument(
@@ -1351,6 +1639,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("optim")
     g.add_argument("--batch-size", type=int, default=t.batch_size)
+    g.add_argument(
+        "--max-cs-windows",
+        type=int,
+        default=t.max_cs_windows,
+        help="cap concatenated CS names per step; 0 disables (default 1024)",
+    )
     g.add_argument("--epochs", type=int, default=t.epochs)
     g.add_argument("--max-steps", type=int, default=t.max_steps)
     g.add_argument("--lr", type=float, default=t.lr)
@@ -1379,6 +1673,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=t.rank_loss_weight,
         help="weight on pairwise RankNet over labelled bars in the batch",
+    )
+    g.add_argument(
+        "--pred-std-target-frac",
+        type=float,
+        default=t.pred_std_target_frac,
+        help="pred-std loss matches this fraction of labelled target std (0.04 ~ IC-scale)",
     )
     g.add_argument(
         "--ridge-skip",
@@ -1565,6 +1865,7 @@ def configs_from_cli(
         global_calendar_split=not args.no_global_split,
         residual_target=not args.no_residual_target,
         allow_mixed_prices=args.allow_mixed_prices,
+<<<<<<< Updated upstream
         universe=args.universe,
         cs_zscore=not args.no_cs_zscore,
         cross_section_min_names=(
@@ -1580,6 +1881,9 @@ def configs_from_cli(
         industry_residual=args.industry_residual,
         label_return=_cli_label_return(args),
         fill_minutes=_cli_fill_minutes(args),
+=======
+        cs_feature_norm=args.cs_feature_norm,
+>>>>>>> Stashed changes
     )
     model_cfg = ForecastModelConfig(
         n_features=len(FEATURE_NAMES),
@@ -1587,7 +1891,11 @@ def configs_from_cli(
         n_layer=ssm.get("n_layer", m.n_layer) if args.n_layer is None else args.n_layer,
         d_state=ssm.get("d_state", m.d_state) if args.d_state is None else args.d_state,
         expand=args.expand,
-        dropout=args.dropout,
+        dropout=(
+            args.dropout
+            if args.dropout is not None
+            else ssm.get("dropout", m.dropout)
+        ),
         heteroscedastic=heteroscedastic,
         linear_skip=not args.no_linear_skip,
         dt_min=ssm["dt_min"],
@@ -1597,6 +1905,7 @@ def configs_from_cli(
     )
     train_cfg = ForecastTrainConfig(
         batch_size=args.batch_size,
+        max_cs_windows=args.max_cs_windows,
         epochs=args.epochs,
         max_steps=args.max_steps,
         lr=args.lr,
@@ -1606,6 +1915,7 @@ def configs_from_cli(
         location_loss_weight=args.location_loss_weight,
         sign_loss_weight=args.sign_loss_weight,
         rank_loss_weight=args.rank_loss_weight,
+        pred_std_target_frac=args.pred_std_target_frac,
         ridge_skip=args.ridge_skip,
         freeze_skip=not args.no_freeze_skip,
         ridge_cs_demean=not args.no_ridge_cs_demean,

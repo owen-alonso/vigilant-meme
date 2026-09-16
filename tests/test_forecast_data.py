@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -10,11 +12,16 @@ import pytest
 
 from forecast.config import DataConfig, ForecastModelConfig, ForecastTrainConfig, validate_loss_head
 from forecast.data import (
+<<<<<<< Updated upstream
     CS_PRODUCTS,
+=======
+    CS_NORM_FEATURES,
+>>>>>>> Stashed changes
     FEATURE_NAMES,
     SequenceDataset,
     SymbolArrays,
     _session_naive_datetime,
+    apply_cs_feature_norm,
     attach_cross_section_features,
     attach_residual_target,
     build_datasets,
@@ -22,6 +29,7 @@ from forecast.data import (
     compute_features,
     embargo_calendar_horizon,
     fit_ridge_readout,
+    global_session_cuts,
     load_bars,
 )
 from forecast.model import ReturnForecaster
@@ -32,6 +40,9 @@ from forecast.training import (
     masked_correlation_loss,
     masked_loss,
     build_arg_parser,
+    _pack_by_group,
+    _trim_cs_windows,
+    masked_pairwise_rank_loss,
 )
 
 
@@ -465,6 +476,116 @@ def test_cross_section_does_not_see_future_peer_return():
     )
 
 
+def _cs_norm_panels(n_syms: int = 6, n: int = 40) -> tuple[dict, DataConfig]:
+    """``n_syms`` daily names on one calendar, each with its own return path."""
+    cfg = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+    )
+    rng = np.random.default_rng(7)
+    panels: dict[str, pd.DataFrame] = {}
+    for i in range(n_syms):
+        grid = _daily_grid(n)
+        steps = rng.normal(0.0, 0.01, size=n).cumsum()
+        grid["close"] = 100.0 * np.exp(steps) * (1.0 + 0.1 * i)
+        grid["open"] = grid["close"]
+        grid["high"] = grid["close"] * 1.001
+        grid["low"] = grid["close"] * 0.999
+        grid["volume"] = 1000.0 * (i + 1)
+        symbol = f"S{i}"
+        panel = compute_features(grid, cfg)
+        panel["symbol"] = symbol
+        panels[symbol] = panel
+    return attach_cross_section_features(panels, cfg), cfg
+
+
+def test_cs_feature_norm_off_is_identity():
+    panels, cfg = _cs_norm_panels()
+    out = apply_cs_feature_norm(panels, replace(cfg, cs_feature_norm="off"))
+    for sym, panel in panels.items():
+        pd.testing.assert_frame_equal(out[sym], panel)
+
+
+def test_cs_feature_norm_rank_preserves_within_date_order():
+    panels, cfg = _cs_norm_panels()
+    out = apply_cs_feature_norm(panels, replace(cfg, cs_feature_norm="rank"))
+    row = 20
+    raw = np.array([float(panels[s]["ret_1"].iloc[row]) for s in sorted(panels)])
+    ranked = np.array([float(out[s]["ret_1"].iloc[row]) for s in sorted(panels)])
+    assert np.array_equal(np.argsort(raw), np.argsort(ranked))
+    # Percentile ranks are bounded and centred, unlike the raw vol-unit value.
+    assert abs(float(ranked.mean())) < 1e-9
+    assert np.abs(ranked).max() <= math.sqrt(12.0) / 2.0
+
+
+def test_cs_feature_norm_z_is_centred_across_names():
+    panels, cfg = _cs_norm_panels()
+    out = apply_cs_feature_norm(panels, replace(cfg, cs_feature_norm="z"))
+    row = 20
+    z = np.array([float(out[s]["ret_1"].iloc[row]) for s in sorted(panels)])
+    assert float(z.mean()) == pytest.approx(0.0, abs=1e-9)
+    assert float(z.std()) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_cs_feature_norm_leaves_date_level_features_alone():
+    panels, cfg = _cs_norm_panels()
+    out = apply_cs_feature_norm(panels, replace(cfg, cs_feature_norm="rank"))
+    untouched = [n for n in FEATURE_NAMES if n not in CS_NORM_FEATURES]
+    assert "mkt_ret_1" in untouched and "tod_sin" in untouched
+    for sym in panels:
+        for name in untouched:
+            assert np.allclose(
+                out[sym][name].to_numpy(), panels[sym][name].to_numpy(), equal_nan=True
+            )
+
+
+def test_cs_feature_norm_only_uses_the_same_date():
+    """A later bar of one name must not move an earlier bar of another."""
+    panels, cfg = _cs_norm_panels()
+    cfg = replace(cfg, cs_feature_norm="rank")
+    base = apply_cs_feature_norm(panels, cfg)
+    spiked = {s: p.copy() for s, p in panels.items()}
+    spiked["S1"].loc[spiked["S1"].index[30], "ret_1"] = 9.0
+    alt = apply_cs_feature_norm(spiked, cfg)
+    assert base["S0"]["ret_1"].iloc[20] == pytest.approx(
+        float(alt["S0"]["ret_1"].iloc[20]), abs=1e-12
+    )
+    # The spiked name becomes the top of its own date, and only that date.
+    assert float(alt["S1"]["ret_1"].iloc[30]) > float(base["S1"]["ret_1"].iloc[30])
+
+
+def test_cs_feature_norm_skips_the_benchmark_panel():
+    panels, cfg = _cs_norm_panels()
+    panels["SPY"] = panels["S0"].copy()
+    panels["SPY"]["symbol"] = "SPY"
+    out = apply_cs_feature_norm(
+        panels, replace(cfg, cs_feature_norm="rank", benchmark_symbol="SPY")
+    )
+    assert np.allclose(
+        out["SPY"]["ret_1"].to_numpy(), panels["SPY"]["ret_1"].to_numpy()
+    )
+    assert not np.allclose(
+        out["S0"]["ret_1"].to_numpy(), panels["S0"]["ret_1"].to_numpy()
+    )
+
+
+def test_cs_feature_norm_rejects_unknown_mode():
+    panels, cfg = _cs_norm_panels()
+    with pytest.raises(ValueError, match="cs_feature_norm"):
+        apply_cs_feature_norm(panels, replace(cfg, cs_feature_norm="median"))
+
+
+def test_cs_feature_norm_cli_flag_reaches_data_config():
+    args = build_arg_parser().parse_args(["--cs-feature-norm", "rank"])
+    data_cfg, _model_cfg, _train_cfg = configs_from_cli(args)
+    assert data_cfg.cs_feature_norm == "rank"
+    assert configs_from_cli(build_arg_parser().parse_args([]))[0].cs_feature_norm == "off"
+
+
 def test_ridge_readout_recovers_linear_target():
     n, f = 80, 4
     rng = np.random.default_rng(0)
@@ -529,8 +650,12 @@ def test_weekly_cli_uses_week_scale_context():
     assert model_cfg.d_state == 8
     assert model_cfg.linear_skip is True
     assert model_cfg.dt_min == pytest.approx(0.05)
+<<<<<<< Updated upstream
     assert train_cfg.ic_loss_weight == pytest.approx(2.0)
     assert train_cfg.rank_loss_weight == pytest.approx(1.0)
+=======
+    assert train_cfg.ic_loss_weight == pytest.approx(2.5)
+>>>>>>> Stashed changes
     assert train_cfg.early_stop_evals == 24
     assert train_cfg.ridge_skip == pytest.approx(10.0)
     assert train_cfg.ridge_rank_target is True
@@ -834,6 +959,7 @@ def test_cross_section_dataset_when_enough_names(tmp_path: Path):
     assert int(mask[0].sum()) == 1
     assert bool(mask[0, -1])
     assert int(dates.unique().numel()) == 1
+<<<<<<< Updated upstream
 
 
 def test_cs_zscore_is_same_day_and_excludes_spy():
@@ -987,6 +1113,192 @@ def test_cs_rank_is_same_day_and_centered():
 
 
 def test_sector_residual_uses_future_xlk_in_label_not_features():
+=======
+    ds = bundle["datasets"]["train"]
+    again_x = ds[0][0]
+    assert x.data_ptr() == again_x.data_ptr()
+    assert ds.cache_bytes > 0
+
+
+def test_sequence_dataset_applies_feature_norm_once():
+    n, f = 20, 4
+    features = np.ones((n, f), dtype=np.float32)
+    features[:, 0] = 3.0
+    sym = SymbolArrays(
+        symbol="AAA",
+        features=features,
+        target=np.zeros(n, dtype=np.float32),
+        scale=np.ones(n, dtype=np.float32),
+        valid=np.ones(n, dtype=bool),
+        dates=np.arange(n, dtype=np.int64),
+    )
+    mean = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    std = np.ones(f, dtype=np.float32)
+    ds = SequenceDataset(
+        [sym],
+        seq_len=8,
+        stride=1,
+        last_bar_only=True,
+        min_context=2,
+        feature_mean=mean,
+        feature_std=std,
+    )
+    x, _y, _mask, _scale, _date, _sym = ds[0]
+    assert float(x[0, 0]) == pytest.approx(2.0)
+    assert np.allclose(sym.features[:, 0], 3.0)
+
+
+def test_sign_loss_empty_large_moves_is_zero():
+    import torch
+
+    from forecast.training import masked_sign_loss
+
+    mean = torch.zeros(2, 4)
+    target = torch.zeros(2, 4)
+    mask = torch.ones(2, 4)
+    loss = masked_sign_loss(mean, target, mask, min_abs=0.25)
+    assert float(loss) == pytest.approx(0.0)
+
+
+def test_daily_cli_is_expanded_capacity():
+    import torch
+
+    args = build_arg_parser().parse_args(["--interval", "daily"])
+    _data_cfg, model_cfg, train_cfg = configs_from_cli(args)
+    assert model_cfg.d_model == 64
+    assert model_cfg.n_layer == 2
+    assert model_cfg.d_state == 16
+    assert model_cfg.dropout == pytest.approx(0.1)
+    assert train_cfg.rank_loss_weight == pytest.approx(1.0)
+    assert train_cfg.pred_std_target_frac == pytest.approx(0.04)
+    assert train_cfg.epochs == 12
+    model = ReturnForecaster(model_cfg)
+    n = sum(p.numel() for p in model.parameters())
+    assert 50_000 <= n <= 100_000
+
+
+def test_grouped_ic_matches_per_date_loop():
+    import torch
+
+    from forecast.training import _pearson_1d
+
+    mean = torch.tensor([[1.0, 2.0, 3.0, 0.0], [0.5, 1.5, 2.5, 0.0]])
+    target = torch.tensor([[1.0, 2.0, 3.0, 0.0], [3.0, 2.0, 1.0, 0.0]])
+    mask = torch.tensor([[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 1.0, 0.0]])
+    dates = torch.tensor([[7, 7, 7, 7], [8, 8, 8, 8]])
+    got = float(masked_correlation_loss(mean, target, mask, date_ids=dates))
+    rhos = [
+        float(_pearson_1d(mean[0, :3], target[0, :3])),
+        float(_pearson_1d(mean[1, :3], target[1, :3])),
+    ]
+    assert got == pytest.approx(1.0 - float(np.mean(rhos)), abs=1e-5)
+
+
+def test_ranknet_packed_matches_per_date_loop():
+    import torch
+
+    from forecast.training import _ranknet, masked_pairwise_rank_loss
+
+    mean = torch.tensor([[1.0, 2.0, 0.5], [3.0, 0.0, 1.0]])
+    target = torch.tensor([[1.0, 2.0, 0.5], [0.0, 3.0, 1.0]])
+    mask = torch.ones_like(mean)
+    dates = torch.tensor([[10, 10, 10], [11, 11, 11]])
+    got = float(masked_pairwise_rank_loss(mean, target, mask, date_ids=dates))
+    ref = float(
+        torch.stack(
+            [
+                _ranknet(mean[0], target[0]),
+                _ranknet(mean[1], target[1]),
+            ]
+        ).mean()
+    )
+    assert got == pytest.approx(ref, abs=1e-5)
+
+
+def test_ranknet_pack_shape_is_per_date_not_batch():
+    import torch
+
+    n_dates, n_names = 16, 80
+    pred = torch.randn(n_dates * n_names)
+    keys = torch.repeat_interleave(torch.arange(n_dates), n_names)
+    packed, valid = _pack_by_group(pred, keys)
+    assert packed.shape == (n_dates, n_names)
+    assert bool(valid.all())
+
+
+def test_ranknet_matches_per_date_on_wide_cs_batch():
+    import torch
+
+    from forecast.training import _ranknet
+
+    n_dates, n_names = 6, 80
+    g = torch.Generator().manual_seed(0)
+    mean = torch.randn(n_dates, n_names, generator=g)
+    target = torch.randn(n_dates, n_names, generator=g)
+    mask = torch.ones_like(mean)
+    dates = torch.arange(n_dates).unsqueeze(1).expand_as(mean)
+    got = float(masked_pairwise_rank_loss(mean, target, mask, date_ids=dates))
+    ref = float(
+        torch.stack([_ranknet(mean[i], target[i]) for i in range(n_dates)]).mean()
+    )
+    assert got == pytest.approx(ref, abs=1e-5)
+
+
+def test_ranknet_single_name_dates_is_zero_not_pooled():
+    import torch
+
+    mean = torch.tensor([[1.0], [3.0]])
+    target = torch.tensor([[0.0], [1.0]])
+    mask = torch.ones_like(mean)
+    dates = torch.tensor([[10], [11]])
+    loss = float(masked_pairwise_rank_loss(mean, target, mask, date_ids=dates))
+    pooled = float(masked_pairwise_rank_loss(mean, target, mask, date_ids=None))
+    assert loss == pytest.approx(0.0)
+    assert pooled != pytest.approx(0.0)
+
+
+def test_trim_cs_windows_drops_trailing_whole_dates():
+    import torch
+
+    n_dates, n_names = 3, 50
+    x = torch.arange(n_dates * n_names).reshape(-1, 1, 1).float()
+    y = torch.zeros(n_dates * n_names, 1)
+    mask = torch.ones(n_dates * n_names, 1)
+    scale = torch.ones(n_dates * n_names, 1)
+    dates = torch.repeat_interleave(torch.tensor([10, 11, 12]), n_names)
+    batch = (x, y, mask, scale, dates)
+    trimmed = _trim_cs_windows(batch, 100)
+    assert trimmed[0].size(0) == 100
+    assert set(trimmed[4].tolist()) == {10, 11}
+
+
+def test_mean_book_hit_perfect_ranks():
+    from forecast.training import mean_book_hit
+
+    pred = np.array([1.0, 2.0, 3.0, 4.0, 5.0] * 2, dtype=np.float64)
+    target = pred.copy()
+    dates = np.array([1, 1, 1, 1, 1, 2, 2, 2, 2, 2], dtype=np.int64)
+    assert mean_book_hit(pred, target, dates) == pytest.approx(1.0)
+    flipped = -target
+    assert mean_book_hit(pred, flipped, dates) == pytest.approx(0.0)
+
+
+def test_pred_std_loss_targets_fraction():
+    import torch
+
+    from forecast.training import masked_pred_std_loss
+
+    mean = torch.ones(1, 8)
+    target = torch.arange(8, dtype=torch.float32).unsqueeze(0)
+    mask = torch.ones_like(mean)
+    full = float(masked_pred_std_loss(mean, target, mask, target_frac=1.0))
+    frac = float(masked_pred_std_loss(mean, target, mask, target_frac=0.0))
+    # Constant preds: full target std is farther from 0 than frac=0.
+    assert frac < full
+
+
+def test_residual_target_invalid_when_spy_missing():
+>>>>>>> Stashed changes
     cfg = DataConfig(
         interval="daily",
         horizon=1,
@@ -995,11 +1307,15 @@ def test_sector_residual_uses_future_xlk_in_label_not_features():
         z_window=10,
         z_min_periods=3,
         residual_target=True,
+<<<<<<< Updated upstream
         sector_residual=True,
+=======
+>>>>>>> Stashed changes
         beta_halflife=5,
         benchmark_symbol="SPY",
     )
     a = compute_features(_daily_grid(50), cfg)
+<<<<<<< Updated upstream
     spy = compute_features(_daily_grid(50), cfg)
     xlk = compute_features(_daily_grid(50), cfg)
     a["symbol"], spy["symbol"], xlk["symbol"] = "AAPL", "SPY", "XLK"
@@ -1166,3 +1482,34 @@ def test_train_from_drops_early_train_labels_not_val_end(tmp_path: Path):
     assert cut["datasets"]["train"].n_valid_bars < full["datasets"]["train"].n_valid_bars
     assert cut["datasets"]["test"].n_valid_bars == full["datasets"]["test"].n_valid_bars
 
+=======
+    spy = compute_features(_daily_grid(50).iloc[20:].reset_index(drop=True), cfg)
+    a["symbol"], spy["symbol"] = "AAPL", "SPY"
+    out = attach_residual_target({"AAPL": a, "SPY": spy}, cfg)
+    assert not bool(out["AAPL"]["valid"].iloc[10])
+    assert bool(out["AAPL"]["valid"].iloc[45])
+
+
+def test_global_session_cuts_start_at_benchmark():
+    dates = pd.bdate_range("1980-01-02", periods=8000)
+    a = pd.DataFrame({"session": dates})
+    spy_start = pd.Timestamp("1993-01-29")
+    train_all, _ = global_session_cuts({"A": a}, DataConfig())
+    train_spy, _ = global_session_cuts({"A": a}, DataConfig(), start=spy_start)
+    assert pd.Timestamp(train_spy) >= spy_start
+    assert pd.Timestamp(train_spy) > pd.Timestamp(train_all)
+
+
+def test_reset_optimizer_state_clears_moments():
+    import torch
+
+    from forecast.training import reset_optimizer_state
+
+    p = torch.nn.Parameter(torch.ones(2, 2))
+    opt = torch.optim.AdamW([p], lr=1e-3)
+    p.grad = torch.ones_like(p)
+    opt.step()
+    assert opt.state[p]
+    reset_optimizer_state(opt)
+    assert opt.state == {}
+>>>>>>> Stashed changes

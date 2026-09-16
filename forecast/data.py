@@ -150,6 +150,30 @@ CS_ZSCORE_SOURCES: tuple[tuple[str, str], ...] = (
     ("vol_level", "cs_vol"),
 )
 
+# Features ``cs_feature_norm`` restates against the same-date cross-section.
+# Date-level features (mkt_ret_1, the calendar block, session flags) are
+# near-constant across names, so a per-date z-score would divide by ~0.
+CS_NORM_FEATURES: tuple[str, ...] = (
+    "ret_1",
+    "ret_5",
+    "ret_15",
+    "ret_60",
+    "ret_390",
+    "range_hl",
+    "body_co",
+    "close_loc",
+    "wick_up",
+    "wick_dn",
+    "vol_level",
+    "vol_change",
+    "volume_z",
+    "turnover_z",
+    "ret_vol",
+    "idio_ret_1",
+)
+# Below this many names a date has no usable cross-section; keep raw values.
+MIN_CS_NORM_NAMES = 5
+
 OHLCV_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 
 
@@ -697,6 +721,7 @@ def attach_cross_section_features(
     return out
 
 
+<<<<<<< Updated upstream
 def _ewm_beta(y: np.ndarray, x: np.ndarray, hl: int) -> np.ndarray:
     frame = pd.DataFrame({"y": y, "x": x})
     cov = frame["y"].ewm(halflife=hl, min_periods=hl).cov(frame["x"])
@@ -737,6 +762,121 @@ def _ewm_multi_beta(y: np.ndarray, xs: list[np.ndarray], hl: int) -> list[np.nda
         except np.linalg.LinAlgError:
             betas[t] = 0.0
     return [np.clip(betas[:, i], -5.0, 5.0) for i in range(k)]
+=======
+def _cs_group_bounds(sorted_keys: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``(group_starts, group_sizes)`` for an already key-sorted array."""
+    change = np.ones(sorted_keys.size, dtype=bool)
+    change[1:] = sorted_keys[1:] != sorted_keys[:-1]
+    starts = np.flatnonzero(change)
+    return starts, np.diff(np.append(starts, sorted_keys.size))
+
+
+def _cs_zscore(values: np.ndarray, keys: np.ndarray) -> np.ndarray:
+    """Per-key z-score of ``values`` [N, C] down the name axis."""
+    order = np.argsort(keys, kind="stable")
+    xs = values[order]
+    starts, counts = _cs_group_bounds(keys[order])
+    inv = np.repeat(np.arange(starts.size), counts)
+    cnt = counts.astype(np.float64)[:, None]
+    mean = np.add.reduceat(xs, starts, axis=0) / cnt
+    var = np.add.reduceat(xs * xs, starts, axis=0) / cnt - mean**2
+    std = np.sqrt(np.clip(var, 0.0, None))
+    z = (xs - mean[inv]) / np.clip(std[inv], 1e-6, None)
+    out = np.empty_like(z)
+    out[order] = np.where((counts[inv] < MIN_CS_NORM_NAMES)[:, None], xs, z)
+    return out
+
+
+def _cs_rank(values: np.ndarray, keys: np.ndarray) -> np.ndarray:
+    """Per-key percentile rank down the name axis, rescaled to ~unit variance.
+
+    Ties break ordinally, like the Spearman IC in training.
+    """
+    n = keys.size
+    out = np.empty_like(values)
+    positions = np.arange(n)
+    for j in range(values.shape[1]):
+        order = np.lexsort((values[:, j], keys))
+        starts, counts = _cs_group_bounds(keys[order])
+        inv = np.repeat(np.arange(starts.size), counts)
+        intra = positions - starts[inv]
+        pct = (intra + 0.5) / counts[inv]
+        col = np.empty(n, dtype=values.dtype)
+        col[order] = (pct - 0.5) * math.sqrt(12.0)
+        out[:, j] = col
+    order = np.argsort(keys, kind="stable")
+    _starts, counts = _cs_group_bounds(keys[order])
+    sizes = np.empty(n, dtype=np.int64)
+    sizes[order] = np.repeat(counts, counts)
+    thin = sizes < MIN_CS_NORM_NAMES
+    out[thin] = values[thin]
+    return out
+
+
+def apply_cs_feature_norm(
+    panels: dict[str, pd.DataFrame],
+    cfg: DataConfig,
+) -> dict[str, pd.DataFrame]:
+    """Restate ``CS_NORM_FEATURES`` against the same-date cross-section.
+
+    Mean CS IC only reads the ordering of names within one date, but ~30% of
+    each feature's variance is a date-level common factor (every name is down
+    on a down day). Removing it leaves the model an input that is already the
+    cross-sectional signal.
+
+    Strictly causal: only bar-``t`` values of the other names are used, the
+    same information ``attach_cross_section_features`` puts in ``peer_ret_1``.
+    The benchmark panel is left alone; it is a market feature, not a name.
+    """
+    mode = str(getattr(cfg, "cs_feature_norm", "off") or "off")
+    if mode == "off":
+        return panels
+    if mode not in ("z", "rank"):
+        raise ValueError(
+            f"cs_feature_norm must be 'off', 'z' or 'rank'; got {mode!r}"
+        )
+    bench = str(cfg.benchmark_symbol or "").upper()
+    syms = [s for s in panels if s != bench]
+    if len(syms) < MIN_CS_NORM_NAMES:
+        return panels
+    cols = [c for c in CS_NORM_FEATURES if c in panels[syms[0]].columns]
+    if not cols:
+        return panels
+
+    key_parts: list[np.ndarray] = []
+    blocks: list[np.ndarray] = []
+    lengths: list[int] = []
+    for sym in syms:
+        panel = panels[sym]
+        key_parts.append(
+            _cross_section_key(panel, cfg)
+            .to_numpy()
+            .astype("datetime64[ns]")
+            .astype(np.int64)
+        )
+        blocks.append(panel[cols].to_numpy(dtype=np.float64))
+        lengths.append(len(panel))
+    keys = np.concatenate(key_parts)
+    values = np.concatenate(blocks, axis=0)
+
+    normed = _cs_zscore(values, keys) if mode == "z" else _cs_rank(values, keys)
+    normed = np.clip(
+        np.nan_to_num(normed, nan=0.0, posinf=0.0, neginf=0.0),
+        -float(cfg.clip),
+        float(cfg.clip),
+    )
+
+    out = dict(panels)
+    offset = 0
+    for sym, length in zip(syms, lengths):
+        block = normed[offset : offset + length]
+        offset += length
+        panel = panels[sym].copy()
+        for j, name in enumerate(cols):
+            panel[name] = block[:, j]
+        out[sym] = panel
+    return out
+>>>>>>> Stashed changes
 
 
 def attach_residual_target(
@@ -745,6 +885,7 @@ def attach_residual_target(
 ) -> dict[str, pd.DataFrame]:
     """Replace the label with trailing-beta residual vs hedge forward return(s).
 
+<<<<<<< Updated upstream
     ``beta_t`` uses same-bar returns through ``t`` only. Hedge *forward* return
     enters the label, never ``FEATURE_NAMES``. Default hedge is SPY;
     ``sector_residual`` uses the mapped sector ETF when that parquet exists.
@@ -755,6 +896,14 @@ def attach_residual_target(
     ``label_return`` selects which forward log-return is residualized.
     Overnight is ``log(open_{t+h})-log(close_t)``; the hedge's *forward*
     overnight return is a label term. Features stay at close ``t``.
+=======
+    ``beta_t`` uses same-bar returns through ``t`` only. The benchmark's
+    *forward* return enters the label, never ``FEATURE_NAMES``.
+
+    Bars are unlabelled unless the benchmark return, the benchmark forward
+    return, and a finite trailing beta all exist. Missing SPY is not a
+    zero hedge.
+>>>>>>> Stashed changes
     """
     bench = str(cfg.benchmark_symbol or "").upper()
     if not cfg.residual_target:
@@ -828,6 +977,7 @@ def attach_residual_target(
             continue
         keys = _cross_section_key(p, cfg)
         own_r = p["ret_raw"].to_numpy(dtype=np.float64)
+<<<<<<< Updated upstream
         xs = []
         fwds = []
         for hedge_fwd, hedge_r in series:
@@ -861,6 +1011,23 @@ def attach_residual_target(
             if "idio_sector" in p.columns and "ret_1" in p.columns and "sector_ret_1" in p.columns:
                 p["idio_sector"] = p["ret_1"] - p["sector_ret_1"]
         valid = p["valid"].to_numpy(dtype=bool).copy()
+=======
+        frame = pd.DataFrame({"y": own_r, "x": spy_r_al})
+        cov = frame["y"].ewm(halflife=hl, min_periods=hl).cov(frame["x"])
+        var = frame["x"].ewm(halflife=hl, min_periods=hl).var()
+        beta = (cov / var.replace(0.0, np.nan)).to_numpy()
+        beta_ok = np.isfinite(beta)
+        beta_use = np.where(beta_ok, np.clip(beta, -5.0, 5.0), 0.0)
+        own_fwd = p["target_raw"].to_numpy(dtype=np.float64)
+        spy_ok = np.isfinite(spy_r_al) & np.isfinite(spy_fwd_al)
+        resid = own_fwd - beta_use * np.where(spy_ok, spy_fwd_al, 0.0)
+        scale = p["scale"].to_numpy(dtype=np.float64)
+        p["target_raw"] = resid
+        p["target"] = np.divide(resid, scale, out=np.zeros_like(resid), where=scale > 0)
+        # Missing benchmark (pre-listing or a hole) must not stay labelled as
+        # a residual: fillna(0) turned those bars into unhedged total returns.
+        valid = p["valid"].to_numpy(dtype=bool).copy() & spy_ok & beta_ok
+>>>>>>> Stashed changes
         if cfg.max_abs_log_return > 0:
             valid &= np.abs(resid) <= cfg.max_abs_log_return
         if cfg.max_abs_target > 0:
@@ -956,6 +1123,18 @@ def panel_to_arrays(panel: pd.DataFrame, symbol: str) -> SymbolArrays:
     )
 
 
+def _normalize_features(
+    features: np.ndarray,
+    feature_mean: np.ndarray | None,
+    feature_std: np.ndarray | None,
+) -> np.ndarray:
+    """Train-set z-score applied once so ``__getitem__`` is a slice, not a copy."""
+    x = np.ascontiguousarray(features, dtype=np.float32)
+    if feature_mean is None or feature_std is None:
+        return x
+    return np.ascontiguousarray((x - feature_mean) / feature_std, dtype=np.float32)
+
+
 class SequenceDataset(Dataset):
     """Fixed-length windows over one or more symbols.
 
@@ -993,6 +1172,11 @@ class SequenceDataset(Dataset):
         self.last_bar_only = bool(last_bar_only)
         self.feature_mean = feature_mean
         self.feature_std = feature_std
+        # Normalized copy; SymbolArrays.features stay raw for the ridge skip.
+        self._feat = [
+            _normalize_features(s.features, feature_mean, feature_std)
+            for s in self.symbols
+        ]
 
         self.windows: list[tuple[int, int]] = []
         for i, sym in enumerate(self.symbols):
@@ -1024,10 +1208,7 @@ class SequenceDataset(Dataset):
         sym_idx, start = self.windows[index]
         sym = self.symbols[sym_idx]
         stop = start + self.seq_len
-        x = sym.features[start:stop]
-        if self.feature_mean is not None and self.feature_std is not None:
-            x = (x - self.feature_mean) / self.feature_std
-        mask = sym.valid[start:stop].copy()
+        mask = np.array(sym.valid[start:stop], dtype=bool, copy=True)
         mask[: self.min_context] = False
         if self.last_bar_only:
             last = mask[-1]
@@ -1039,17 +1220,23 @@ class SequenceDataset(Dataset):
         if sym.dates is not None and len(sym.dates) >= stop:
             date_id = int(sym.dates[stop - 1])
         return (
-            torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)),
-            torch.from_numpy(sym.target[start:stop].copy()),
+            torch.from_numpy(self._feat[sym_idx][start:stop]),
+            torch.from_numpy(np.ascontiguousarray(sym.target[start:stop])),
             torch.from_numpy(mask),
-            torch.from_numpy(sym.scale[start:stop].copy()),
+            torch.from_numpy(np.ascontiguousarray(sym.scale[start:stop])),
             torch.tensor(date_id, dtype=torch.int64),
             torch.tensor(sym_idx, dtype=torch.int64),
         )
 
 
 class CrossSectionDataset(Dataset):
-    """One item is every name that prints on a date, last-bar windows aligned."""
+    """One item is every name that prints on a date, last-bar windows aligned.
+
+    Train windows can be materialized so the daily loop is not restacking
+    ~50 names × 128 bars in Python on every fetch (that left the GPU idle).
+    Val/test stack from the normalized series instead of duplicating another
+    ~6 GB of overlapping windows.
+    """
 
     def __init__(
         self,
@@ -1059,6 +1246,7 @@ class CrossSectionDataset(Dataset):
         feature_mean: np.ndarray | None = None,
         feature_std: np.ndarray | None = None,
         min_names: int = 8,
+        cache: bool = False,
     ) -> None:
         if seq_len < 1:
             raise ValueError("seq_len must be positive")
@@ -1081,6 +1269,45 @@ class CrossSectionDataset(Dataset):
             for d, pairs in sorted(buckets.items())
             if len(pairs) >= int(min_names)
         ]
+        self._feat = [
+            _normalize_features(s.features, feature_mean, feature_std)
+            for s in self.symbols
+        ]
+        self._cached: list[tuple[torch.Tensor, ...]] | None = None
+        self.cache_bytes = 0
+        if cache and self.items:
+            self._cached, self.cache_bytes = self._materialize()
+
+    def _row(self, date_id: int, pairs: list[tuple[int, int]]) -> tuple[torch.Tensor, ...]:
+        n = len(pairs)
+        L = self.seq_len
+        f = int(self._feat[pairs[0][0]].shape[1])
+        xs = np.empty((n, L, f), dtype=np.float32)
+        ys = np.empty((n, L), dtype=np.float32)
+        masks = np.zeros((n, L), dtype=bool)
+        scales = np.empty((n, L), dtype=np.float32)
+        dates = np.full(n, int(date_id), dtype=np.int64)
+        syms = np.empty(n, dtype=np.int64)
+        for j, (sym_idx, end) in enumerate(pairs):
+            start = end - L + 1
+            xs[j] = self._feat[sym_idx][start : end + 1]
+            ys[j] = self.symbols[sym_idx].target[start : end + 1]
+            scales[j] = self.symbols[sym_idx].scale[start : end + 1]
+            masks[j, -1] = bool(self.symbols[sym_idx].valid[end])
+            syms[j] = int(sym_idx)
+        return (
+            torch.from_numpy(xs),
+            torch.from_numpy(ys),
+            torch.from_numpy(masks),
+            torch.from_numpy(scales),
+            torch.from_numpy(dates),
+            torch.from_numpy(syms),
+        )
+
+    def _materialize(self) -> tuple[list[tuple[torch.Tensor, ...]], int]:
+        cached = [self._row(date_id, pairs) for date_id, pairs in self.items]
+        nbytes = sum(t.numel() * t.element_size() for row in cached for t in row)
+        return cached, nbytes
 
     def __len__(self) -> int:
         return len(self.items)
@@ -1090,37 +1317,10 @@ class CrossSectionDataset(Dataset):
         return int(sum(len(pairs) for _d, pairs in self.items))
 
     def __getitem__(self, index: int):
+        if self._cached is not None:
+            return self._cached[index]
         date_id, pairs = self.items[index]
-        xs: list[np.ndarray] = []
-        ys: list[np.ndarray] = []
-        masks: list[np.ndarray] = []
-        scales: list[np.ndarray] = []
-        dates: list[int] = []
-        syms: list[int] = []
-        for sym_idx, end in pairs:
-            sym = self.symbols[sym_idx]
-            start = end - self.seq_len + 1
-            x = sym.features[start : end + 1]
-            if self.feature_mean is not None and self.feature_std is not None:
-                x = (x - self.feature_mean) / self.feature_std
-            mask = np.zeros(self.seq_len, dtype=bool)
-            mask[-1] = bool(sym.valid[end])
-            y = sym.target[start : end + 1].copy()
-            sc = sym.scale[start : end + 1].copy()
-            xs.append(np.ascontiguousarray(x, dtype=np.float32))
-            ys.append(y)
-            masks.append(mask)
-            scales.append(sc)
-            dates.append(int(date_id))
-            syms.append(int(sym_idx))
-        return (
-            torch.from_numpy(np.stack(xs, axis=0)),
-            torch.from_numpy(np.stack(ys, axis=0)),
-            torch.from_numpy(np.stack(masks, axis=0)),
-            torch.from_numpy(np.stack(scales, axis=0)),
-            torch.tensor(dates, dtype=torch.int64),
-            torch.tensor(syms, dtype=torch.int64),
-        )
+        return self._row(date_id, pairs)
 
 
 def collate_forecast(batch: list[tuple]) -> tuple[torch.Tensor, ...]:
@@ -1204,12 +1404,21 @@ def _arrays_with_valid(src: SymbolArrays, valid: np.ndarray) -> SymbolArrays:
 def global_session_cuts(
     panels: dict[str, pd.DataFrame],
     cfg: DataConfig,
+    *,
+    start: Any | None = None,
 ) -> tuple[Any, Any]:
-    """Union of session dates, then the usual 70/15/15 cuts."""
+    """Union of session dates, then the usual 70/15/15 cuts.
+
+    ``start`` drops dates before the residual benchmark lists so empty
+    pre-SPY years do not consume the train split.
+    """
     sessions = pd.concat(
         [p["session"].drop_duplicates() for p in panels.values()],
         ignore_index=True,
-    ).drop_duplicates().sort_values().to_numpy()
+    ).drop_duplicates().sort_values()
+    if start is not None:
+        sessions = sessions[pd.to_datetime(sessions) >= pd.Timestamp(start)]
+    sessions = sessions.to_numpy()
     cut_train, cut_val = split_session_bounds(len(sessions), cfg)
     return sessions[cut_train], sessions[cut_val]
 
@@ -1273,15 +1482,25 @@ def build_datasets(
         raise FileNotFoundError("no symbol panels long enough to window")
 
     raw_panels = attach_cross_section_features(raw_panels, cfg)
+    raw_panels = apply_cs_feature_norm(raw_panels, cfg)
     raw_panels = attach_residual_target(raw_panels, cfg)
 
     bench = str(cfg.benchmark_symbol or "").upper()
+<<<<<<< Updated upstream
     trade_names = trading_panel_symbols(raw_panels, cfg)
     trade_panels = {s: raw_panels[s] for s in trade_names}
     train_from_ts: pd.Timestamp | None = None
     raw_from = str(getattr(cfg, "train_from", "") or "").strip()
     if raw_from:
         train_from_ts = pd.Timestamp(raw_from)
+=======
+    if cfg.residual_target and bench not in raw_panels and log_fn:
+        log_fn(
+            f"WARNING residual_target=True but {bench} parquet is missing; "
+            "labels are raw forward returns, not residuals"
+        )
+    trade_panels = {s: p for s, p in raw_panels.items() if s != bench}
+>>>>>>> Stashed changes
     if not trade_panels:
         raise ValueError(
             f"no trading names after filters (benchmark={bench}, "
@@ -1299,8 +1518,13 @@ def build_datasets(
             + (f" (held out of book: {','.join(sorted(dropped))})" if dropped else "")
         )
 
+    spy_start = None
+    if cfg.residual_target and bench in raw_panels:
+        spy_start = pd.to_datetime(raw_panels[bench]["session"]).min()
     if cfg.global_calendar_split and cfg.is_calendar() and len(trade_panels) >= 1:
-        train_end, val_end = global_session_cuts(trade_panels, cfg)
+        train_end, val_end = global_session_cuts(
+            trade_panels, cfg, start=spy_start
+        )
     else:
         train_end, val_end = None, None
 
@@ -1406,6 +1630,7 @@ def build_datasets(
                 feature_mean=mean,
                 feature_std=std,
                 min_names=cfg.cross_section_min_names,
+                cache=True,
             ),
             "val": CrossSectionDataset(
                 val_syms,
@@ -1423,10 +1648,12 @@ def build_datasets(
             ),
         }
         if log_fn:
+            cache_mb = datasets["train"].cache_bytes / (1024 ** 2)
             log_fn(
                 f"cross-section dates: train={len(datasets['train'])} "
                 f"val={len(datasets['val'])} test={len(datasets['test'])} "
-                f"(min_names={cfg.cross_section_min_names})"
+                f"(min_names={cfg.cross_section_min_names}, "
+                f"train window cache {cache_mb:.0f} MiB RAM)"
             )
         if any(len(datasets[k]) == 0 for k in ("train", "val", "test")):
             if log_fn:

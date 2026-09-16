@@ -184,11 +184,12 @@ if _TRITON_OK:
 
 
 def _block_d(d_inner: int) -> int:
+    # Larger tiles on wide models cut the D-grid (and dB/dC atomics) in half.
     if d_inner <= 16:
         return 16
     if d_inner <= 32:
         return 32
-    return 32  # 32 lanes x BLOCK_N keeps register pressure low; grid covers D.
+    return 64
 
 
 def _next_pow2(n: int) -> int:

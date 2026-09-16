@@ -78,10 +78,13 @@ class ReturnForecaster(nn.Module):
                 f"got {features.size(-1)}"
             )
 
-        x = self.dropout(self.input_norm(self.input_proj(features)))
+        # Dropout sits after the mixers so the SSM sees clean inputs. Stem
+        # dropout next to a frozen ridge skip (and zero out_proj) was shrinking
+        # the only learned residual toward zero.
+        x = self.input_norm(self.input_proj(features))
         for layer in self.layers:
             x = layer(x)
-        x = self.norm_f(x)
+        x = self.dropout(self.norm_f(x))
         out = self.head(x)  # [B, L, 1 or 2]
         skip = self.skip(features).squeeze(-1)
 
