@@ -150,30 +150,6 @@ CS_ZSCORE_SOURCES: tuple[tuple[str, str], ...] = (
     ("vol_level", "cs_vol"),
 )
 
-# Features ``cs_feature_norm`` restates against the same-date cross-section.
-# Date-level features (mkt_ret_1, the calendar block, session flags) are
-# near-constant across names, so a per-date z-score would divide by ~0.
-CS_NORM_FEATURES: tuple[str, ...] = (
-    "ret_1",
-    "ret_5",
-    "ret_15",
-    "ret_60",
-    "ret_390",
-    "range_hl",
-    "body_co",
-    "close_loc",
-    "wick_up",
-    "wick_dn",
-    "vol_level",
-    "vol_change",
-    "volume_z",
-    "turnover_z",
-    "ret_vol",
-    "idio_ret_1",
-)
-# Below this many names a date has no usable cross-section; keep raw values.
-MIN_CS_NORM_NAMES = 5
-
 OHLCV_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 
 
@@ -721,7 +697,6 @@ def attach_cross_section_features(
     return out
 
 
-<<<<<<< Updated upstream
 def _ewm_beta(y: np.ndarray, x: np.ndarray, hl: int) -> np.ndarray:
     frame = pd.DataFrame({"y": y, "x": x})
     cov = frame["y"].ewm(halflife=hl, min_periods=hl).cov(frame["x"])
@@ -762,121 +737,6 @@ def _ewm_multi_beta(y: np.ndarray, xs: list[np.ndarray], hl: int) -> list[np.nda
         except np.linalg.LinAlgError:
             betas[t] = 0.0
     return [np.clip(betas[:, i], -5.0, 5.0) for i in range(k)]
-=======
-def _cs_group_bounds(sorted_keys: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """``(group_starts, group_sizes)`` for an already key-sorted array."""
-    change = np.ones(sorted_keys.size, dtype=bool)
-    change[1:] = sorted_keys[1:] != sorted_keys[:-1]
-    starts = np.flatnonzero(change)
-    return starts, np.diff(np.append(starts, sorted_keys.size))
-
-
-def _cs_zscore(values: np.ndarray, keys: np.ndarray) -> np.ndarray:
-    """Per-key z-score of ``values`` [N, C] down the name axis."""
-    order = np.argsort(keys, kind="stable")
-    xs = values[order]
-    starts, counts = _cs_group_bounds(keys[order])
-    inv = np.repeat(np.arange(starts.size), counts)
-    cnt = counts.astype(np.float64)[:, None]
-    mean = np.add.reduceat(xs, starts, axis=0) / cnt
-    var = np.add.reduceat(xs * xs, starts, axis=0) / cnt - mean**2
-    std = np.sqrt(np.clip(var, 0.0, None))
-    z = (xs - mean[inv]) / np.clip(std[inv], 1e-6, None)
-    out = np.empty_like(z)
-    out[order] = np.where((counts[inv] < MIN_CS_NORM_NAMES)[:, None], xs, z)
-    return out
-
-
-def _cs_rank(values: np.ndarray, keys: np.ndarray) -> np.ndarray:
-    """Per-key percentile rank down the name axis, rescaled to ~unit variance.
-
-    Ties break ordinally, like the Spearman IC in training.
-    """
-    n = keys.size
-    out = np.empty_like(values)
-    positions = np.arange(n)
-    for j in range(values.shape[1]):
-        order = np.lexsort((values[:, j], keys))
-        starts, counts = _cs_group_bounds(keys[order])
-        inv = np.repeat(np.arange(starts.size), counts)
-        intra = positions - starts[inv]
-        pct = (intra + 0.5) / counts[inv]
-        col = np.empty(n, dtype=values.dtype)
-        col[order] = (pct - 0.5) * math.sqrt(12.0)
-        out[:, j] = col
-    order = np.argsort(keys, kind="stable")
-    _starts, counts = _cs_group_bounds(keys[order])
-    sizes = np.empty(n, dtype=np.int64)
-    sizes[order] = np.repeat(counts, counts)
-    thin = sizes < MIN_CS_NORM_NAMES
-    out[thin] = values[thin]
-    return out
-
-
-def apply_cs_feature_norm(
-    panels: dict[str, pd.DataFrame],
-    cfg: DataConfig,
-) -> dict[str, pd.DataFrame]:
-    """Restate ``CS_NORM_FEATURES`` against the same-date cross-section.
-
-    Mean CS IC only reads the ordering of names within one date, but ~30% of
-    each feature's variance is a date-level common factor (every name is down
-    on a down day). Removing it leaves the model an input that is already the
-    cross-sectional signal.
-
-    Strictly causal: only bar-``t`` values of the other names are used, the
-    same information ``attach_cross_section_features`` puts in ``peer_ret_1``.
-    The benchmark panel is left alone; it is a market feature, not a name.
-    """
-    mode = str(getattr(cfg, "cs_feature_norm", "off") or "off")
-    if mode == "off":
-        return panels
-    if mode not in ("z", "rank"):
-        raise ValueError(
-            f"cs_feature_norm must be 'off', 'z' or 'rank'; got {mode!r}"
-        )
-    bench = str(cfg.benchmark_symbol or "").upper()
-    syms = [s for s in panels if s != bench]
-    if len(syms) < MIN_CS_NORM_NAMES:
-        return panels
-    cols = [c for c in CS_NORM_FEATURES if c in panels[syms[0]].columns]
-    if not cols:
-        return panels
-
-    key_parts: list[np.ndarray] = []
-    blocks: list[np.ndarray] = []
-    lengths: list[int] = []
-    for sym in syms:
-        panel = panels[sym]
-        key_parts.append(
-            _cross_section_key(panel, cfg)
-            .to_numpy()
-            .astype("datetime64[ns]")
-            .astype(np.int64)
-        )
-        blocks.append(panel[cols].to_numpy(dtype=np.float64))
-        lengths.append(len(panel))
-    keys = np.concatenate(key_parts)
-    values = np.concatenate(blocks, axis=0)
-
-    normed = _cs_zscore(values, keys) if mode == "z" else _cs_rank(values, keys)
-    normed = np.clip(
-        np.nan_to_num(normed, nan=0.0, posinf=0.0, neginf=0.0),
-        -float(cfg.clip),
-        float(cfg.clip),
-    )
-
-    out = dict(panels)
-    offset = 0
-    for sym, length in zip(syms, lengths):
-        block = normed[offset : offset + length]
-        offset += length
-        panel = panels[sym].copy()
-        for j, name in enumerate(cols):
-            panel[name] = block[:, j]
-        out[sym] = panel
-    return out
->>>>>>> Stashed changes
 
 
 def attach_residual_target(
@@ -885,7 +745,6 @@ def attach_residual_target(
 ) -> dict[str, pd.DataFrame]:
     """Replace the label with trailing-beta residual vs hedge forward return(s).
 
-<<<<<<< Updated upstream
     ``beta_t`` uses same-bar returns through ``t`` only. Hedge *forward* return
     enters the label, never ``FEATURE_NAMES``. Default hedge is SPY;
     ``sector_residual`` uses the mapped sector ETF when that parquet exists.
@@ -896,14 +755,8 @@ def attach_residual_target(
     ``label_return`` selects which forward log-return is residualized.
     Overnight is ``log(open_{t+h})-log(close_t)``; the hedge's *forward*
     overnight return is a label term. Features stay at close ``t``.
-=======
-    ``beta_t`` uses same-bar returns through ``t`` only. The benchmark's
-    *forward* return enters the label, never ``FEATURE_NAMES``.
-
-    Bars are unlabelled unless the benchmark return, the benchmark forward
-    return, and a finite trailing beta all exist. Missing SPY is not a
-    zero hedge.
->>>>>>> Stashed changes
+    Bars are unlabelled unless hedge returns and a finite trailing beta exist.
+    A missing hedge is not a zero hedge.
     """
     bench = str(cfg.benchmark_symbol or "").upper()
     if not cfg.residual_target:
@@ -977,13 +830,15 @@ def attach_residual_target(
             continue
         keys = _cross_section_key(p, cfg)
         own_r = p["ret_raw"].to_numpy(dtype=np.float64)
-<<<<<<< Updated upstream
         xs = []
         fwds = []
+        hedge_ok = np.ones(len(p), dtype=bool)
         for hedge_fwd, hedge_r in series:
-            xs.append(keys.map(hedge_r).to_numpy(dtype=np.float64))
-            fwd = keys.map(hedge_fwd).to_numpy(dtype=np.float64)
-            fwds.append(np.where(np.isfinite(fwd), fwd, 0.0))
+            xr = keys.map(hedge_r).to_numpy(dtype=np.float64)
+            xf = keys.map(hedge_fwd).to_numpy(dtype=np.float64)
+            hedge_ok &= np.isfinite(xr) & np.isfinite(xf)
+            xs.append(xr)
+            fwds.append(np.where(np.isfinite(xf), xf, 0.0))
         betas = _ewm_multi_beta(own_r, xs, hl) if len(xs) > 1 else [_ewm_beta(own_r, xs[0], hl)]
         own_fwd = p["target_raw"].to_numpy(dtype=np.float64)
         resid = own_fwd.astype(np.float64, copy=True)
@@ -1010,24 +865,9 @@ def attach_residual_target(
                 p["idio_ret_1"] = p["ret_1"] - p["mkt_ret_1"]
             if "idio_sector" in p.columns and "ret_1" in p.columns and "sector_ret_1" in p.columns:
                 p["idio_sector"] = p["ret_1"] - p["sector_ret_1"]
-        valid = p["valid"].to_numpy(dtype=bool).copy()
-=======
-        frame = pd.DataFrame({"y": own_r, "x": spy_r_al})
-        cov = frame["y"].ewm(halflife=hl, min_periods=hl).cov(frame["x"])
-        var = frame["x"].ewm(halflife=hl, min_periods=hl).var()
-        beta = (cov / var.replace(0.0, np.nan)).to_numpy()
-        beta_ok = np.isfinite(beta)
-        beta_use = np.where(beta_ok, np.clip(beta, -5.0, 5.0), 0.0)
-        own_fwd = p["target_raw"].to_numpy(dtype=np.float64)
-        spy_ok = np.isfinite(spy_r_al) & np.isfinite(spy_fwd_al)
-        resid = own_fwd - beta_use * np.where(spy_ok, spy_fwd_al, 0.0)
-        scale = p["scale"].to_numpy(dtype=np.float64)
-        p["target_raw"] = resid
-        p["target"] = np.divide(resid, scale, out=np.zeros_like(resid), where=scale > 0)
-        # Missing benchmark (pre-listing or a hole) must not stay labelled as
-        # a residual: fillna(0) turned those bars into unhedged total returns.
-        valid = p["valid"].to_numpy(dtype=bool).copy() & spy_ok & beta_ok
->>>>>>> Stashed changes
+        # Missing hedge (pre-listing or a hole) must not stay labelled as a
+        # residual: fillna(0) turned those bars into unhedged total returns.
+        valid = p["valid"].to_numpy(dtype=bool).copy() & hedge_ok
         if cfg.max_abs_log_return > 0:
             valid &= np.abs(resid) <= cfg.max_abs_log_return
         if cfg.max_abs_target > 0:
@@ -1482,25 +1322,20 @@ def build_datasets(
         raise FileNotFoundError("no symbol panels long enough to window")
 
     raw_panels = attach_cross_section_features(raw_panels, cfg)
-    raw_panels = apply_cs_feature_norm(raw_panels, cfg)
     raw_panels = attach_residual_target(raw_panels, cfg)
 
     bench = str(cfg.benchmark_symbol or "").upper()
-<<<<<<< Updated upstream
+    if cfg.residual_target and bench not in raw_panels and log_fn:
+        log_fn(
+            f"WARNING residual_target=True but {bench} parquet is missing; "
+            "labels are raw forward returns, not residuals"
+        )
     trade_names = trading_panel_symbols(raw_panels, cfg)
     trade_panels = {s: raw_panels[s] for s in trade_names}
     train_from_ts: pd.Timestamp | None = None
     raw_from = str(getattr(cfg, "train_from", "") or "").strip()
     if raw_from:
         train_from_ts = pd.Timestamp(raw_from)
-=======
-    if cfg.residual_target and bench not in raw_panels and log_fn:
-        log_fn(
-            f"WARNING residual_target=True but {bench} parquet is missing; "
-            "labels are raw forward returns, not residuals"
-        )
-    trade_panels = {s: p for s, p in raw_panels.items() if s != bench}
->>>>>>> Stashed changes
     if not trade_panels:
         raise ValueError(
             f"no trading names after filters (benchmark={bench}, "

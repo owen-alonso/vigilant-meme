@@ -38,7 +38,6 @@ from forecast.checkpoint import load_forecaster, uncertainty_is_trained
 from forecast.config import DataConfig
 from forecast.data import (
     FEATURE_NAMES,
-    apply_cs_feature_norm,
     attach_cross_section_features,
     attach_residual_target,
     build_panel,
@@ -223,7 +222,6 @@ def load_forecast_panels(
         symbol: build_panel(path, data_cfg) for symbol, path in by_path.items()
     }
     panels = attach_cross_section_features(panels, data_cfg)
-    panels = apply_cs_feature_norm(panels, data_cfg)
     return attach_residual_target(panels, data_cfg)
 
 

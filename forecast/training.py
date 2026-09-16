@@ -45,12 +45,9 @@ from forecast.config import (
 )
 from forecast.data import FEATURE_NAMES, build_datasets, collate_forecast
 from forecast.model import ReturnForecaster
-<<<<<<< Updated upstream
 from forecast.overnight import formula_log_line, parse_label_spec
 from forecast.ridge import feature_mask, labelled_rows, walk_forward_predict, cs_stats
-=======
 from mamba_lm.diagnostics import clear_ssm_diagnostics
->>>>>>> Stashed changes
 from mamba_lm.model import format_dynamic_diagnostics
 from mamba_lm.paths import anchor_to_repo
 from mamba_lm.reporting import clip_grad_norm_unique
@@ -154,22 +151,19 @@ def masked_loss(
             neginf=0.0,
         )
     if cfg.rank_loss_weight > 0:
-<<<<<<< Updated upstream
-        rank_term = masked_pairwise_rank_loss(mean, target, mask, date_ids=date_ids)
-        if torch.isfinite(rank_term):
-            total = total + cfg.rank_loss_weight * rank_term
-    if float(getattr(cfg, "listnet_loss_weight", 0.0) or 0.0) > 0:
-        list_term = masked_listnet_loss(mean, target, mask, date_ids=date_ids)
-        if torch.isfinite(list_term):
-            total = total + float(cfg.listnet_loss_weight) * list_term
-=======
         total = total + cfg.rank_loss_weight * torch.nan_to_num(
             masked_pairwise_rank_loss(mean, target, mask, date_ids=date_ids),
             nan=0.0,
             posinf=0.0,
             neginf=0.0,
         )
->>>>>>> Stashed changes
+    if float(getattr(cfg, "listnet_loss_weight", 0.0) or 0.0) > 0:
+        total = total + float(cfg.listnet_loss_weight) * torch.nan_to_num(
+            masked_listnet_loss(mean, target, mask, date_ids=date_ids),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
     if cfg.pred_std_weight > 0:
         total = total + cfg.pred_std_weight * torch.nan_to_num(
             masked_pred_std_loss(
@@ -811,19 +805,14 @@ def evaluate(
         tgt_np = np.empty(0)
         scale_np = np.empty(0)
     metrics = compute_metrics(pred_np, tgt_np, scale_np, winsor=train_cfg.ic_winsor)
-<<<<<<< Updated upstream
-    if date_list:
-        dates_np = np.concatenate(date_list)
-        metrics.update(
-            mean_cs_stats(pred_np, tgt_np, dates_np, min_names=int(cs_min_names))
-=======
     if date_parts:
         dates_np = torch.cat(date_parts).cpu().numpy()
-        metrics["cs_ic"] = mean_cs_ic(pred_np, tgt_np, dates_np)
+        metrics.update(
+            mean_cs_stats(pred_np, tgt_np, dates_np, min_names=int(cs_min_names))
+        )
         metrics["book_hit"] = mean_book_hit(pred_np, tgt_np, dates_np)
         metrics["book_hit_wide"] = mean_book_hit(
             pred_np, tgt_np, dates_np, spread_pct=50.0
->>>>>>> Stashed changes
         )
     metrics["select"] = selection_score(metrics)
     den = float(loss_den)
@@ -850,7 +839,6 @@ def _tag_skip_lr_mult(
     optimizer.param_groups = new_groups
 
 
-<<<<<<< Updated upstream
 def walk_forward_split_metrics(
     bundle: dict[str, Any],
     train_cfg: ForecastTrainConfig,
@@ -906,7 +894,8 @@ def walk_forward_split_metrics(
             row[split] = cs_stats(pred[sel], y[sel], d[sel], min_names=min_names)
         out[name] = row
     return out
-=======
+
+
 def _undecay_residual_readout(
     optimizer: torch.optim.Optimizer, model: ReturnForecaster
 ) -> None:
@@ -942,7 +931,6 @@ def _undecay_residual_readout(
 def reset_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
     """Drop Adam moments after restoring best.pt (stale m/v at a new point)."""
     optimizer.state.clear()
->>>>>>> Stashed changes
 
 
 def apply_ridge_skip(
@@ -1016,12 +1004,9 @@ def _fmt(metrics: dict[str, float]) -> str:
         f"loss={metrics['loss']:.5f} ic={metrics['ic']:+.4f} "
         f"spearman={spearman:+.4f} raw={raw:+.4f} "
         f"cs_ic={metrics.get('cs_ic', float('nan')):+.4f} "
-<<<<<<< Updated upstream
         f"cs_sp={cs_sp:+.4f} cs_t={cs_t:+.2f} cs_dates={int(cs_n) if np.isfinite(cs_n) else 0} "
-=======
         f"book={metrics.get('book_hit', float('nan')):.3f} "
         f"wide={metrics.get('book_hit_wide', float('nan')):.3f} "
->>>>>>> Stashed changes
         f"r2={metrics['r2']:+.5f} dir={metrics['direction']:.4f} "
         f"pred_std={metrics['pred_std_bps']:.2f}bps n={int(metrics['n'])}"
     )
@@ -1076,21 +1061,14 @@ def _train(
         log_fn(
             f"device={device} params={n_params:,} features={model_cfg.n_features} "
             f"seq_len={data_cfg.seq_len} horizon={data_cfg.horizon} "
-<<<<<<< Updated upstream
             f"label_return={getattr(data_cfg, 'label_return', 'close')} "
-=======
-            f"cs_feature_norm={data_cfg.cs_feature_norm} "
->>>>>>> Stashed changes
             f"linear_skip={model_cfg.linear_skip} "
             f"dynamic_weights={model_cfg.dynamic_weights} "
             f"loss={train_cfg.loss} ic_loss_weight={train_cfg.ic_loss_weight} "
             f"ridge_skip={train_cfg.ridge_skip} "
-<<<<<<< Updated upstream
             f"ridge_rank_target={train_cfg.ridge_rank_target} "
             f"ridge_objective={getattr(train_cfg, 'ridge_objective', 'ridge')} "
-=======
             f"max_cs_windows={train_cfg.max_cs_windows} "
->>>>>>> Stashed changes
             f"heteroscedastic={model_cfg.heteroscedastic}"
         )
         log_fn(formula_log_line(
@@ -1536,12 +1514,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="score every labelled bar instead of unique last-bar dates",
     )
     g.add_argument(
-        "--cs-feature-norm",
-        default=d.cs_feature_norm,
-        choices=("off", "z", "rank"),
-        help="restate name-specific features against the same-date cross-section",
-    )
-    g.add_argument(
         "--no-global-split",
         action="store_true",
         help="split each symbol on its own session count (legacy)",
@@ -1865,7 +1837,6 @@ def configs_from_cli(
         global_calendar_split=not args.no_global_split,
         residual_target=not args.no_residual_target,
         allow_mixed_prices=args.allow_mixed_prices,
-<<<<<<< Updated upstream
         universe=args.universe,
         cs_zscore=not args.no_cs_zscore,
         cross_section_min_names=(
@@ -1881,9 +1852,6 @@ def configs_from_cli(
         industry_residual=args.industry_residual,
         label_return=_cli_label_return(args),
         fill_minutes=_cli_fill_minutes(args),
-=======
-        cs_feature_norm=args.cs_feature_norm,
->>>>>>> Stashed changes
     )
     model_cfg = ForecastModelConfig(
         n_features=len(FEATURE_NAMES),

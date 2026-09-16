@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -12,16 +10,11 @@ import pytest
 
 from forecast.config import DataConfig, ForecastModelConfig, ForecastTrainConfig, validate_loss_head
 from forecast.data import (
-<<<<<<< Updated upstream
     CS_PRODUCTS,
-=======
-    CS_NORM_FEATURES,
->>>>>>> Stashed changes
     FEATURE_NAMES,
     SequenceDataset,
     SymbolArrays,
     _session_naive_datetime,
-    apply_cs_feature_norm,
     attach_cross_section_features,
     attach_residual_target,
     build_datasets,
@@ -476,116 +469,6 @@ def test_cross_section_does_not_see_future_peer_return():
     )
 
 
-def _cs_norm_panels(n_syms: int = 6, n: int = 40) -> tuple[dict, DataConfig]:
-    """``n_syms`` daily names on one calendar, each with its own return path."""
-    cfg = DataConfig(
-        interval="daily",
-        horizon=1,
-        warmup_bars=5,
-        vol_halflife=5,
-        z_window=10,
-        z_min_periods=3,
-    )
-    rng = np.random.default_rng(7)
-    panels: dict[str, pd.DataFrame] = {}
-    for i in range(n_syms):
-        grid = _daily_grid(n)
-        steps = rng.normal(0.0, 0.01, size=n).cumsum()
-        grid["close"] = 100.0 * np.exp(steps) * (1.0 + 0.1 * i)
-        grid["open"] = grid["close"]
-        grid["high"] = grid["close"] * 1.001
-        grid["low"] = grid["close"] * 0.999
-        grid["volume"] = 1000.0 * (i + 1)
-        symbol = f"S{i}"
-        panel = compute_features(grid, cfg)
-        panel["symbol"] = symbol
-        panels[symbol] = panel
-    return attach_cross_section_features(panels, cfg), cfg
-
-
-def test_cs_feature_norm_off_is_identity():
-    panels, cfg = _cs_norm_panels()
-    out = apply_cs_feature_norm(panels, replace(cfg, cs_feature_norm="off"))
-    for sym, panel in panels.items():
-        pd.testing.assert_frame_equal(out[sym], panel)
-
-
-def test_cs_feature_norm_rank_preserves_within_date_order():
-    panels, cfg = _cs_norm_panels()
-    out = apply_cs_feature_norm(panels, replace(cfg, cs_feature_norm="rank"))
-    row = 20
-    raw = np.array([float(panels[s]["ret_1"].iloc[row]) for s in sorted(panels)])
-    ranked = np.array([float(out[s]["ret_1"].iloc[row]) for s in sorted(panels)])
-    assert np.array_equal(np.argsort(raw), np.argsort(ranked))
-    # Percentile ranks are bounded and centred, unlike the raw vol-unit value.
-    assert abs(float(ranked.mean())) < 1e-9
-    assert np.abs(ranked).max() <= math.sqrt(12.0) / 2.0
-
-
-def test_cs_feature_norm_z_is_centred_across_names():
-    panels, cfg = _cs_norm_panels()
-    out = apply_cs_feature_norm(panels, replace(cfg, cs_feature_norm="z"))
-    row = 20
-    z = np.array([float(out[s]["ret_1"].iloc[row]) for s in sorted(panels)])
-    assert float(z.mean()) == pytest.approx(0.0, abs=1e-9)
-    assert float(z.std()) == pytest.approx(1.0, abs=1e-6)
-
-
-def test_cs_feature_norm_leaves_date_level_features_alone():
-    panels, cfg = _cs_norm_panels()
-    out = apply_cs_feature_norm(panels, replace(cfg, cs_feature_norm="rank"))
-    untouched = [n for n in FEATURE_NAMES if n not in CS_NORM_FEATURES]
-    assert "mkt_ret_1" in untouched and "tod_sin" in untouched
-    for sym in panels:
-        for name in untouched:
-            assert np.allclose(
-                out[sym][name].to_numpy(), panels[sym][name].to_numpy(), equal_nan=True
-            )
-
-
-def test_cs_feature_norm_only_uses_the_same_date():
-    """A later bar of one name must not move an earlier bar of another."""
-    panels, cfg = _cs_norm_panels()
-    cfg = replace(cfg, cs_feature_norm="rank")
-    base = apply_cs_feature_norm(panels, cfg)
-    spiked = {s: p.copy() for s, p in panels.items()}
-    spiked["S1"].loc[spiked["S1"].index[30], "ret_1"] = 9.0
-    alt = apply_cs_feature_norm(spiked, cfg)
-    assert base["S0"]["ret_1"].iloc[20] == pytest.approx(
-        float(alt["S0"]["ret_1"].iloc[20]), abs=1e-12
-    )
-    # The spiked name becomes the top of its own date, and only that date.
-    assert float(alt["S1"]["ret_1"].iloc[30]) > float(base["S1"]["ret_1"].iloc[30])
-
-
-def test_cs_feature_norm_skips_the_benchmark_panel():
-    panels, cfg = _cs_norm_panels()
-    panels["SPY"] = panels["S0"].copy()
-    panels["SPY"]["symbol"] = "SPY"
-    out = apply_cs_feature_norm(
-        panels, replace(cfg, cs_feature_norm="rank", benchmark_symbol="SPY")
-    )
-    assert np.allclose(
-        out["SPY"]["ret_1"].to_numpy(), panels["SPY"]["ret_1"].to_numpy()
-    )
-    assert not np.allclose(
-        out["S0"]["ret_1"].to_numpy(), panels["S0"]["ret_1"].to_numpy()
-    )
-
-
-def test_cs_feature_norm_rejects_unknown_mode():
-    panels, cfg = _cs_norm_panels()
-    with pytest.raises(ValueError, match="cs_feature_norm"):
-        apply_cs_feature_norm(panels, replace(cfg, cs_feature_norm="median"))
-
-
-def test_cs_feature_norm_cli_flag_reaches_data_config():
-    args = build_arg_parser().parse_args(["--cs-feature-norm", "rank"])
-    data_cfg, _model_cfg, _train_cfg = configs_from_cli(args)
-    assert data_cfg.cs_feature_norm == "rank"
-    assert configs_from_cli(build_arg_parser().parse_args([]))[0].cs_feature_norm == "off"
-
-
 def test_ridge_readout_recovers_linear_target():
     n, f = 80, 4
     rng = np.random.default_rng(0)
@@ -650,12 +533,8 @@ def test_weekly_cli_uses_week_scale_context():
     assert model_cfg.d_state == 8
     assert model_cfg.linear_skip is True
     assert model_cfg.dt_min == pytest.approx(0.05)
-<<<<<<< Updated upstream
     assert train_cfg.ic_loss_weight == pytest.approx(2.0)
     assert train_cfg.rank_loss_weight == pytest.approx(1.0)
-=======
-    assert train_cfg.ic_loss_weight == pytest.approx(2.5)
->>>>>>> Stashed changes
     assert train_cfg.early_stop_evals == 24
     assert train_cfg.ridge_skip == pytest.approx(10.0)
     assert train_cfg.ridge_rank_target is True
@@ -959,7 +838,10 @@ def test_cross_section_dataset_when_enough_names(tmp_path: Path):
     assert int(mask[0].sum()) == 1
     assert bool(mask[0, -1])
     assert int(dates.unique().numel()) == 1
-<<<<<<< Updated upstream
+    ds = bundle["datasets"]["train"]
+    again_x = ds[0][0]
+    assert x.data_ptr() == again_x.data_ptr()
+    assert ds.cache_bytes > 0
 
 
 def test_cs_zscore_is_same_day_and_excludes_spy():
@@ -1113,11 +995,184 @@ def test_cs_rank_is_same_day_and_centered():
 
 
 def test_sector_residual_uses_future_xlk_in_label_not_features():
-=======
-    ds = bundle["datasets"]["train"]
-    again_x = ds[0][0]
-    assert x.data_ptr() == again_x.data_ptr()
-    assert ds.cache_bytes > 0
+    cfg = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+        residual_target=True,
+        sector_residual=True,
+        beta_halflife=5,
+        benchmark_symbol="SPY",
+    )
+    a = compute_features(_daily_grid(50), cfg)
+    spy = compute_features(_daily_grid(50), cfg)
+    xlk = compute_features(_daily_grid(50), cfg)
+    a["symbol"], spy["symbol"], xlk["symbol"] = "AAPL", "SPY", "XLK"
+    base = attach_cross_section_features(
+        {"AAPL": a.copy(), "SPY": spy.copy(), "XLK": xlk.copy()}, cfg
+    )
+    base = attach_residual_target(base, cfg)
+    spiked_grid = _daily_grid(50)
+    spiked_grid.loc[spiked_grid.index[-1], "close"] = (
+        float(spiked_grid["close"].iloc[-1]) * 1.08
+    )
+    spiked = compute_features(spiked_grid, cfg)
+    spiked["symbol"] = "XLK"
+    alt_panels = attach_cross_section_features(
+        {"AAPL": a.copy(), "SPY": spy.copy(), "XLK": spiked}, cfg
+    )
+    alt = attach_residual_target(alt_panels, cfg)
+    t = 48
+    for col in ("ret_1", "mkt_ret_1", "sector_ret_1", "idio_sector", "cs_rank_1"):
+        assert base["AAPL"][col].iloc[t] == pytest.approx(float(alt["AAPL"][col].iloc[t]))
+    assert base["AAPL"]["target"].iloc[t] != pytest.approx(float(alt["AAPL"]["target"].iloc[t]))
+
+
+def test_double_residual_uses_spy_and_sector_forward():
+    cfg = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+        residual_target=True,
+        sector_residual=True,
+        double_residual=True,
+        beta_halflife=5,
+        benchmark_symbol="SPY",
+    )
+    a = compute_features(_daily_grid(50), cfg)
+    spy = compute_features(_daily_grid(50), cfg)
+    xlk = compute_features(_daily_grid(50), cfg)
+    a["symbol"], spy["symbol"], xlk["symbol"] = "AAPL", "SPY", "XLK"
+    base_panels = attach_cross_section_features(
+        {"AAPL": a.copy(), "SPY": spy.copy(), "XLK": xlk.copy()}, cfg
+    )
+    base = attach_residual_target(base_panels, cfg)
+    spiked_grid = _daily_grid(50)
+    spiked_grid.loc[spiked_grid.index[-1], "close"] = (
+        float(spiked_grid["close"].iloc[-1]) * 1.08
+    )
+    spiked = compute_features(spiked_grid, cfg)
+    spiked["symbol"] = "SPY"
+    alt_panels = attach_cross_section_features(
+        {"AAPL": a.copy(), "SPY": spiked, "XLK": xlk.copy()}, cfg
+    )
+    alt = attach_residual_target(alt_panels, cfg)
+    t = 48
+    assert base["AAPL"]["ret_1"].iloc[t] == pytest.approx(float(alt["AAPL"]["ret_1"].iloc[t]))
+    assert base["AAPL"]["target"].iloc[t] != pytest.approx(float(alt["AAPL"]["target"].iloc[t]))
+
+
+def test_residualize_features_uses_same_bar_hedge():
+    cfg = DataConfig(
+        interval="daily",
+        horizon=1,
+        warmup_bars=5,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=3,
+        residual_target=True,
+        sector_residual=True,
+        double_residual=True,
+        residualize_features=True,
+        beta_halflife=5,
+        benchmark_symbol="SPY",
+    )
+    a = compute_features(_daily_grid(50), cfg)
+    spy = compute_features(_daily_grid(50), cfg)
+    xlk = compute_features(_daily_grid(50), cfg)
+    a["symbol"], spy["symbol"], xlk["symbol"] = "AAPL", "SPY", "XLK"
+    base_panels = attach_cross_section_features(
+        {"AAPL": a.copy(), "SPY": spy.copy(), "XLK": xlk.copy()}, cfg
+    )
+    base = attach_residual_target(base_panels, cfg)
+    spiked_grid = _daily_grid(50)
+    spiked_grid.loc[spiked_grid.index[40], "close"] = (
+        float(spiked_grid["close"].iloc[40]) * 1.06
+    )
+    spiked = compute_features(spiked_grid, cfg)
+    spiked["symbol"] = "SPY"
+    alt_panels = attach_cross_section_features(
+        {"AAPL": a.copy(), "SPY": spiked, "XLK": xlk.copy()}, cfg
+    )
+    alt = attach_residual_target(alt_panels, cfg)
+    t = 40
+    assert base["AAPL"]["ret_1"].iloc[t] != pytest.approx(float(alt["AAPL"]["ret_1"].iloc[t]))
+
+
+def test_equities_only_drops_etfs_from_the_book(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_daily_parquet(data_dir / "AAPL_daily.parquet", "AAPL", 90, "2018-01-02")
+    _write_daily_parquet(data_dir / "MSFT_daily.parquet", "MSFT", 90, "2018-01-02", 0.02)
+    _write_daily_parquet(data_dir / "QQQ_daily.parquet", "QQQ", 90, "2018-01-02", 0.015)
+    _write_daily_parquet(data_dir / "SPY_daily.parquet", "SPY", 90, "2018-01-02", 0.012)
+    cfg = DataConfig(
+        data_dir=str(data_dir),
+        interval="daily",
+        horizon=1,
+        seq_len=16,
+        stride=1,
+        min_context=4,
+        warmup_bars=8,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=5,
+        global_calendar_split=True,
+        residual_target=False,
+        eval_last_bar=True,
+        cross_section_min_names=99,
+        allow_mixed_prices=True,
+        equities_only=True,
+        sector_residual=False,
+        train_from="",
+    )
+    bundle = build_datasets(cfg, log_fn=None)
+    names = {m["symbol"] for m in bundle["meta"]}
+    assert names == {"AAPL", "MSFT"}
+    assert bundle["equities_only"] is True
+
+
+def test_train_from_drops_early_train_labels_not_val_end(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    for i, name in enumerate(("AAPL", "MSFT", "GOOGL", "JPM", "XOM", "JNJ", "PG", "HD")):
+        _write_daily_parquet(
+            data_dir / f"{name}_daily.parquet",
+            name,
+            600,
+            "1998-01-02",
+            0.01 + 0.001 * i,
+        )
+    common = dict(
+        data_dir=str(data_dir),
+        interval="daily",
+        horizon=1,
+        seq_len=16,
+        stride=1,
+        min_context=4,
+        warmup_bars=8,
+        vol_halflife=5,
+        z_window=10,
+        z_min_periods=5,
+        global_calendar_split=True,
+        residual_target=False,
+        eval_last_bar=True,
+        cross_section_min_names=8,
+        allow_mixed_prices=True,
+        equities_only=True,
+        sector_residual=False,
+    )
+    full = build_datasets(DataConfig(train_from="", **common), log_fn=None)
+    cut = build_datasets(DataConfig(train_from="1999-01-01", **common), log_fn=None)
+    assert {m["val_end"] for m in full["meta"]} == {m["val_end"] for m in cut["meta"]}
+    assert cut["datasets"]["train"].n_valid_bars < full["datasets"]["train"].n_valid_bars
+    assert cut["datasets"]["test"].n_valid_bars == full["datasets"]["test"].n_valid_bars
 
 
 def test_sequence_dataset_applies_feature_norm_once():
@@ -1298,7 +1353,6 @@ def test_pred_std_loss_targets_fraction():
 
 
 def test_residual_target_invalid_when_spy_missing():
->>>>>>> Stashed changes
     cfg = DataConfig(
         interval="daily",
         horizon=1,
@@ -1307,182 +1361,10 @@ def test_residual_target_invalid_when_spy_missing():
         z_window=10,
         z_min_periods=3,
         residual_target=True,
-<<<<<<< Updated upstream
-        sector_residual=True,
-=======
->>>>>>> Stashed changes
         beta_halflife=5,
         benchmark_symbol="SPY",
     )
     a = compute_features(_daily_grid(50), cfg)
-<<<<<<< Updated upstream
-    spy = compute_features(_daily_grid(50), cfg)
-    xlk = compute_features(_daily_grid(50), cfg)
-    a["symbol"], spy["symbol"], xlk["symbol"] = "AAPL", "SPY", "XLK"
-    base = attach_cross_section_features(
-        {"AAPL": a.copy(), "SPY": spy.copy(), "XLK": xlk.copy()}, cfg
-    )
-    base = attach_residual_target(base, cfg)
-    spiked_grid = _daily_grid(50)
-    spiked_grid.loc[spiked_grid.index[-1], "close"] = (
-        float(spiked_grid["close"].iloc[-1]) * 1.08
-    )
-    spiked = compute_features(spiked_grid, cfg)
-    spiked["symbol"] = "XLK"
-    alt_panels = attach_cross_section_features(
-        {"AAPL": a.copy(), "SPY": spy.copy(), "XLK": spiked}, cfg
-    )
-    alt = attach_residual_target(alt_panels, cfg)
-    t = 48
-    for col in ("ret_1", "mkt_ret_1", "sector_ret_1", "idio_sector", "cs_rank_1"):
-        assert base["AAPL"][col].iloc[t] == pytest.approx(float(alt["AAPL"][col].iloc[t]))
-    assert base["AAPL"]["target"].iloc[t] != pytest.approx(float(alt["AAPL"]["target"].iloc[t]))
-
-
-def test_double_residual_uses_spy_and_sector_forward():
-    cfg = DataConfig(
-        interval="daily",
-        horizon=1,
-        warmup_bars=5,
-        vol_halflife=5,
-        z_window=10,
-        z_min_periods=3,
-        residual_target=True,
-        sector_residual=True,
-        double_residual=True,
-        beta_halflife=5,
-        benchmark_symbol="SPY",
-    )
-    a = compute_features(_daily_grid(50), cfg)
-    spy = compute_features(_daily_grid(50), cfg)
-    xlk = compute_features(_daily_grid(50), cfg)
-    a["symbol"], spy["symbol"], xlk["symbol"] = "AAPL", "SPY", "XLK"
-    base_panels = attach_cross_section_features(
-        {"AAPL": a.copy(), "SPY": spy.copy(), "XLK": xlk.copy()}, cfg
-    )
-    base = attach_residual_target(base_panels, cfg)
-    spiked_grid = _daily_grid(50)
-    spiked_grid.loc[spiked_grid.index[-1], "close"] = (
-        float(spiked_grid["close"].iloc[-1]) * 1.08
-    )
-    spiked = compute_features(spiked_grid, cfg)
-    spiked["symbol"] = "SPY"
-    alt_panels = attach_cross_section_features(
-        {"AAPL": a.copy(), "SPY": spiked, "XLK": xlk.copy()}, cfg
-    )
-    alt = attach_residual_target(alt_panels, cfg)
-    t = 48
-    assert base["AAPL"]["ret_1"].iloc[t] == pytest.approx(float(alt["AAPL"]["ret_1"].iloc[t]))
-    assert base["AAPL"]["target"].iloc[t] != pytest.approx(float(alt["AAPL"]["target"].iloc[t]))
-
-
-def test_residualize_features_uses_same_bar_hedge():
-    cfg = DataConfig(
-        interval="daily",
-        horizon=1,
-        warmup_bars=5,
-        vol_halflife=5,
-        z_window=10,
-        z_min_periods=3,
-        residual_target=True,
-        sector_residual=True,
-        double_residual=True,
-        residualize_features=True,
-        beta_halflife=5,
-        benchmark_symbol="SPY",
-    )
-    a = compute_features(_daily_grid(50), cfg)
-    spy = compute_features(_daily_grid(50), cfg)
-    xlk = compute_features(_daily_grid(50), cfg)
-    a["symbol"], spy["symbol"], xlk["symbol"] = "AAPL", "SPY", "XLK"
-    base_panels = attach_cross_section_features(
-        {"AAPL": a.copy(), "SPY": spy.copy(), "XLK": xlk.copy()}, cfg
-    )
-    base = attach_residual_target(base_panels, cfg)
-    spiked_grid = _daily_grid(50)
-    spiked_grid.loc[spiked_grid.index[40], "close"] = (
-        float(spiked_grid["close"].iloc[40]) * 1.06
-    )
-    spiked = compute_features(spiked_grid, cfg)
-    spiked["symbol"] = "SPY"
-    alt_panels = attach_cross_section_features(
-        {"AAPL": a.copy(), "SPY": spiked, "XLK": xlk.copy()}, cfg
-    )
-    alt = attach_residual_target(alt_panels, cfg)
-    t = 40
-    assert base["AAPL"]["ret_1"].iloc[t] != pytest.approx(float(alt["AAPL"]["ret_1"].iloc[t]))
-
-
-def test_equities_only_drops_etfs_from_the_book(tmp_path: Path):
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    _write_daily_parquet(data_dir / "AAPL_daily.parquet", "AAPL", 90, "2018-01-02")
-    _write_daily_parquet(data_dir / "MSFT_daily.parquet", "MSFT", 90, "2018-01-02", 0.02)
-    _write_daily_parquet(data_dir / "QQQ_daily.parquet", "QQQ", 90, "2018-01-02", 0.015)
-    _write_daily_parquet(data_dir / "SPY_daily.parquet", "SPY", 90, "2018-01-02", 0.012)
-    cfg = DataConfig(
-        data_dir=str(data_dir),
-        interval="daily",
-        horizon=1,
-        seq_len=16,
-        stride=1,
-        min_context=4,
-        warmup_bars=8,
-        vol_halflife=5,
-        z_window=10,
-        z_min_periods=5,
-        global_calendar_split=True,
-        residual_target=False,
-        eval_last_bar=True,
-        cross_section_min_names=99,
-        allow_mixed_prices=True,
-        equities_only=True,
-        sector_residual=False,
-        train_from="",
-    )
-    bundle = build_datasets(cfg, log_fn=None)
-    names = {m["symbol"] for m in bundle["meta"]}
-    assert names == {"AAPL", "MSFT"}
-    assert bundle["equities_only"] is True
-
-
-def test_train_from_drops_early_train_labels_not_val_end(tmp_path: Path):
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    for i, name in enumerate(("AAPL", "MSFT", "GOOGL", "JPM", "XOM", "JNJ", "PG", "HD")):
-        _write_daily_parquet(
-            data_dir / f"{name}_daily.parquet",
-            name,
-            600,
-            "1998-01-02",
-            0.01 + 0.001 * i,
-        )
-    common = dict(
-        data_dir=str(data_dir),
-        interval="daily",
-        horizon=1,
-        seq_len=16,
-        stride=1,
-        min_context=4,
-        warmup_bars=8,
-        vol_halflife=5,
-        z_window=10,
-        z_min_periods=5,
-        global_calendar_split=True,
-        residual_target=False,
-        eval_last_bar=True,
-        cross_section_min_names=8,
-        allow_mixed_prices=True,
-        equities_only=True,
-        sector_residual=False,
-    )
-    full = build_datasets(DataConfig(train_from="", **common), log_fn=None)
-    cut = build_datasets(DataConfig(train_from="1999-01-01", **common), log_fn=None)
-    assert {m["val_end"] for m in full["meta"]} == {m["val_end"] for m in cut["meta"]}
-    assert cut["datasets"]["train"].n_valid_bars < full["datasets"]["train"].n_valid_bars
-    assert cut["datasets"]["test"].n_valid_bars == full["datasets"]["test"].n_valid_bars
-
-=======
     spy = compute_features(_daily_grid(50).iloc[20:].reset_index(drop=True), cfg)
     a["symbol"], spy["symbol"] = "AAPL", "SPY"
     out = attach_residual_target({"AAPL": a, "SPY": spy}, cfg)
@@ -1512,4 +1394,3 @@ def test_reset_optimizer_state_clears_moments():
     assert opt.state[p]
     reset_optimizer_state(opt)
     assert opt.state == {}
->>>>>>> Stashed changes
